@@ -60,8 +60,9 @@ oprobe prove last
 `prove` takes the run's operator (A) and the same operator with the top finding's remedy (B);
 `oprobe prove last FINDING` proves another finding's. For a remedy with a size, such as a
 concurrency limit, it first runs short sizing trials over that one value and picks the knee of
-the objective. Then it runs trials of A and B interleaved, pair by pair, until a sequential test
-against the noise floor decides, or the budget (`--max-duration`) runs out. It starts with the
+the objective. Then it runs trials of A and B interleaved, pair by pair in a balanced order,
+until a sequential test against the noise floor decides, or the budget (`--max-duration`) runs
+out. It starts with the
 number of trials and the ETA of the whole proof, and prints each trial as it ends (on stderr):
 
 ```text
@@ -82,7 +83,7 @@ The verdict is `improved`, `worse` (exit 3) or `inconclusive`, on goodput unless
 improved on goodput: +33.3 %, 95 % interval [+26.9, +40.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
 secondary (not decisive; 95 % intervals): p99 -68.5 % [-70.0, -66.9] · throttled 0.00 % → 0.00 % · errors 0.00 % → 0.00 %
 note: TailCutLayer re-issues through RetryLayer: its first backoff is shortened so a cut request is retried at once; trials warm up 11.5 s because the layer ignores its first 10 s
-+ TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(60)).build()
++ TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(10)).build()
 ~ RetryLayer::new().with_min_delay(Duration::from_millis(20))
 op.toml:
 [layers]

@@ -5,13 +5,17 @@
 //! 2. **Size it**: when the remedy is a size (a limit, a gap, a concurrency), a bracket search
 //!    over that one value with short trials picks the objective's knee — the smallest value
 //!    within [`KNEE_RATIO`] of the best — subject to `--max-throttle`.
-//! 3. **A/B test**: interleaved A/B pairs (each pair's order drawn from the run's seed) with a
-//!    sequential test ([`Sprt`]) on the objective against a noise floor learned from each
-//!    side's trial-to-trial spread, until a decision, the pair limit or the wall-time budget
-//!    (`--max-duration`).
+//! 3. **A/B test**: interleaved A/B pairs in a balanced order (blocks of one `AB` and one
+//!    `BA`, drawn from the run's seed) with a sequential test ([`AbTest`]) on the objective
+//!    against a noise floor learned from each side's trial-to-trial spread, until a decision,
+//!    the pair limit or the wall-time budget (`--max-duration`). A trial that ends throttled
+//!    is followed by a cool-down ([`cool_down`]), so it does not drain the limit the next
+//!    trial — often the other arm — starts against.
 //! 4. **Decide**: `improved | worse | inconclusive` on the objective (goodput = successful
-//!    operations per second, or p99). Intervals are log-ratio (never below −100 %) and
-//!    Wilson/Newcombe for shares; secondary metrics are shown, never decisive.
+//!    operations per second, or p99): whether its sequential, order-adjusted 95 % interval
+//!    excludes no change — the one rule every look and the verdict share. Intervals are
+//!    log-ratio (never below −100 %) and Wilson/Newcombe for shares; secondary metrics are
+//!    shown, never decisive.
 //! 5. **Save**: every trial is a run whose `parent_id` is this prove (hidden from
 //!    `show --list` unless `--all`); the result is stored as `<id>.prove.json`.
 
@@ -25,7 +29,10 @@ use serde::{Deserialize, Serialize};
 use super::Ctx;
 use super::input::{OutputOptions, Safety};
 use crate::analysis::stats::Interval;
-use crate::analysis::verdict::{Sprt, SprtDecision, log_ratio, ratio_difference};
+use crate::analysis::verdict::{
+    AbDecision, AbTest, AbVerdict, candidate_first, log_ratio, ratio_difference,
+};
+pub use crate::analysis::verdict::{AbPair, MAX_PAIRS, MIN_DECISIVE_PAIRS};
 use crate::config::Profile;
 use crate::engine::Cancel;
 use crate::errors::{ErrorCode, OprobeError, exit};
@@ -40,14 +47,12 @@ pub const PROVE_SCHEMA: &str = "oprobe.prove/9";
 
 /// A value within this share of the best objective is as good: the knee is the smallest one.
 pub const KNEE_RATIO: f64 = 0.03;
-/// The smallest noise floor assumed before the A/A pairs have spoken (per-pair log ratio).
-const MIN_NOISE_SD: f64 = 0.02;
-/// The smallest effect the sequential test looks for.
-const MIN_EFFECT: f64 = 0.03;
-/// A/B pairs at least before a verdict other than `inconclusive`: with fewer, the spread of
-/// the pairs cannot be estimated (`--pairs` is raised to this, and a budget that allows
-/// fewer gives `inconclusive`).
-pub const MIN_DECISIVE_PAIRS: usize = 3;
+/// The shortest cool-down after a throttled trial, and the longest when the service named no
+/// `Retry-After` ([`cool_down`]).
+const COOL_DOWN_DEFAULT: (Duration, Duration) =
+    (Duration::from_millis(250), Duration::from_secs(2));
+/// The longest cool-down, whatever `Retry-After` the service sent.
+const COOL_DOWN_MAX: Duration = Duration::from_secs(5);
 /// The first retry backoffs prove searches for transient failures (ms): from a short 20 ms up
 /// to half a second.
 const RETRY_MIN_DELAY_MS: (u64, u64) = (20, 500);
@@ -89,13 +94,9 @@ impl ProveObjective {
         }
     }
 
-    /// `ln(b/a)` signed so that positive is better.
-    fn signed_log_ratio(self, a: f64, b: f64) -> f64 {
-        let (a, b) = (a.max(1e-9), b.max(1e-9));
-        match self {
-            Self::Goodput => (b / a).ln(),
-            Self::P99 => (a / b).ln(),
-        }
+    /// More of the objective is better (goodput), or less is (p99).
+    fn higher_is_better(self) -> bool {
+        self == Self::Goodput
     }
 
     /// `v` is within the knee ratio of `best`.
@@ -272,12 +273,19 @@ pub struct ProveOutput {
     pub objective: ProveObjective,
     pub verdict: ProveVerdict,
     /// Relative change of the objective (candidate vs baseline) with its 95 % interval,
-    /// signed in the metric's own direction (goodput +: more; p99 −: faster).
+    /// signed in the metric's own direction (goodput +: more; p99 −: faster). The interval is
+    /// sequential (valid whenever the prove stopped) and adjusted for the order of the trials
+    /// within a pair; the verdict is whether it excludes no change.
     pub objective_delta: Interval,
     /// The A/A noise floor: the per-pair spread of the objective's log ratio.
     pub noise_floor_ratio: f64,
     /// Interleaved A/B pairs that ran.
     pub pairs_count: u64,
+    /// The A/B pairs the prove planned at most (`--pairs`): the interval's sequential boundary
+    /// is the one of that plan. Absent in results of 9.1 and earlier, whose interval was the
+    /// fixed-sample one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairs_max_count: Option<u64>,
     pub max_throttle_ratio: f64,
     /// The other metrics (shown, never decisive).
     pub secondary: Vec<SecondaryMetric>,
@@ -315,6 +323,15 @@ impl ProveOutput {
             )),
             None => Err("not an oprobe v9 prove result (missing `schema`)".into()),
         }
+    }
+
+    /// The A/B pairs the prove planned at most. A result of 9.1 or earlier does not say: the
+    /// default plan, or the pairs it ran if more.
+    pub fn planned_pairs(&self) -> usize {
+        let planned = self.pairs_max_count.unwrap_or_else(|| {
+            (crate::config::prove_defaults::MAX_PAIRS as u64).max(self.pairs_count)
+        });
+        (planned as usize).clamp(MIN_DECISIVE_PAIRS, MAX_PAIRS)
     }
 
     fn metric_label(m: &str) -> &str {
@@ -959,11 +976,10 @@ fn remedy_change(run: &Run, f: &Finding) -> Result<Change> {
                     scaled
                 };
             }
-            // Foyer shards memory into 4 pieces: keep at least 2 whole objects per shard (8x).
-            let min_foyer = obj_bytes.saturating_mul(8).max(16 << 20);
-            let mem = ((set as f64 * 1.25) as u64).max(min_foyer).min(1 << 30);
+            let largest = seen.values().copied().max().unwrap_or(obj_bytes);
+            let cache = crate::operator::Cache::sized_for(set, largest);
             c.fixed
-                .push(("layers.cache.memory".into(), ByteSize(mem).to_string()));
+                .push(("layers.cache.memory".into(), cache.memory.to_string()));
         }
         "cold_connections" => match f.remedy.path.as_deref() {
             Some("http.keep_alive") => c.fixed.push(("http.keep_alive".into(), "on".into())),
@@ -1092,6 +1108,44 @@ struct Trials<'a> {
     target_name: Option<String>,
     /// The budget breach that stopped the trials (the partial trial run is saved).
     breach: Option<anyhow::Error>,
+    /// The cool-down owed before the next trial: the last one ended throttled
+    /// ([`cool_down`]).
+    cool: Duration,
+    /// The cool-down that followed the last baseline trial and the last changed one (sizing or
+    /// candidate): what the next trial of that arm is expected to need after it.
+    cool_after: [Duration; 2],
+    /// The cool-downs waited: how many, and how long in all.
+    cooled: (u64, Duration),
+}
+
+/// How long to wait after a trial before the next one starts. A trial that ended throttled
+/// (429/503) leaves the service's limit drained — an empty token bucket, a `Retry-After` still
+/// running — and the next trial, often the other arm of its pair, would start against it and
+/// be measured worse than it is. The wait follows what the trial saw: the longest
+/// `Retry-After`, and at least twice the trials' warm-up (within [`COOL_DOWN_DEFAULT`]), never
+/// more than [`COOL_DOWN_MAX`]. A trial that was not throttled needs none.
+fn cool_down(throttled_count: u64, max_retry_after_ms: u64, warmup: Duration) -> Duration {
+    if throttled_count == 0 && max_retry_after_ms == 0 {
+        return Duration::ZERO;
+    }
+    let (shortest, longest) = COOL_DOWN_DEFAULT;
+    (warmup * 2)
+        .clamp(shortest, longest)
+        .max(Duration::from_millis(max_retry_after_ms))
+        .min(COOL_DOWN_MAX)
+}
+
+/// Sleep `wait`; `false` as soon as `cancel` fires instead.
+async fn sleep_unless_cancelled(wait: Duration, cancel: &Cancel) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(wait) => true,
+        _ = cancel.cancelled() => false,
+    }
+}
+
+/// The arm of a trial in [`Trials::cool_after`]: the baseline, or the changed operator.
+fn arm(kind: TrialKind) -> usize {
+    usize::from(kind != TrialKind::Baseline)
 }
 
 impl Trials<'_> {
@@ -1127,8 +1181,38 @@ impl Trials<'_> {
             && self.deadline.is_none_or(|d| Instant::now() + need <= d)
     }
 
+    /// There is time for the cool-down owed and a trial of `(sets, kind)` after it.
     fn time_left_for_sets(&self, sets: &[(String, String)], kind: TrialKind) -> bool {
-        self.has_time_for(self.expected_duration(sets, kind))
+        self.has_time_for(self.cool + self.expected_duration(sets, kind))
+    }
+
+    /// Expected wall duration of an A/B pair run in `order` with the candidate's `sets`: the
+    /// cool-down owed, both trials, and the cool-down the first is expected to need before
+    /// the second (what last followed a trial of its arm).
+    fn expected_pair(&self, order: [TrialKind; 2], sets: &[(String, String)]) -> Duration {
+        let trial = |kind| {
+            let sets = if kind == TrialKind::Baseline {
+                &[]
+            } else {
+                sets
+            };
+            self.expected_duration(sets, kind)
+        };
+        self.cool + trial(order[0]) + self.cool_after[arm(order[0])] + trial(order[1])
+    }
+
+    /// Wait out the cool-down the last trial left ([`cool_down`]); Ctrl-C interrupts it.
+    async fn cool_off(&mut self) -> Result<()> {
+        let wait = std::mem::take(&mut self.cool);
+        if wait.is_zero() {
+            return Ok(());
+        }
+        if !sleep_unless_cancelled(wait, &self.cancel).await {
+            return Err(OprobeError::new(ErrorCode::RunInterrupted, "prove interrupted").into());
+        }
+        self.cooled.0 += 1;
+        self.cooled.1 += wait;
+        Ok(())
     }
 
     /// [`Self::trial`], with a budget breach recorded instead of returned: `None` once a
@@ -1170,6 +1254,7 @@ impl Trials<'_> {
         if self.cancel.is_cancelled() {
             return Err(OprobeError::new(ErrorCode::RunInterrupted, "prove interrupted").into());
         }
+        self.cool_off().await?;
         let mut p = self.base.clone();
         if kind != TrialKind::Baseline {
             p.operator.apply_edits(sets)?;
@@ -1257,6 +1342,8 @@ impl Trials<'_> {
         let thr = r.resilience.throttled_responses;
         let throttled_request_ratio = thr as f64 / requests.max(1) as f64;
         let error_ratio = failed as f64 / ops.max(1) as f64;
+        self.cool = cool_down(thr, r.resilience.max_retry_after_ms, self.short_warmup);
+        self.cool_after[arm(kind)] = self.cool;
         let t = ProveTrial {
             kind,
             pair,
@@ -1536,13 +1623,34 @@ async fn search(
     Ok(knee(&evals, obj))
 }
 
-/// Whether pair `pair` runs its candidate (B) first: a fair coin drawn from `seed`
-/// (splitmix64), so the order is random across pairs yet the same for the same run.
-fn candidate_first(seed: u64, pair: u64) -> bool {
-    let mut z = seed.wrapping_add((pair + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    (z ^ (z >> 31)) >> 63 == 1
+/// The complete A/B pairs of a prove's `trials`, by pair number, on `objective`: each pair's
+/// order is the order its two trials ran in (the trials are stored as they ran). A trial whose
+/// other half did not run is left out.
+pub fn ab_pairs(objective: ProveObjective, trials: &[ProveTrial]) -> Vec<AbPair> {
+    let mut by: BTreeMap<u64, (Option<&ProveTrial>, Option<&ProveTrial>, bool)> = BTreeMap::new();
+    for t in trials {
+        let Some(pair) = t.pair else { continue };
+        let e = by.entry(pair).or_default();
+        match t.kind {
+            TrialKind::Baseline => e.0 = Some(t),
+            TrialKind::Candidate => {
+                e.1 = Some(t);
+                e.2 = e.0.is_none();
+            }
+            TrialKind::Sizing => {}
+        }
+    }
+    by.into_values()
+        .filter_map(|(a, b, candidate_first)| {
+            let (a, b) = (a?, b?);
+            Some(AbPair {
+                baseline: objective.value(a),
+                candidate: objective.value(b),
+                ops_count: a.ops_count.min(b.ops_count),
+                candidate_first,
+            })
+        })
+        .collect()
 }
 
 /// The `kind` trials of the first `pairs` completed A/B pairs: a trailing trial whose other
@@ -1623,109 +1731,23 @@ fn mean(ts: &[&ProveTrial], f: impl Fn(&ProveTrial) -> f64) -> f64 {
     ts.iter().map(|t| f(t)).sum::<f64>() / ts.len() as f64
 }
 
-/// The smallest change a trial of `ops` operations can resolve, as a log ratio: one operation
-/// more or less is `ln(1 + 1/ops)` (2.7 % at 37 operations). Below it, a run of A/A trials that
-/// happen to agree exactly says nothing about the noise (0 when nothing was counted).
-pub fn count_resolution(ops: u64) -> f64 {
-    if ops == 0 {
-        0.0
-    } else {
-        (1.0 + 1.0 / ops as f64).ln()
-    }
-}
-
-/// The A/A noise floor: the RMS log ratio of consecutive baseline trials (a per-pair spread),
-/// at least [`MIN_NOISE_SD`] and at least the trials' count `resolution`
-/// ([`count_resolution`]). Fewer than two A/A differences cannot say how precise the floor is,
-/// so it is doubled (and with none, it is twice the minimum). [`noise_floor_ab`] with no B.
-#[cfg(test)]
-fn noise_floor(a: &[f64], resolution: f64) -> f64 {
-    noise_floor_ab(a, &[], resolution)
-}
-
-/// The mean squared log ratio of consecutive trials of one side, with how many ratios it
-/// averages: twice that side's trial-to-trial variance (von Neumann), robust to a slow drift.
-fn successive_msd(x: &[f64]) -> (f64, usize) {
-    let d: Vec<f64> = x
-        .windows(2)
-        .filter(|w| w[0] > 0.0 && w[1] > 0.0)
-        .map(|w| (w[1] / w[0]).ln())
-        .collect();
-    let msd = if d.is_empty() {
-        0.0
-    } else {
-        d.iter().map(|x| x * x).sum::<f64>() / d.len() as f64
-    };
-    (msd, d.len())
-}
-
-/// The noise floor of a pair's log ratio `ln(b/a)`: its variance is A's trial-to-trial
-/// variance plus B's, each estimated from that side's consecutive trials
-/// ([`successive_msd`]: `σ² ≈ MSSD / 2`), so `floor² = (MSSD_A + MSSD_B) / 2`. Until B has
-/// two trials it is assumed as noisy as A (an A/A pair: `floor² = MSSD_A`, [`noise_floor`]).
-/// W8: 9.0 took the A/A spread alone, which overstates a pair's spread by up to √2 when the
-/// change steadies B (a cap that ends the throttling of a throttled baseline). At least
-/// [`MIN_NOISE_SD`] and the count `resolution`, and doubled while A has fewer than two
-/// differences.
-fn noise_floor_ab(a: &[f64], b: &[f64], resolution: f64) -> f64 {
-    let (msd_a, na) = successive_msd(a);
-    let (msd_b, nb) = successive_msd(b);
-    let var = if nb == 0 {
-        msd_a
-    } else {
-        (msd_a + msd_b) / 2.0
-    };
-    let floor = var.sqrt().max(MIN_NOISE_SD).max(resolution);
-    if na < 2 { 2.0 * floor } else { floor }
-}
-
-/// The objective's relative change (candidate vs baseline) over the interleaved pairs: the
-/// mean paired log ratio ± t(0.975, n − 1) σ/√n (Student's t: few pairs give a wide
-/// interval), where σ is the larger of the pairs' own spread and the A/A noise floor (the
-/// spread the sequential test assumes), as `exp(·) − 1` — never below −100 %.
-fn objective_interval(obj: ProveObjective, a: &[f64], b: &[f64], floor: f64) -> Interval {
-    let d: Vec<f64> = a
-        .iter()
-        .zip(b)
-        .map(|(x, y)| obj.signed_log_ratio(*x, *y))
-        .collect();
-    if d.is_empty() {
-        return Interval::default();
-    }
-    let n = d.len() as f64;
-    let m = d.iter().sum::<f64>() / n;
-    let sd = if d.len() > 1 {
-        (d.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (n - 1.0)).sqrt()
-    } else {
-        0.0
-    };
-    let h = crate::analysis::verdict::t975(n - 1.0) * sd.max(floor) / n.sqrt();
-    // Back to the metric's own direction (p99: lower is better, so the sign flips).
-    let (est, lo, hi) = match obj {
-        ProveObjective::Goodput => (m, m - h, m + h),
-        ProveObjective::P99 => (-m, -m - h, -m + h),
-    };
-    Interval {
-        estimate: est.exp() - 1.0,
-        low: lo.exp() - 1.0,
-        high: hi.exp() - 1.0,
-    }
-}
-
 /// The objective's interval after each A/B pair, as the prove saw it grow (the convergence
-/// chart): the same estimate and interval as the verdict's, over the first 1, 2, … n pairs,
-/// with the A/A noise floor known at that point. `a` and `b` are the paired objective values;
-/// `ops[k]` is the fewest operations a trial of the first `k + 1` pairs counted (missing: no
-/// resolution floor).
-pub fn convergence(obj: ProveObjective, a: &[f64], b: &[f64], ops: &[u64]) -> Vec<Converged> {
-    let n = a.len().min(b.len());
-    (1..=n)
-        .map(|k| {
-            let res = ops.get(k - 1).map(|o| count_resolution(*o)).unwrap_or(0.0);
-            let floor = noise_floor_ab(&a[..k], &b[..k], res);
+/// chart): the estimate, interval and noise floor of the verdict's own test ([`AbTest`]) over
+/// the first 1, 2, … n of `pairs`, of a prove planned for at most `max_pairs`
+/// ([`ProveOutput::planned_pairs`]). Its last point is the verdict's interval.
+pub fn convergence(
+    objective: ProveObjective,
+    pairs: &[AbPair],
+    max_pairs: usize,
+) -> Vec<Converged> {
+    let mut test = AbTest::new(objective.higher_is_better(), MIN_DECISIVE_PAIRS, max_pairs);
+    pairs
+        .iter()
+        .map(|p| {
+            test.push(*p);
             Converged {
-                interval: objective_interval(obj, &a[..k], &b[..k], floor),
-                noise_floor_ratio: floor,
+                interval: test.interval(),
+                noise_floor_ratio: test.noise_floor(),
             }
         })
         .collect()
@@ -1734,7 +1756,8 @@ pub fn convergence(obj: ProveObjective, a: &[f64], b: &[f64], ops: &[u64]) -> Ve
 /// The objective after some pairs (see [`convergence`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Converged {
-    /// Relative change of the objective (candidate vs baseline) with its 95 % interval.
+    /// Relative change of the objective (candidate vs baseline) with its sequential,
+    /// order-adjusted 95 % interval.
     pub interval: Interval,
     /// The A/A noise floor (a per-pair log-ratio spread).
     pub noise_floor_ratio: f64,
@@ -1969,7 +1992,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
             Some(s) if s.unmeasured.is_none() => (defaults.max_sizing_trials as u64, 2),
             _ => (0, 0),
         };
-        let max_pairs = req.pairs.clamp(MIN_DECISIVE_PAIRS, 12) as u64;
+        let max_pairs = req.pairs.clamp(MIN_DECISIVE_PAIRS, MAX_PAIRS) as u64;
         let min_pairs = (defaults.min_pairs.max(MIN_DECISIVE_PAIRS) as u64).min(max_pairs);
         // A candidate that needs a long warmup takes longer on its first trial, then reuses
         // its warmed TailCutLayer across the remaining pairs.
@@ -2040,6 +2063,9 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         out: Vec::new(),
         target_name,
         breach: None,
+        cool: Duration::ZERO,
+        cool_after: [Duration::ZERO; 2],
+        cooled: (0, Duration::ZERO),
     };
     let obj = req.objective;
     ctx.out.info(format!(
@@ -2084,49 +2110,51 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     }
     let sets = sets_at(&change, value, &run);
     // Step 3: interleaved A/B with the sequential test.
-    let max_pairs = req.pairs.clamp(MIN_DECISIVE_PAIRS, 12);
+    let max_pairs = req.pairs.clamp(MIN_DECISIVE_PAIRS, MAX_PAIRS);
     let min_pairs = defaults.min_pairs.max(MIN_DECISIVE_PAIRS);
-    let mut a_vals: Vec<f64> = Vec::new();
-    let mut b_vals: Vec<f64> = Vec::new();
-    let mut pairs = 0u64;
-    let mut decision = SprtDecision::Continue;
-    // The fewest operations a paired trial counted: the objective's resolution.
-    let mut min_ops = u64::MAX;
+    let mut test = AbTest::new(obj.higher_is_better(), min_pairs, max_pairs);
+    let mut decision = AbDecision::Continue;
     let candidate_value = sizing.as_ref().map(|s| s.value.clone());
     let seed = run.report.spec.seed;
-    notes.push(if change.long_warmup {
-        format!(
-            "the A/B order of each pair is drawn from the run's seed ({seed}); the changed operator's TailCutLayer keeps its warmed state from one of its trials to the next, as a long-lived operator's does"
-        )
-    } else {
-        format!("the A/B order of each pair is drawn from the run's seed ({seed})")
-    });
-    while (pairs as usize) < max_pairs {
-        let need_pair = t.expected_duration(&[], TrialKind::Baseline)
-            + t.expected_duration(&sets, TrialKind::Candidate);
-        if !t.has_time_for(need_pair) {
-            break;
-        }
-        // The order within the pair is drawn from the run's seed (W11): a drift that favours
-        // whichever trial runs first or second is spread over both.
-        let order = if candidate_first(seed, pairs) {
+    let mut method = format!(
+        "the A/B order of the pairs is balanced in blocks of two (one AB, one BA), the order within a block drawn from the run's seed ({seed}); the interval is the sequential, order-adjusted 95 % interval of a prove of at most {max_pairs} pairs, and the verdict is whether it excludes no change"
+    );
+    if change.long_warmup {
+        method += "; the changed operator's TailCutLayer keeps its warmed state from one of its trials to the next, as a long-lived operator's does";
+    }
+    notes.push(method);
+    while decision == AbDecision::Continue {
+        // Balanced in blocks of one AB and one BA (W11, 9.2): a drift or a carryover that
+        // favours whichever trial runs first or second falls on both arms alike, and the
+        // test's estimate cancels it.
+        let first = candidate_first(seed, test.pairs() as u64);
+        let order = if first {
             [TrialKind::Candidate, TrialKind::Baseline]
         } else {
             [TrialKind::Baseline, TrialKind::Candidate]
         };
+        if !t.has_time_for(t.expected_pair(order, &sets)) {
+            break;
+        }
         let (mut a, mut b) = (None, None);
         for (i, kind) in order.into_iter().enumerate() {
-            // `need_pair` already reserved time for both halves before the first started; run
-            // the second to complete the pair unless the first ran past the deadline, breached
-            // a guard, or was cancelled.
+            // The pair's time was reserved for both halves before the first started; run the
+            // second to complete the pair unless the first ran past the deadline, breached a
+            // guard, or was cancelled.
             if i == 1 && !t.has_time_for(Duration::ZERO) {
                 break;
             }
             let trial = if kind == TrialKind::Baseline {
-                t.try_trial(&[], kind, Some(pairs), None).await?
-            } else {
-                t.try_trial(&sets, kind, Some(pairs), candidate_value.clone())
+                t.try_trial(&[], kind, Some(test.pairs() as u64), None)
                     .await?
+            } else {
+                t.try_trial(
+                    &sets,
+                    kind,
+                    Some(test.pairs() as u64),
+                    candidate_value.clone(),
+                )
+                .await?
             };
             let Some(trial) = trial else { break };
             if kind == TrialKind::Baseline {
@@ -2138,28 +2166,14 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         let (Some(a), Some(b)) = (a, b) else {
             break;
         };
-        a_vals.push(obj.value(&a));
-        b_vals.push(obj.value(&b));
-        min_ops = min_ops.min(a.ops_count).min(b.ops_count);
-        pairs += 1;
-        let floor = noise_floor_ab(&a_vals, &b_vals, count_resolution(min_ops));
-        let mut sprt = Sprt::new((2.0 * floor).max(MIN_EFFECT), floor, 0.05, 0.10);
-        for (x, y) in a_vals.iter().zip(&b_vals) {
-            sprt.push(obj.signed_log_ratio(*x, *y));
-        }
-        decision = sprt.decision(min_pairs);
-        // Stop on a decision the interval agrees with (an early "better" whose interval still
-        // includes no change keeps sampling).
-        let i = objective_interval(obj, &a_vals, &b_vals, floor);
-        let agrees = match decision {
-            SprtDecision::Better | SprtDecision::Worse => i.low > 0.0 || i.high < 0.0,
-            SprtDecision::Same => true,
-            SprtDecision::Continue => false,
-        };
-        if agrees {
-            break;
-        }
+        decision = test.push(AbPair {
+            baseline: obj.value(&a),
+            candidate: obj.value(&b),
+            ops_count: a.ops_count.min(b.ops_count),
+            candidate_first: first,
+        });
     }
+    let pairs = test.pairs() as u64;
     // Ctrl-C between two trials stops the loop like one during a trial: the prove is
     // interrupted (exit 130, its trials deleted), not a result of the pairs that happened to run.
     if cancel.is_cancelled() && t.breach.is_none() {
@@ -2188,44 +2202,31 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     } else if pairs == 0 {
         notes.push("the budget ran out before one pair of trials could run".to_owned());
     }
-    // Step 4: decide.
-    let floor = noise_floor_ab(
-        &a_vals,
-        &b_vals,
-        if pairs == 0 {
-            0.0
-        } else {
-            count_resolution(min_ops)
-        },
-    );
-    let delta = objective_interval(obj, &a_vals, &b_vals, floor);
-    let better = |x: f64| match obj {
-        ProveObjective::Goodput => x > 0.0,
-        ProveObjective::P99 => x < 0.0,
+    if t.cooled.0 > 0 {
+        notes.push(format!(
+            "{} trial{} ended throttled: the prove cooled down before the next one ({} in all), so no trial started against a limit the one before it had drained",
+            t.cooled.0,
+            if t.cooled.0 == 1 { "" } else { "s" },
+            crate::util::fmt_ms(t.cooled.1.as_secs_f64() * 1000.0)
+        ));
+    }
+    // Step 4: decide. The verdict is the test's own: whether the interval of the look the
+    // prove stopped at excludes no change, whatever stopped it.
+    let floor = test.noise_floor();
+    let delta = test.interval();
+    let verdict = match test.verdict() {
+        AbVerdict::Improved => ProveVerdict::Improved,
+        AbVerdict::Worse => ProveVerdict::Worse,
+        AbVerdict::Inconclusive => ProveVerdict::Inconclusive,
     };
-    let excludes_zero = delta.low > 0.0 || delta.high < 0.0;
-    let too_few = (pairs as usize) < MIN_DECISIVE_PAIRS;
-    let verdict = match decision {
-        _ if too_few || !excludes_zero => ProveVerdict::Inconclusive,
-        SprtDecision::Better => ProveVerdict::Improved,
-        SprtDecision::Worse => ProveVerdict::Worse,
-        _ if (1.0 + delta.estimate).max(1e-9).ln().abs() > floor => {
-            if better(delta.estimate) {
-                ProveVerdict::Improved
-            } else {
-                ProveVerdict::Worse
-            }
-        }
-        _ => ProveVerdict::Inconclusive,
-    };
-    if too_few {
+    if (pairs as usize) < MIN_DECISIVE_PAIRS {
         notes.push(format!(
             "the budget allowed only {pairs} pair{} of trials: at least {MIN_DECISIVE_PAIRS} are needed to decide",
             if pairs == 1 { "" } else { "s" }
         ));
-    } else if decision == SprtDecision::Continue {
+    } else if verdict == ProveVerdict::Inconclusive && decision != AbDecision::Futile {
         notes.push(format!(
-            "the sequential test did not decide within {pairs} pairs: the verdict reads the interval"
+            "the sequential test did not decide within {pairs} pairs: the interval still includes no change"
         ));
     }
     let a_trials = paired(&t.out, TrialKind::Baseline, pairs);
@@ -2288,6 +2289,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         objective_delta: delta,
         noise_floor_ratio: floor,
         pairs_count: pairs,
+        pairs_max_count: Some(max_pairs as u64),
         max_throttle_ratio: max_throttle,
         secondary,
         trials: t.out.clone(),
@@ -2409,26 +2411,84 @@ mod tests {
         assert!((80..=126).contains(&v), "{v}: {:?}", f.1);
     }
 
-    /// W11: the A/B order of the pairs is a fair coin from the run's seed: both orders occur,
-    /// and the same seed gives the same orders.
-    #[test]
-    fn the_ab_order_is_drawn_from_the_seed() {
-        let orders = |seed: u64| {
-            (0..12)
-                .map(|p| candidate_first(seed, p))
-                .collect::<Vec<_>>()
-        };
-        for seed in [0, 1, 42, u64::MAX] {
-            let o = orders(seed);
-            assert!(
-                o.iter().any(|b| *b) && o.iter().any(|b| !*b),
-                "{seed}: {o:?}"
-            );
-            assert_eq!(o, orders(seed));
+    fn ab(kind: TrialKind, pair: u64, goodput: f64, ops: u64) -> ProveTrial {
+        ProveTrial {
+            kind,
+            pair: Some(pair),
+            ops_count: ops,
+            ..trial(goodput, 10.0, true)
         }
-        assert_ne!(orders(1), orders(2));
-        let firsts = (0..1000u64).filter(|s| candidate_first(*s, 0)).count();
-        assert!((400..=600).contains(&firsts), "{firsts}");
+    }
+
+    /// The order of a stored pair is the order its trials ran in, so a stored result gives
+    /// the test the pairs the prove gave it.
+    #[test]
+    fn stored_trials_give_back_the_pairs_and_their_order() {
+        use TrialKind::{Baseline, Candidate};
+        let trials = vec![
+            trial(50.0, 10.0, true), // sizing
+            ab(Baseline, 0, 100.0, 900),
+            ab(Candidate, 0, 120.0, 1000),
+            ab(Candidate, 1, 121.0, 1000),
+            ab(Baseline, 1, 101.0, 800),
+            // The budget ended before this candidate's baseline ran.
+            ab(Candidate, 2, 119.0, 1000),
+        ];
+        let pairs = ab_pairs(ProveObjective::Goodput, &trials);
+        assert_eq!(
+            pairs,
+            [
+                AbPair {
+                    baseline: 100.0,
+                    candidate: 120.0,
+                    ops_count: 900,
+                    candidate_first: false
+                },
+                AbPair {
+                    baseline: 101.0,
+                    candidate: 121.0,
+                    ops_count: 800,
+                    candidate_first: true
+                },
+            ]
+        );
+        assert_eq!(ab_pairs(ProveObjective::P99, &trials)[0].baseline, 10.0);
+    }
+
+    /// A trial that ended throttled is followed by a cool-down taken from what it saw; one
+    /// that was not is followed by none.
+    #[test]
+    fn a_throttled_trial_is_followed_by_a_bounded_cool_down() {
+        let ms = Duration::from_millis;
+        // Not throttled: the next trial starts at once.
+        assert_eq!(cool_down(0, 0, ms(300)), Duration::ZERO);
+        // Throttled, no Retry-After: twice the warm-up, within 250 ms .. 2 s.
+        assert_eq!(cool_down(1, 0, ms(300)), ms(600));
+        assert_eq!(cool_down(4000, 0, ms(300)), ms(600), "not by how much");
+        assert_eq!(cool_down(1, 0, ms(100)), ms(250));
+        assert_eq!(cool_down(1, 0, TAIL_CUT_WARMUP), ms(2000));
+        // The service named a wait: at least that, and never more than 5 s.
+        assert_eq!(cool_down(1, 1500, ms(300)), ms(1500));
+        assert_eq!(cool_down(1, 100, ms(300)), ms(600));
+        assert_eq!(cool_down(1, 60_000, ms(300)), ms(5000));
+        // A Retry-After alone (a redirect or 5xx that asked to wait) counts too.
+        assert_eq!(cool_down(0, 1000, ms(300)), ms(1000));
+    }
+
+    /// The cool-down is waited out, and Ctrl-C ends it instead (no wall-clock race: a wait
+    /// that is cancelled never ends by itself within the test).
+    #[tokio::test]
+    async fn the_cool_down_can_be_interrupted() {
+        let cancel = Cancel::new();
+        assert!(sleep_unless_cancelled(Duration::from_millis(1), &cancel).await);
+        let waiter = {
+            let cancel = cancel.clone();
+            tokio::spawn(
+                async move { sleep_unless_cancelled(Duration::from_secs(3600), &cancel).await },
+            )
+        };
+        cancel.cancel();
+        assert!(!waiter.await.unwrap());
     }
 
     fn output(pairs: u64, verdict: ProveVerdict) -> ProveOutput {
@@ -2454,6 +2514,7 @@ mod tests {
             },
             noise_floor_ratio: 0.02,
             pairs_count: pairs,
+            pairs_max_count: Some(6),
             max_throttle_ratio: 0.001,
             secondary: Vec::new(),
             trials: Vec::new(),
@@ -2692,90 +2753,61 @@ mod tests {
     }
 
     #[test]
-    fn a_one_operation_difference_is_not_a_change() {
-        // The macOS CI trials: ~37 operations each, the A/A trials agreeing exactly and the
-        // candidates one or two operations short. Without the count resolution the interval
-        // excluded no change (−6.0 %, −0.4 %): "worse" from rounding.
-        let a = [37.0, 37.0, 37.0, 38.0, 37.0];
-        let b = [36.0, 35.0, 37.0, 37.0, 35.0];
-        let loose = objective_interval(ProveObjective::Goodput, &a, &b, noise_floor(&a, 0.0));
-        assert!(loose.high < 0.0, "{loose:?}");
-        let floor = noise_floor(&a, count_resolution(35));
-        assert!(floor > MIN_NOISE_SD);
-        let i = objective_interval(ProveObjective::Goodput, &a, &b, floor);
-        assert!(i.low < 0.0 && i.high > 0.0, "{i:?}");
-        // Thousands of operations resolve far below the minimum floor: nothing changes.
-        assert_eq!(
-            noise_floor(&a, count_resolution(10_000)),
-            noise_floor(&a, 0.0)
-        );
-    }
-
-    #[test]
     fn convergence_ends_on_the_verdicts_interval() {
         let a = [100.0, 102.0, 99.0, 101.0, 100.0];
         let b = [120.0, 121.0, 118.0, 122.0, 119.0];
-        let c = convergence(ProveObjective::Goodput, &a, &b, &[]);
-        assert_eq!(c.len(), 5);
-        let last = c.last().unwrap();
-        let floor = noise_floor_ab(&a, &b, 0.0);
-        assert_eq!(last.noise_floor_ratio, floor);
-        assert_eq!(
-            last.interval,
-            objective_interval(ProveObjective::Goodput, &a, &b, floor)
+        for obj in [ProveObjective::Goodput, ProveObjective::P99] {
+            let pairs: Vec<AbPair> = (0..5)
+                .map(|i| AbPair {
+                    baseline: a[i],
+                    candidate: b[i],
+                    ops_count: 10_000,
+                    candidate_first: candidate_first(7, i as u64),
+                })
+                .collect();
+            let c = convergence(obj, &pairs, 6);
+            assert_eq!(c.len(), 5);
+            // The last point is what the prove's own test says after the same pairs.
+            let mut test = AbTest::new(obj.higher_is_better(), 3, 6);
+            for p in &pairs {
+                test.push(*p);
+            }
+            let last = c.last().unwrap();
+            assert_eq!(last.interval, test.interval());
+            assert_eq!(last.noise_floor_ratio, test.noise_floor());
+            // More pairs, a narrower interval; +20 % on either objective's own sign.
+            let w = |i: &Interval| i.high - i.low;
+            assert!(w(&c[4].interval) < w(&c[2].interval));
+            assert!(w(&c[2].interval) < w(&c[0].interval));
+            assert!(last.interval.low > 0.0, "{last:?}");
+            // The interval is the plan's: a longer plan looks more often, so each look is wider.
+            let longer = convergence(obj, &pairs, 12);
+            assert!(w(&longer[4].interval) > w(&c[4].interval));
+        }
+        assert!(convergence(ProveObjective::Goodput, &[], 6).is_empty());
+    }
+
+    /// A result of 9.1 has no `pairs_max_count`: it still reads, as the default plan.
+    #[test]
+    fn a_9_1_result_reads_without_the_planned_pairs() {
+        let mut v = serde_json::to_value(output(4, ProveVerdict::Improved)).unwrap();
+        assert_eq!(v["pairs_max_count"], 6);
+        v.as_object_mut().unwrap().remove("pairs_max_count");
+        let old = ProveOutput::from_json_slice(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(old.pairs_max_count, None);
+        assert_eq!(old.planned_pairs(), 6);
+        // Not written back when absent.
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("pairs_max_count")
+                .is_none()
         );
-        // More pairs, a narrower interval.
-        let w = |i: &Interval| i.high - i.low;
-        assert!(w(&c[4].interval) < w(&c[1].interval));
-        assert!(last.interval.low > 0.0);
-    }
-
-    #[test]
-    fn the_noise_floor_has_a_minimum() {
-        // No A/A difference yet: the minimum, widened.
-        assert_eq!(noise_floor(&[100.0], 0.0), 2.0 * MIN_NOISE_SD);
-        let f = noise_floor(&[100.0, 120.0, 100.0], 0.0);
-        assert!(f > 0.15 && f < 0.2, "{f}");
-    }
-
-    /// W8: a steady candidate against a noisy (throttled) baseline: the pair's spread is A's
-    /// alone, not the A/A spread of two noisy trials (√2 more).
-    #[test]
-    fn a_steady_candidate_does_not_double_the_baselines_noise() {
-        let a = [100.0, 150.0, 100.0, 150.0];
-        let steady = [60.0, 60.0, 60.0, 60.0];
-        let aa = noise_floor(&a, 0.0);
-        let ab = noise_floor_ab(&a, &steady, 0.0);
-        assert!((ab - aa / 2f64.sqrt()).abs() < 1e-12, "{ab} vs {aa}");
-        // As noisy as A: the A/A floor.
-        assert!((noise_floor_ab(&a, &a, 0.0) - aa).abs() < 1e-12);
-        // One B trial says nothing about B: A/A.
-        assert_eq!(noise_floor_ab(&a, &[60.0], 0.0), aa);
-        // Minimums hold.
-        assert_eq!(noise_floor_ab(&[100.0; 4], &[100.0; 4], 0.0), MIN_NOISE_SD);
-    }
-
-    #[test]
-    fn one_aa_difference_is_not_a_precise_floor() {
-        let one = noise_floor(&[100.0, 110.0], 0.0);
-        let d = (110.0f64 / 100.0).ln();
-        assert!((one - 2.0 * d).abs() < 1e-12, "{one}");
-    }
-
-    #[test]
-    fn few_pairs_give_a_t_interval() {
-        // Three pairs, each +10 % with a little spread: t(0.975, 2) = 4.303, not 1.96.
-        let a = [100.0, 100.0, 100.0];
-        let b = [109.0, 110.0, 111.0];
-        let i = objective_interval(ProveObjective::Goodput, &a, &b, 0.0);
-        let d: Vec<f64> = a.iter().zip(&b).map(|(x, y)| (y / x).ln()).collect();
-        let m = d.iter().sum::<f64>() / 3.0;
-        let sd = (d.iter().map(|x| (x - m).powi(2)).sum::<f64>() / 2.0).sqrt();
-        let want = (m + 4.303 * sd / 3f64.sqrt()).exp() - 1.0;
-        assert!((i.high - want).abs() < 1e-9, "{i:?} vs {want}");
-        // One pair: the widest quantile, whatever the floor.
-        let one = objective_interval(ProveObjective::Goodput, &[100.0], &[110.0], 0.02);
-        assert!(one.high - one.low > 0.4, "{one:?}");
+        let mut long = old.clone();
+        long.pairs_count = 9;
+        assert_eq!(long.planned_pairs(), 9);
+        long.pairs_max_count = Some(12);
+        assert_eq!(long.planned_pairs(), 12);
     }
 
     #[test]

@@ -853,13 +853,32 @@ async fn cancelled_run_is_marked_interrupted() {
 #[cfg(unix)]
 #[test]
 fn interrupted_run_exits_130() {
-    let child = oprobe_cmd()
+    let home = tempfile::tempdir().unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_oprobe"))
+        .env("OPROBE_DATA_DIR", home.path().join("data"))
+        .env("OPROBE_CONFIG", home.path().join("config.toml"))
+        .env_remove("OPROBE_OUTPUT")
         .args(["run", "memory://", "-d", "60s", "--warmup", "0s", "--quiet"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    // Interrupt once the run is measuring: its run file is being written. (A fixed sleep
+    // raced the child's start: on a loaded runner the signal arrived before the run had
+    // installed its handler, and the child died of it instead of exiting 130.)
+    let measuring = || {
+        std::fs::read_dir(home.path().join("data").join("runs")).is_ok_and(|d| {
+            d.filter_map(|e| e.ok()).any(|e| {
+                e.file_name().to_string_lossy().ends_with(".oprobe.tmp")
+                    && e.metadata().is_ok_and(|m| m.len() > 0)
+            })
+        })
+    };
+    let t0 = std::time::Instant::now();
+    while !measuring() && t0.elapsed() < std::time::Duration::from_secs(120) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(measuring(), "the run never started measuring");
     // SAFETY: plain signal to our own child process.
     unsafe {
         libc::kill(child.id() as libc::pid_t, libc::SIGINT);

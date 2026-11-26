@@ -8,7 +8,7 @@
 
 use crate::analysis::capacity::Confidence;
 use crate::app::ProveObjective;
-use crate::app::prove::{Converged, convergence};
+use crate::app::prove::{AbPair, Converged, convergence};
 use crate::report::view::{ConcurrencyView, EvidenceChart, LatencyCdf, TimelineView};
 use crate::ui::chart::{Band, Line, Plot, Rule, Unit};
 use crate::ui::data::{Heat, ProfileModel};
@@ -570,9 +570,11 @@ fn noise_band(floor: f64) -> (f64, f64) {
 
 /// Prove's convergence: each pair's change (candidate / baseline − 1) as a dot, the running
 /// estimate with its 95 % interval narrowing as pairs come in, the A/A noise floor around no
-/// change, and no change ruled. `ab` holds the objective of each pair and the fewest operations
-/// its trials counted (the noise floor is never below that resolution, as in the verdict).
-pub fn prove(ab: &[(f64, f64, u64)], p99: bool) -> Option<Plot> {
+/// change, and no change ruled. `ab` holds the objective of each pair, the fewest operations
+/// its trials counted (the noise floor is never below that resolution) and the order they ran
+/// in; with `max_pairs`, the pairs the prove planned at most, the interval is the verdict's own
+/// (sequential, order-adjusted).
+pub fn prove(ab: &[AbPair], p99: bool, max_pairs: usize) -> Option<Plot> {
     if ab.is_empty() {
         return None;
     }
@@ -581,20 +583,19 @@ pub fn prove(ab: &[(f64, f64, u64)], p99: bool) -> Option<Plot> {
     } else {
         ProveObjective::Goodput
     };
-    let (a, b): (Vec<f64>, Vec<f64>) = ab.iter().map(|p| (p.0, p.1)).unzip();
-    let ops: Vec<u64> = ab
-        .iter()
-        .scan(u64::MAX, |m, p| {
-            *m = (*m).min(p.2);
-            Some(*m)
-        })
-        .collect();
-    let conv: Vec<Converged> = convergence(obj, &a, &b, &ops);
+    let conv: Vec<Converged> = convergence(obj, ab, max_pairs);
     let n = ab.len() as f64;
     let d: Vec<(f64, f64)> = ab
         .iter()
         .enumerate()
-        .map(|(i, (a, b, _))| ((i + 1) as f64, if *a > 0.0 { b / a - 1.0 } else { 0.0 }))
+        .map(|(i, p)| {
+            let change = if p.baseline > 0.0 {
+                p.candidate / p.baseline - 1.0
+            } else {
+                0.0
+            };
+            ((i + 1) as f64, change)
+        })
         .collect();
     let floor = conv.last().map(|c| c.noise_floor_ratio).unwrap_or(0.0);
     let (nlo, nhi) = noise_band(floor);
@@ -1105,10 +1106,16 @@ mod tests {
 
     #[test]
     fn the_prove_chart_narrows_around_the_estimate() {
-        let ab: Vec<(f64, f64, u64)> = (0..6)
-            .map(|i| (100.0 + i as f64, 120.0 + (i % 3) as f64, 10_000))
+        let pair = |i: usize, baseline: f64, candidate: f64, ops_count: u64| AbPair {
+            baseline,
+            candidate,
+            ops_count,
+            candidate_first: i % 2 == 1,
+        };
+        let ab: Vec<AbPair> = (0..6)
+            .map(|i| pair(i, 100.0 + i as f64, 120.0 + (i % 3) as f64, 10_000))
             .collect();
-        let p = prove(&ab, false).unwrap();
+        let p = prove(&ab, false, 6).unwrap();
         let est = &p.lines[0].pts;
         let dots = &p.lines[1].pts;
         assert_eq!((est.len(), dots.len()), (6, 6));
@@ -1120,11 +1127,17 @@ mod tests {
         assert_eq!(p.rules[0].y, Some(0.0));
         assert!(p.y.min <= 0.0 && p.y.max >= 0.2);
         // p99: lower is better; each dot is still candidate / baseline − 1.
-        let q = prove(&[(50.0, 40.0, 10_000)], true).unwrap();
+        let q = prove(&[pair(0, 50.0, 40.0, 10_000)], true, 6).unwrap();
         assert!((q.lines[1].pts[0].1 + 0.2).abs() < 1e-9);
-        assert!(prove(&[], false).is_none());
+        assert!(prove(&[], false, 6).is_none());
+        // The band is the verdict's interval: the one of the prove's plan.
+        let planned = crate::app::prove::convergence(ProveObjective::Goodput, &ab, 6);
+        assert_eq!(band[5].1, planned[5].interval.low);
+        let longer = prove(&ab, false, 12).unwrap();
+        let wide = &longer.bands[1].pts;
+        assert!(wide[5].2 - wide[5].1 > w(5), "a longer plan, a wider look");
         // Few operations per trial: the noise floor is their resolution, as in the verdict.
-        let few: Vec<(f64, f64, u64)> = [
+        let few: Vec<AbPair> = [
             (37.0, 36.0),
             (37.0, 35.0),
             (37.0, 37.0),
@@ -1132,9 +1145,10 @@ mod tests {
             (37.0, 35.0),
         ]
         .iter()
-        .map(|(a, b)| (*a, *b, 35))
+        .enumerate()
+        .map(|(i, (a, b))| pair(i, *a, *b, 35))
         .collect();
-        let f = prove(&few, false).unwrap();
+        let f = prove(&few, false, 6).unwrap();
         let last = f.bands[1].pts.last().unwrap();
         assert!(last.1 < 0.0 && last.2 > 0.0, "{last:?}");
     }

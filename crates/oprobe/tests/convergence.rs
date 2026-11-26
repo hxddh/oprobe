@@ -284,7 +284,7 @@ fn the_default_rate_limit_lab_is_a_rate_limit() {
     improved(&p);
 }
 
-/// The default `lab://throttle` (32 workers over an in-flight limit of 8): the finding's
+/// The default `lab://throttle` (48 workers over an in-flight limit of 8): the finding's
 /// `next`, run exactly as printed, proves the cap `improved` on p99 (W8: 9.0's `next` named no
 /// objective, and at 16 workers the throttled operations' backoffs sat above the p99).
 #[test]
@@ -468,11 +468,17 @@ fn serial_reads_on_a_lossy_link_are_split() {
 
 /// Parquet-like scans (a HEAD, a footer, four column ranges): on OpenDAL's defaults the
 /// ranges are fetched one after another, so `read.concurrent` is the remedy.
+///
+/// Six workers: with four ranges in flight each they reach the lab's limit of 24 requests in
+/// flight and never cross it, so this proof is about the ranges alone. The lab's default of
+/// eight can cross it (8 × 4 = 32) whenever the workers scan in step: on macOS CI every
+/// candidate trial then began with eight 503s and a second of backoff each, and the proof
+/// was, rightly, inconclusive over `--max-throttle`. The limit has its own test below.
 #[test]
 fn parquet_ranges_are_fetched_concurrently() {
     let env = Env::new();
     let r = env.run_until(
-        &["lab://parquet", "-d", "2s", "--warmup", "300ms"],
+        &["lab://parquet", "-c", "6", "-d", "2s", "--warmup", "300ms"],
         "small_ranges",
     );
     check_finding(&r, "small_ranges", Some("read.concurrent"));

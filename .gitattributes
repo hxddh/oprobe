@@ -5,6 +5,9 @@ llms.txt text eol=lf
 llms-full.txt text eol=lf
 README*.md text eol=lf
 CHANGELOG.md text eol=lf
+crates/oprobe-core/tests/codegen/** text eol=lf
 # Images are binary: never convert line endings in them.
 *.png binary
 *.ico binary
+# Run-file fixtures are compared and decoded as bytes.
+*.oprobe binary

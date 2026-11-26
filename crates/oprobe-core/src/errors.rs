@@ -379,8 +379,9 @@ pub fn classify(err: &anyhow::Error, scheme: &str) -> ErrorBody {
     body
 }
 
-/// The whole chain on one line (`outer: inner: root`), with URL credentials (`user:pass@`)
-/// removed: OpenDAL contexts quote endpoints as configured.
+/// The whole chain on one line (`outer: inner: root`), with URL credentials removed
+/// (`user:pass@`, the signature and token of a presigned or SAS URL): OpenDAL contexts quote
+/// endpoints as configured, and HTTP clients quote the URL of a failed request.
 fn chain_message(err: &anyhow::Error) -> String {
     crate::util::strip_url_credentials(&format!("{err:#}"))
 }
@@ -492,6 +493,38 @@ mod tests {
             .with_hint("check https://u:p@proxy.example.com")
             .into();
         assert!(!classify(&e, "s3").hint.unwrap().contains("u:p@"));
+    }
+
+    /// A presigned or SAS URL is a bearer credential: HTTP clients and OpenDAL quote the whole
+    /// URL in their errors, and neither the message nor the machine `detail` may carry its
+    /// signature or token (9.1 removed only `user:password@`).
+    #[test]
+    fn presigned_signatures_never_reach_error_output() {
+        let source = opendal::Error::new(opendal::ErrorKind::Unexpected, "send http request")
+            .with_operation("reqwest::send")
+            .with_context(
+                "url",
+                "https://b.s3.amazonaws.com/k?X-Amz-Credential=AKIAEXAMPLE&X-Amz-Expires=900&X-Amz-Security-Token=STSTOKEN&X-Amz-Signature=deadbeefcafe",
+            )
+            .set_source(anyhow::anyhow!(
+                "error sending request for url (https://acct.blob.core.windows.net/c/k?sv=2024&se=2026-12-01&sig=SASSECRET)"
+            ));
+        let e = anyhow::Error::new(source).context("cannot read the object");
+        let b = classify(&e, "s3");
+        let json = serde_json::to_string(&b).unwrap();
+        for text in [b.message.as_str(), json.as_str(), &format!("{b:?}")] {
+            for secret in ["deadbeefcafe", "STSTOKEN", "AKIAEXAMPLE", "SASSECRET"] {
+                assert!(!text.contains(secret), "{secret} in {text}");
+            }
+        }
+        // What is not a credential stays, so the failing request is still identifiable.
+        assert!(
+            b.message
+                .contains("https://b.s3.amazonaws.com/k?X-Amz-Expires=900"),
+            "{}",
+            b.message
+        );
+        assert!(json.contains("sv=2024&se=2026-12-01"), "{json}");
     }
 
     #[test]

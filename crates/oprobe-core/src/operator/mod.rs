@@ -219,7 +219,7 @@ impl Default for Timeout {
 ///
 /// The defaults are what oprobe measures with, not OpenDAL's (1.3, 200 samples, 500 ms, 30 s):
 /// a shorter warm-up and floor so that short runs can see the layer work, and a ceiling at the
-/// operation timeout. Generated Rust spells out every value that differs from OpenDAL's default.
+/// timeout that severs the same calls. Generated Rust spells out every value that differs from OpenDAL's default.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct TailCut {
@@ -231,8 +231,8 @@ pub struct TailCut {
     pub min_samples: usize,
     /// The shortest deadline.
     pub min_deadline: HumanDuration,
-    /// The longest deadline (unset: the operation timeout, `layers.timeout.op`, or 60 s without
-    /// the timeout layer).
+    /// The longest deadline (unset: the shorter of `layers.timeout.op` and `layers.timeout.io`,
+    /// the timeouts that sever the calls this layer times; 60 s without the timeout layer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_deadline: Option<HumanDuration>,
     /// The sliding window of latencies (at most 120 s).
@@ -253,14 +253,20 @@ impl Default for TailCut {
 }
 
 impl TailCut {
-    /// The parameters applied with an operation timeout of `op_timeout`.
-    pub fn params(&self, op_timeout: Duration) -> crate::engine::stack::TailCutParams {
+    /// The parameters applied when the timeout layer severs a call after `call_timeout`
+    /// ([`OperatorSpec::call_timeout`]): unless `max_deadline` is given, the deadline's ceiling
+    /// is that timeout, so the layer never reports a deadline it cannot reach (and never one
+    /// below `min_deadline`, which OpenDAL's clamp would panic on).
+    pub fn params(&self, call_timeout: Duration) -> crate::engine::stack::TailCutParams {
+        let min_deadline = self.min_deadline.get();
         crate::engine::stack::TailCutParams {
             percentile: self.percentile,
             safety_factor: self.safety_factor,
             min_samples: self.min_samples,
-            min_deadline: self.min_deadline.get(),
-            max_deadline: self.max_deadline.map_or(op_timeout, HumanDuration::get),
+            min_deadline,
+            max_deadline: self
+                .max_deadline
+                .map_or(call_timeout.max(min_deadline), HumanDuration::get),
             window: self.window.get(),
         }
     }
@@ -283,7 +289,8 @@ impl Default for Throttle {
     }
 }
 
-/// `FoyerLayer` over an in-memory foyer cache.
+/// `FoyerLayer` over an in-memory foyer cache of `memory` bytes of data: any object no larger
+/// than `memory` is cached whole, a larger one is read through.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Cache {
@@ -789,6 +796,17 @@ impl OperatorSpec {
             .timeout
             .as_ref()
             .map_or(Duration::from_secs(60), |t| t.op.get())
+    }
+
+    /// The longest a call that `TimeoutLayer` and `TailCutLayer` both time can last. OpenDAL's
+    /// `TimeoutLayer` gives `stat`-like calls `op` and every read, write, list and delete call
+    /// `io`; `TailCutLayer` has one deadline rule for all of them, so the timeout that bounds
+    /// every one is the shorter of the two (60 s, OpenDAL's default, without the layer).
+    pub fn call_timeout(&self) -> Duration {
+        self.layers
+            .timeout
+            .as_ref()
+            .map_or(Duration::from_secs(60), |t| t.op.get().min(t.io.get()))
     }
 
     /// Retries of a failed request (0 without the retry layer).

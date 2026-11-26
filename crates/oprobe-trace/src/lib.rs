@@ -29,8 +29,9 @@
 //!   verb, connections, bytes and a timeline.
 //! - [`Handle::save`] and [`Snapshot::save`] write a `.oprobe` file (format `oprobe.trace/9`).
 //! - [`Exporter`] receives every request, operation and cache lookup as it completes; with the
-//!   `otel` feature, [`otel::OtelExporter`] records the requests into the OpenTelemetry
-//!   histogram `http.client.request.duration`, stage by stage.
+//!   `otel` feature, [`otel::OtelExporter`] records every HTTP request once into the
+//!   OpenTelemetry histogram `http.client.request.duration` and its stages into
+//!   `oprobe.http.client.request.stage.duration`.
 //! - [`Config`] sets the row budget, the HTTP client settings and the exporter.
 //!
 //! # How it works
@@ -42,6 +43,33 @@
 //! window to open, and memory stays bounded ([`Config::max_rows`]). The cost is measured by the
 //! `overhead` benchmark (`cargo bench -p oprobe-trace --bench overhead`), whose budget is 2 µs
 //! per operation.
+//!
+//! # The HTTP transport and where the layer goes
+//!
+//! Dial, TLS and connection statistics can only be measured from inside the HTTP client, so by
+//! default the layer brings its own and **replaces the transport installed on the operator**.
+//! OpenDAL composes transports in the order of the `.layer(...)` calls: each layer receives
+//! the transport the layers before it left and may wrap or replace it. Therefore:
+//!
+//! - **Add the trace layer first**, before any layer that touches the transport. A
+//!   `ConcurrentLimitLayer::with_http_concurrent_limit` added *after* it wraps the instrumented
+//!   client and keeps limiting; added *before* it, the limiter wraps a transport the trace
+//!   layer then replaces, and stops limiting. ([`Handle::queue_layer`], added last, records
+//!   the time requests wait for such a limiter.)
+//! - **A custom client is not used.** A transport you installed yourself
+//!   (`Operator::with_context(OperationContext::new().with_http_transport(..))`) with its own
+//!   proxy, TLS roots, timeouts or pool is replaced as well; so is the process default
+//!   (`HttpTransporter::install_default`). Express the settings on [`Config`]
+//!   ([`Config::proxy`], [`Config::extra_ca_pem`], [`Config::http_version`],
+//!   [`Config::keep_alive`], [`Config::max_inflight`]) or keep your client:
+//! - **[`Config::keep_http_transport`]** makes the layer wrap the installed transport instead
+//!   of replacing it. Your client, and every limiter beneath the trace layer, carries the
+//!   requests unchanged, wherever the layer sits. The layer then sees each request from
+//!   outside: queue, time to first byte, body, stall, status, bytes and errors are recorded,
+//!   but DNS, TCP and TLS time are part of the time to first byte, and connections (reuse,
+//!   dials, kernel TCP statistics) are not observed.
+//!
+//! `format!("{:?}", layer)` says which of the two a [`TraceLayer`] does.
 //!
 //! # Stability
 //!
@@ -127,6 +155,7 @@ pub struct Config {
     max_rows: usize,
     transport: net::TransportConfig,
     https: bool,
+    keep_http_transport: bool,
     exporter: Option<Arc<dyn Exporter>>,
     exporter_factory: Option<Arc<dyn Fn() -> Arc<dyn Exporter> + Send + Sync>>,
 }
@@ -137,6 +166,7 @@ impl Default for Config {
             max_rows: 10_000,
             transport: net::TransportConfig::default(),
             https: true,
+            keep_http_transport: false,
             exporter: None,
             exporter_factory: None,
         }
@@ -150,6 +180,7 @@ impl std::fmt::Debug for Config {
             .field("http_version", &self.transport.http)
             .field("keep_alive", &self.transport.keep_alive)
             .field("https", &self.https)
+            .field("keep_http_transport", &self.keep_http_transport)
             .field(
                 "exporter",
                 &(self.exporter.is_some() || self.exporter_factory.is_some()),
@@ -220,6 +251,36 @@ impl Config {
         self
     }
 
+    /// Keep the HTTP transport already installed on the operator and observe it from outside,
+    /// instead of replacing it with oprobe's instrumented client (default false).
+    ///
+    /// Use it when the operator has its own HTTP client (a proxy, private TLS roots, timeouts,
+    /// pool limits set in code) or when a layer added before this one wraps the transport (an
+    /// HTTP concurrency limit): the requests keep going through all of it.
+    ///
+    /// ```
+    /// # use opendal_core::{HttpTransporter, OperationContext, Operator, services::Memory};
+    /// # fn demo(op: Operator, my_client: HttpTransporter) {
+    /// let cfg = oprobe_trace::Config::default().keep_http_transport(true);
+    /// let (trace, handle) = oprobe_trace::layer(cfg);
+    /// let op = op
+    ///     .with_context(OperationContext::new().with_http_transport(my_client))
+    ///     .layer(trace);
+    /// # let _ = (op, handle);
+    /// # }
+    /// ```
+    ///
+    /// The price is what only the client itself can see: DNS, TCP, proxy and TLS time are not
+    /// split out (they are part of the time to first byte), and connections (reuse, dials,
+    /// kernel TCP statistics) are not observed. The client settings of this `Config`
+    /// ([`Config::http_version`], [`Config::keep_alive`], [`Config::proxy`],
+    /// [`Config::extra_ca_pem`], [`Config::insecure_skip_verify`], [`Config::tcp_info`]) do
+    /// not apply: the client is yours. [`Config::max_inflight`] still does.
+    pub fn keep_http_transport(mut self, on: bool) -> Self {
+        self.keep_http_transport = on;
+        self
+    }
+
     /// Call `e` for every recorded request and operation (metrics, logs, your own sink).
     pub fn exporter(mut self, e: Arc<dyn Exporter>) -> Self {
         self.exporter = Some(e);
@@ -249,6 +310,11 @@ impl Config {
 /// The OpenDAL layer of [`layer`]: every OpenDAL call as one operation, with the backend
 /// requests it issued (the instrumented HTTP transport and scope propagation for HTTP services,
 /// one record per backend call for in-process services).
+///
+/// Unless built with [`Config::keep_http_transport`], it **replaces** the operator's HTTP
+/// transport with its instrumented client: add it before any layer that wraps the transport
+/// (see [the crate documentation](crate#the-http-transport-and-where-the-layer-goes)). Its
+/// `Debug` output names what it does to the transport.
 #[derive(Clone)]
 pub struct TraceLayer {
     recorder: Arc<Recorder>,
@@ -262,7 +328,14 @@ pub struct TraceLayer {
 
 impl std::fmt::Debug for TraceLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("TraceLayer")
+        let http_transport = match &self.context {
+            Some(c) if c.keeps_installed() => "the installed transport, observed",
+            Some(_) => "replaced by the instrumented client",
+            None => "not instrumented",
+        };
+        f.debug_struct("TraceLayer")
+            .field("http_transport", &http_transport)
+            .finish_non_exhaustive()
     }
 }
 
@@ -368,7 +441,19 @@ impl Handle {
     }
 
     /// Outermost layer to place outside `ConcurrentLimitLayer` so time spent waiting for an
-    /// HTTP concurrency permit is recorded in the `queue` stage of every request.
+    /// HTTP concurrency permit is recorded in the `queue` stage of every request:
+    ///
+    /// ```
+    /// # use opendal_core::{Operator, raw::Layer};
+    /// # fn demo<L: Layer>(op: Operator, concurrent_limit_layer: L) {
+    /// let (trace, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+    /// let op = op
+    ///     .layer(trace) // first: it installs the client the limiter then wraps
+    ///     .layer(concurrent_limit_layer) // ConcurrentLimitLayer::with_http_concurrent_limit
+    ///     .layer(handle.queue_layer()); // last: stamps requests before they wait
+    /// # let _ = op;
+    /// # }
+    /// ```
     pub fn queue_layer(&self) -> QueueStampLayer {
         QueueStampLayer
     }
@@ -401,7 +486,8 @@ impl Handle {
     }
 
     /// Why HTTP requests are not instrumented (the transport could not be built, for example
-    /// an invalid proxy URL); only in-process services are observed then.
+    /// an invalid proxy URL); only in-process services are observed then, and the operator
+    /// keeps the transport it had.
     pub fn transport_error(&self) -> Option<&str> {
         self.transport_error.as_deref()
     }
@@ -438,11 +524,19 @@ pub fn layer(cfg: Config) -> (TraceLayer, Handle) {
     let http_version = cfg.transport.http;
     let keep_alive = cfg.transport.keep_alive;
     let max_inflight_count = cfg.transport.max_inflight;
-    let (context, transport_error) =
+    let (context, transport_error) = if cfg.keep_http_transport {
+        let observed = TraceContextLayer::around_installed(recorder.clone(), max_inflight_count);
+        (Some(observed), None)
+    } else {
         match net::FidelityTransport::new(cfg.transport, cfg.https, Some(recorder.clone())) {
             Ok(t) => (Some(TraceContextLayer::new(t)), None),
-            Err(e) => (None, Some(Arc::from(format!("{e:#}")))),
-        };
+            // A proxy URL may carry `user:password@`.
+            Err(e) => {
+                let why = util::strip_url_credentials(&format!("{e:#}"));
+                (None, Some(Arc::from(why)))
+            }
+        }
+    };
     let service = Arc::new(std::sync::OnceLock::new());
     let linker = Arc::new(observe::Linker::default());
     (

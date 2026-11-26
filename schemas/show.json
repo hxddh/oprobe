@@ -373,7 +373,7 @@
     },
     "Cache": {
       "additionalProperties": false,
-      "description": "`FoyerLayer` over an in-memory foyer cache.",
+      "description": "`FoyerLayer` over an in-memory foyer cache of `memory` bytes of data: any object no larger\nthan `memory` is cached whole, a larger one is read through.",
       "properties": {
         "memory": {
           "$ref": "#/$defs/ByteSize",
@@ -3905,7 +3905,7 @@
     },
     "TailCut": {
       "additionalProperties": false,
-      "description": "`TailCutLayer`: cancel (and, through `RetryLayer`, re-issue) a request slower than the\n`percentile` of the recent latencies × `safety_factor`, the deadline clamped to\n`[min_deadline, max_deadline]`.\n\nThe defaults are what oprobe measures with, not OpenDAL's (1.3, 200 samples, 500 ms, 30 s):\na shorter warm-up and floor so that short runs can see the layer work, and a ceiling at the\noperation timeout. Generated Rust spells out every value that differs from OpenDAL's default.",
+      "description": "`TailCutLayer`: cancel (and, through `RetryLayer`, re-issue) a request slower than the\n`percentile` of the recent latencies × `safety_factor`, the deadline clamped to\n`[min_deadline, max_deadline]`.\n\nThe defaults are what oprobe measures with, not OpenDAL's (1.3, 200 samples, 500 ms, 30 s):\na shorter warm-up and floor so that short runs can see the layer work, and a ceiling at the\ntimeout that severs the same calls. Generated Rust spells out every value that differs from OpenDAL's default.",
       "properties": {
         "max_deadline": {
           "anyOf": [
@@ -3916,7 +3916,7 @@
               "type": "null"
             }
           ],
-          "description": "The longest deadline (unset: the operation timeout, `layers.timeout.op`, or 60 s without\nthe timeout layer)."
+          "description": "The longest deadline (unset: the shorter of `layers.timeout.op` and `layers.timeout.io`,\nthe timeouts that sever the calls this layer times; 60 s without the timeout layer)."
         },
         "min_deadline": {
           "$ref": "#/$defs/HumanDuration",

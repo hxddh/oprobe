@@ -7,8 +7,12 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::build::{Arg, OpendalDefault, layer_params};
+use super::build::{Arg, CACHE_SHARDS, OpendalDefault, cache_max_entry_bytes, layer_params};
 use super::*;
+use crate::model::spec::REDACTED;
+
+/// What generated Rust says in place of a secret option's value.
+const SECRET_NOTE: &str = "a secret, not written here: your credential chain provides it";
 
 /// Operations a concurrent-limit layer allows when only the HTTP limit is set (unlimited in
 /// practice; `ConcurrentLimitLayer::new` needs a number).
@@ -252,19 +256,52 @@ pub fn layer_rust(s: &OperatorSpec, name: &str) -> Option<String> {
         "tail_cut" if calls.is_empty() => "TailCutLayer::new()".to_owned(),
         "tail_cut" => format!("TailCutLayer::builder(){calls}.build()"),
         "throttle" => format!("ThrottleLayer::new({ctor})"),
-        "cache" => format!(
-            "FoyerLayer::new(HybridCacheBuilder::new().memory({ctor}).with_shards(8).with_weighter(|_: &FoyerKey, v: &FoyerValue| v.len()).with_filter(|_: &FoyerKey, v: &FoyerValue| v.len() <= {ctor} / 8).storage().build().await?)"
-        ),
+        "cache" => cache_rust(params.first()?.value),
         _ => return None,
     })
 }
 
-/// The layer names in the order oprobe stacks them (innermost first).
+/// The cache layer as [`super::build::memory_cache`] builds it and `apply_layers` installs it:
+/// the same budget, shards, weighter and admission limit.
+fn cache_rust(memory: Arg) -> String {
+    let Arg::Bytes(memory_bytes) = memory else {
+        unreachable!("cache parameter {memory:?}")
+    };
+    let memory = rust_arg(memory);
+    let max_entry = rust_size(ByteSize(cache_max_entry_bytes(memory_bytes as usize) as u64));
+    format!(
+        "FoyerLayer::new(HybridCacheBuilder::new().memory({memory}).with_shards({CACHE_SHARDS}).with_weighter(|_: &FoyerKey, v: &FoyerValue| v.len()).with_filter(|_: &FoyerKey, v: &FoyerValue| v.len() <= {max_entry}).storage().build().await?).with_size_limit(..={max_entry})"
+    )
+}
+
+/// The layer names in the order oprobe stacks them, innermost first: the one order the
+/// measured operator is built in ([`super::build::apply_layers`]) and the generated Rust is
+/// written in. Read outermost first, a call passes
+/// `cache → retry → throttle → concurrent_limit → tail_cut → timeout → service`:
+///
+/// - `timeout` and `tail_cut` time one call to the service and nothing else. `tail_cut` is
+///   the outer of the two, so its default ceiling is the timeout that severs the same call
+///   ([`OperatorSpec::call_timeout`]).
+/// - `concurrent_limit` is outside both timers: waiting for an operation permit neither
+///   consumes a timeout nor counts as latency that `tail_cut` would cut (and re-issue into
+///   the same queue).
+/// - `throttle` is outside the limiter and the timers: a write waits for its bytes before it
+///   takes an operation permit, and the wait is not a slow call. (OpenDAL keeps the permit
+///   of a writer, a lister or a deleter from its first call until it is dropped, so the later
+///   writes of a multi-part upload are throttled with the permit held.)
+/// - `retry` is outside everything that can fail per attempt: every attempt is throttled,
+///   limited and timed again, and a `stat` or a read gives its permit back during the
+///   backoff.
+/// - `cache` is outermost: a hit touches none of the others.
+///
+/// One wait cannot be moved: the HTTP permit of `concurrent_limit.http` is taken inside the
+/// service (OpenDAL wraps the HTTP transport), so it is always inside `timeout` and
+/// `tail_cut`.
 pub const LAYER_ORDER: [&str; 6] = [
-    "throttle",
-    "concurrent_limit",
     "timeout",
     "tail_cut",
+    "concurrent_limit",
+    "throttle",
     "retry",
     "cache",
 ];
@@ -315,8 +352,9 @@ fn http_client_expr(s: &OperatorSpec) -> (String, bool) {
     match s.http.version {
         HttpVersion::H2 if h2c => e += ".http2_prior_knowledge()",
         HttpVersion::H2 => {}
-        HttpVersion::H1 => e += ".http1_only()",
-        HttpVersion::Auto => {}
+        // `auto` is OpenDAL's default client, which speaks HTTP/1.1 only: a client built here
+        // must say so, or reqwest's `http2` feature would negotiate h2.
+        HttpVersion::H1 | HttpVersion::Auto => e += ".http1_only()",
     }
     if !s.http.keep_alive {
         e += ".pool_max_idle_per_host(0)";
@@ -359,21 +397,27 @@ fn rust_diff(a: &OperatorSpec, b: &OperatorSpec, changes: &[Change]) -> String {
             .iter()
             .any(|c| c.path == prefix || c.path.starts_with(&format!("{prefix}.")))
     };
+    let shown = b.redacted().options;
     for c in changes
         .iter()
         .filter(|c| c.path.starts_with("options.") || c.path == "url")
     {
-        let _ = writeln!(
-            out,
-            "{} {} = {}",
-            match c.kind {
-                ChangeKind::Added => "+",
-                ChangeKind::Changed => "~",
-                ChangeKind::Removed => "-",
-            },
-            c.path,
-            c.to.as_deref().or(c.from.as_deref()).unwrap_or_default()
-        );
+        let sign = match c.kind {
+            ChangeKind::Added => "+",
+            ChangeKind::Changed => "~",
+            ChangeKind::Removed => "-",
+        };
+        let value = c.to.as_deref().or(c.from.as_deref()).unwrap_or_default();
+        // A secret is never code to paste: the line says where it comes from instead. A
+        // `${NAME}` reference is read from the environment, as the whole operator reads it.
+        // The option as the TOML shows it (`b`'s, a reference kept), else the removed value.
+        let option = c.path.strip_prefix("options.").and_then(|k| shown.get(k));
+        let plain = option.map_or(value.trim_matches('"'), String::as_str);
+        let _ = match rust_string(plain) {
+            _ if plain == REDACTED => writeln!(out, "{sign} {} // {SECRET_NOTE}", c.path),
+            (read, true) if option.is_some() => writeln!(out, "{sign} {} = {read}", c.path),
+            _ => writeln!(out, "{sign} {} = {value}", c.path),
+        };
     }
     for name in LAYER_ORDER {
         if !touched(&format!("layers.{name}")) {
@@ -574,29 +618,90 @@ fn resolved_rust_target(s: &OperatorSpec) -> (String, BTreeMap<String, String>) 
     (svc, red.options)
 }
 
-/// The whole operator as Rust: the imports, the service from its URL (or canonical scheme and
-/// options), every layer of the stack, the HTTP transport context, and any reader/writer builders.
-pub fn to_rust(s: &OperatorSpec) -> String {
-    let mut out = String::new();
-    let need_http = need_http_client(s);
-    let mut layer_exprs: Vec<(&str, String)> = Vec::new();
-    for name in LAYER_ORDER {
-        if let Some(e) = layer_rust(s, name) {
-            layer_exprs.push((name, e));
+/// A string option as a Rust `String` expression, and whether it reads the environment: a
+/// `${NAME}` reference becomes `std::env::var("NAME")?`, read when the code runs, as oprobe
+/// expands it when it builds the operator ([`crate::config::expand_env`]).
+fn rust_string(v: &str) -> (String, bool) {
+    let escaped = |text: &str| text.replace('{', "{{").replace('}', "}}");
+    let (mut format, mut vars) = (String::new(), Vec::new());
+    let mut rest = v;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else { break };
+        format += &escaped(&rest[..start]);
+        format += "{}";
+        vars.push(format!("std::env::var({:?})?", &after[..end]));
+        rest = &after[end + 1..];
+    }
+    format += &escaped(rest);
+    match vars.as_slice() {
+        [] => (format!("{v:?}.to_owned()"), false),
+        [var] if format == "{}" => (var.clone(), true),
+        _ => (format!("format!({format:?}, {})", vars.join(", ")), true),
+    }
+}
+
+/// The service of `s` as a Rust expression (indented for a function body, without the final
+/// `;`), and whether it reads the environment.
+///
+/// A secret option is never written: a value oprobe redacted would replace the credential the
+/// program loads itself, so it is left out with a comment; a `${NAME}` reference is read from
+/// the environment, as the TOML keeps it.
+fn service_rust(s: &OperatorSpec) -> (String, bool) {
+    let disp_url = s.display_url();
+    let url_scheme = disp_url
+        .split_once("://")
+        .map(|(k, _)| k.to_ascii_lowercase())
+        .unwrap_or_default();
+    let fs_ok = url_scheme != "fs" || (disp_url.starts_with("fs:///") && disp_url.len() > 6);
+    let plain_uri = s.options.is_empty()
+        && CANONICAL_URI_SCHEMES.contains(&url_scheme.as_str())
+        && fs_ok
+        && !disp_url.contains('?');
+    if plain_uri {
+        return (format!("Operator::from_uri({disp_url:?})?"), false);
+    }
+    let (scheme, opts) = resolved_rust_target(s);
+    if opts.is_empty() {
+        return (format!("Operator::via_iter({scheme:?}, [])?"), false);
+    }
+    let mut out = format!("Operator::via_iter(\n        {scheme:?},\n        [\n");
+    let mut reads_env = false;
+    for (k, v) in &opts {
+        if v == REDACTED {
+            let _ = writeln!(out, "            // {k}: {SECRET_NOTE}");
+            continue;
         }
+        let (value, env) = rust_string(v);
+        reads_env |= env;
+        let _ = writeln!(out, "            ({k:?}.to_owned(), {value}),");
     }
-    let need_duration = layer_exprs.iter().any(|(_, e)| e.contains("Duration::"));
-    if need_duration {
-        let _ = writeln!(out, "use std::time::Duration;");
+    out.push_str("        ],\n    )?");
+    (out, reads_env)
+}
+
+/// The whole operator as Rust that compiles as written: the imports, `build_operator()` (the
+/// service from its URL or its canonical scheme and options, every layer of the stack in
+/// [`LAYER_ORDER`], the HTTP transport), and `reader()` / `writer()` with the `[read]` and
+/// `[write]` options. `crates/oprobe-core/tests/codegen/` holds this output for a matrix of
+/// operators, compiled against the workspace's OpenDAL.
+pub fn to_rust(s: &OperatorSpec) -> String {
+    let layers: Vec<(&str, String)> = LAYER_ORDER
+        .iter()
+        .filter_map(|name| Some((*name, layer_rust(s, name)?)))
+        .collect();
+    let need_http = need_http_client(s);
+    let cache = s.layers.cache.is_some();
+    let (service, reads_env) = service_rust(s);
+
+    let mut out = String::new();
+    if layers.iter().any(|(_, e)| e.contains("Duration::")) {
+        out.push_str("use std::time::Duration;\n\n");
     }
-    if s.layers.cache.is_some() {
-        let _ = writeln!(out, "use foyer::HybridCacheBuilder;");
+    if cache {
+        out.push_str("use foyer::HybridCacheBuilder;\n");
     }
-    let _ = writeln!(out, "use opendal::Operator;");
-    if need_http {
-        let _ = writeln!(out, "use opendal::{{HttpTransporter, OperationContext}};");
-    }
-    let layer_types: Vec<&str> = layer_exprs
+    let mut layer_types: Vec<&str> = layers
         .iter()
         .flat_map(|(name, _)| match *name {
             "throttle" => &["ThrottleLayer"][..],
@@ -610,63 +715,88 @@ pub fn to_rust(s: &OperatorSpec) -> String {
         })
         .copied()
         .collect();
-    if layer_types.len() == 1 {
-        let _ = writeln!(out, "use opendal::layers::{};", layer_types[0]);
-    } else if layer_types.len() > 1 {
-        let _ = writeln!(out, "use opendal::layers::{{{}}};", layer_types.join(", "));
-    }
+    layer_types.sort_unstable();
+    let import = |module: &str, names: &[&str]| match names {
+        [] => String::new(),
+        [one] => format!("use {module}::{one};\n"),
+        _ => format!("use {module}::{{{}}};\n", names.join(", ")),
+    };
+    out += &import("opendal::layers", &layer_types);
+    let mut types = vec!["Operator"];
     if need_http {
-        let _ = writeln!(out, "use opendal_http_transport_reqwest::ReqwestTransport;");
+        types.extend(["HttpTransporter", "OperationContext"]);
     }
-    out.push('\n');
+    if !s.read.is_default() {
+        types.push("Reader");
+    }
+    if !s.write.is_default() {
+        types.push("Writer");
+    }
+    types.sort_unstable();
+    out += &import("opendal", &types);
+    if need_http {
+        out.push_str("use opendal_http_transport_reqwest::ReqwestTransport;\n");
+    }
 
-    let disp_url = s.display_url();
-    let url_scheme = disp_url
-        .split_once("://")
-        .map(|(k, _)| k.to_ascii_lowercase())
-        .unwrap_or_default();
-    let fs_ok = url_scheme != "fs" || (disp_url.starts_with("fs:///") && disp_url.len() > 6);
-    let plain_uri = s.options.is_empty()
-        && CANONICAL_URI_SCHEMES.contains(&url_scheme.as_str())
-        && fs_ok
-        && !disp_url.contains('?');
-    if plain_uri {
-        let _ = writeln!(out, "let op = Operator::from_uri({disp_url:?})?");
+    // Only OpenDAL can fail unless the code also reads the environment, builds an HTTP client
+    // or builds the cache.
+    let result = if reads_env || need_http || cache {
+        "Result<Operator, Box<dyn std::error::Error + Send + Sync>>"
     } else {
-        let (scheme, opts) = resolved_rust_target(s);
-        if opts.is_empty() {
-            let _ = writeln!(
-                out,
-                "let op = Operator::via_iter({scheme:?}, std::iter::empty::<(&str, &str)>())?"
-            );
-        } else {
-            let _ = writeln!(out, "let op = Operator::via_iter(\n    {scheme:?},\n    [");
-            for (k, v) in &opts {
-                let _ = writeln!(out, "        ({k:?}, {v:?}),");
-            }
-            let _ = writeln!(out, "    ],\n)?");
-        }
+        "opendal::Result<Operator>"
+    };
+    let asyncness = if cache { "async " } else { "" };
+    let _ = writeln!(
+        out,
+        "\n/// The operator as oprobe measured it.\npub {asyncness}fn build_operator() -> {result} {{"
+    );
+    let _ = write!(out, "    let op = {service}");
+    // A multi-line service expression ends at the statement's own indent.
+    let indent = if service.ends_with("\n    )?") {
+        "    "
+    } else {
+        "        "
+    };
+    if !layers.is_empty() {
+        let _ = write!(
+            out,
+            "\n{indent}// Innermost first: each layer wraps the ones before it."
+        );
     }
-    for (_, e) in &layer_exprs {
-        let _ = writeln!(out, "    .layer({e})");
+    if s.http_limit().is_some() {
+        let _ = write!(
+            out,
+            "\n{indent}// The HTTP permits are taken inside the service: waiting for one counts against\n{indent}// the timeout and tail-cut layers."
+        );
+    }
+    for (_, e) in &layers {
+        let _ = write!(out, "\n{indent}.layer({e})");
     }
     out.push_str(";\n");
     if need_http {
         let (client, alpn_h2) = http_client_expr(s);
         if alpn_h2 {
-            let _ = writeln!(out, "// reqwest `http2` feature negotiates ALPN h2");
+            out.push_str("    // reqwest's `http2` feature negotiates h2 through ALPN.\n");
         }
-        let _ = writeln!(out, "let client = {client};");
-        let _ = writeln!(
-            out,
-            "let op = op.with_context(OperationContext::new().with_http_transport(HttpTransporter::new(ReqwestTransport::new(client))));"
+        let _ = writeln!(out, "    let client = {client};");
+        out.push_str(
+            "    let op = op.with_context(OperationContext::new().with_http_transport(HttpTransporter::new(ReqwestTransport::new(client))));\n",
         );
     }
+    out.push_str("    Ok(op)\n}\n");
     if !s.read.is_default() {
-        let _ = writeln!(out, "let reader = {}.await?;", read_rust(s));
+        let _ = write!(
+            out,
+            "\n/// A reader of `path` with the measured `[read]` options.\npub async fn reader(op: &Operator, path: &str) -> opendal::Result<Reader> {{\n    {}.await\n}}\n",
+            read_rust(s)
+        );
     }
     if !s.write.is_default() {
-        let _ = writeln!(out, "let writer = {}.await?;", write_rust(s));
+        let _ = write!(
+            out,
+            "\n/// A writer to `path` with the measured `[write]` options.\npub async fn writer(op: &Operator, path: &str) -> opendal::Result<Writer> {{\n    {}.await\n}}\n",
+            write_rust(s)
+        );
     }
     out
 }
@@ -761,7 +891,7 @@ mod tests {
         );
         // oprobe's tail-cut parameters differ from OpenDAL's: they are spelled out.
         assert!(
-            r.contains(".layer(TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(60)).build())"),
+            r.contains(".layer(TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(10)).build())"),
             "{r}"
         );
         assert!(r.contains(".layer(RetryLayer::new())"), "{r}");
@@ -769,7 +899,7 @@ mod tests {
         // it (foyer's default weighs every entry 1).
         assert!(
             r.contains(
-                "FoyerLayer::new(HybridCacheBuilder::new().memory(256 * 1024 * 1024).with_shards(8).with_weighter(|_: &FoyerKey, v: &FoyerValue| v.len()).with_filter(|_: &FoyerKey, v: &FoyerValue| v.len() <= 256 * 1024 * 1024 / 8).storage().build().await?)"
+                "FoyerLayer::new(HybridCacheBuilder::new().memory(256 * 1024 * 1024).with_shards(1).with_weighter(|_: &FoyerKey, v: &FoyerValue| v.len()).with_filter(|_: &FoyerKey, v: &FoyerValue| v.len() <= 256 * 1024 * 1024).storage().build().await?).with_size_limit(..=256 * 1024 * 1024)"
             ),
             "{r}"
         );
@@ -778,9 +908,138 @@ mod tests {
             "{r}"
         );
         assert!(r.contains("op.reader_with(path).concurrent(4)"), "{r}");
-        // Innermost first: throttle before retry, cache last.
-        assert!(r.find("ThrottleLayer").unwrap() < r.find("RetryLayer").unwrap());
-        assert!(r.find("RetryLayer").unwrap() < r.find("FoyerLayer").unwrap());
+        // The read options are a function of their own: `path` is its parameter.
+        assert!(
+            r.contains("pub async fn reader(op: &Operator, path: &str) -> opendal::Result<Reader> {\n    op.reader_with(path).concurrent(4).await\n}"),
+            "{r}"
+        );
+        // Innermost first, in the order the operator is built in.
+        let at = |layer: &str| r.find(&format!(".layer({layer}")).unwrap();
+        let order = [
+            "TimeoutLayer",
+            "TailCutLayer",
+            "ThrottleLayer",
+            "RetryLayer",
+            "FoyerLayer",
+        ];
+        assert!(order.windows(2).all(|w| at(w[0]) < at(w[1])), "{r}");
+    }
+
+    /// The one order of the stack, outermost first: cache, retry, throttle, the limiter, then
+    /// the two timers around the service. The measured operator is built by walking it
+    /// (`apply_layers`) and so is the generated Rust, so they cannot disagree.
+    #[test]
+    fn the_stack_is_built_and_generated_in_one_order() {
+        let outermost_first: Vec<&str> = LAYER_ORDER.iter().rev().copied().collect();
+        assert_eq!(
+            outermost_first,
+            [
+                "cache",
+                "retry",
+                "throttle",
+                "concurrent_limit",
+                "tail_cut",
+                "timeout"
+            ]
+        );
+        let s = OperatorSpec::parse(
+            "url = \"memory://\"\n[layers]\nconcurrent_limit = { http = 4 }\ntail_cut = true\nthrottle = true\ncache = true\n",
+        )
+        .unwrap();
+        let r = to_rust(&s);
+        let generated: Vec<&str> = r
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix(".layer("))
+            .map(|l| l.split("::").next().unwrap())
+            .collect();
+        assert_eq!(
+            generated,
+            [
+                "TimeoutLayer",
+                "TailCutLayer",
+                "ConcurrentLimitLayer",
+                "ThrottleLayer",
+                "RetryLayer",
+                "FoyerLayer"
+            ]
+        );
+        // The wait OpenDAL's design leaves inside the timers is said where the code is read.
+        assert!(
+            r.contains("// The HTTP permits are taken inside the service"),
+            "{r}"
+        );
+    }
+
+    /// The tail-cut ceiling is one the layer can reach: the shorter of the two timeouts that
+    /// sever the calls it times (9.1 used the operation timeout, 60 s, under a 10 s io
+    /// timeout: every deadline above 10 s ended as "io timeout"). A given `max_deadline` is
+    /// kept; without the timeout layer the ceiling stays 60 s.
+    #[test]
+    fn the_tail_cut_ceiling_is_the_timeout_that_bounds_the_call() {
+        let ceiling = |layers: &str| {
+            let s =
+                OperatorSpec::parse(&format!("url = \"s3://b\"\n[layers]\n{layers}\n")).unwrap();
+            let p = layer_params(&s, "tail_cut").unwrap();
+            let max = p.iter().find(|p| p.method == "max_deadline").unwrap().value;
+            // The analysis replays the same parameters.
+            let model = s.layers.tail_cut.clone().unwrap().params(s.call_timeout());
+            assert_eq!(max, Arg::Time(model.max_deadline));
+            let Arg::Time(d) = max else { unreachable!() };
+            (d, layer_rust(&s, "tail_cut").unwrap())
+        };
+        let secs = Duration::from_secs;
+        // The defaults: op 60 s, io 10 s.
+        let (d, rust) = ceiling("tail_cut = true");
+        assert_eq!(d, secs(10));
+        assert!(
+            rust.contains(".max_deadline(Duration::from_secs(10))"),
+            "{rust}"
+        );
+        // The shorter of the two, whichever it is.
+        assert_eq!(
+            ceiling("tail_cut = true\ntimeout = { op = \"4s\", io = \"10s\" }").0,
+            secs(4)
+        );
+        assert_eq!(
+            ceiling("tail_cut = true\ntimeout = { op = \"30s\", io = \"2500ms\" }").0,
+            Duration::from_millis(2500)
+        );
+        // Given: kept as given, even above the timeouts.
+        assert_eq!(ceiling("tail_cut = { max_deadline = \"45s\" }").0, secs(45));
+        // No timeout layer: nothing severs the call; OpenDAL's 60 s.
+        assert_eq!(ceiling("tail_cut = true\ntimeout = false").0, secs(60));
+        // Never below the floor (OpenDAL clamps the deadline to [min, max] and panics on
+        // min > max).
+        assert_eq!(
+            ceiling("tail_cut = true\ntimeout = { op = \"20ms\", io = \"20ms\" }").0,
+            Duration::from_millis(50)
+        );
+    }
+
+    /// The generated cache is the measured cache: one admission rule
+    /// ([`cache_max_entry_bytes`]) and one shard count, in the cache's filter and in the
+    /// layer's size limit.
+    #[test]
+    fn the_generated_cache_is_the_measured_cache() {
+        let s = OperatorSpec::parse("url = \"s3://b\"\n[layers]\ncache = { memory = \"3MiB\" }\n")
+            .unwrap();
+        let rust = layer_rust(&s, "cache").unwrap();
+        let max_entry = cache_max_entry_bytes(3 << 20);
+        assert_eq!(
+            max_entry,
+            3 << 20,
+            "an object that fits the budget is admitted"
+        );
+        assert_eq!(rust_size(ByteSize(max_entry as u64)), "3 * 1024 * 1024");
+        for part in [
+            ".memory(3 * 1024 * 1024)".to_owned(),
+            format!(".with_shards({CACHE_SHARDS})"),
+            ".with_weighter(|_: &FoyerKey, v: &FoyerValue| v.len())".to_owned(),
+            ".with_filter(|_: &FoyerKey, v: &FoyerValue| v.len() <= 3 * 1024 * 1024)".to_owned(),
+            ".with_size_limit(..=3 * 1024 * 1024)".to_owned(),
+        ] {
+            assert!(rust.contains(&part), "{part} not in {rust}");
+        }
     }
 
     /// Evaluate one argument of generated Rust.
@@ -926,7 +1185,8 @@ mod tests {
                 assert_eq!(got, want, "{name}: measured != emitted: {expr}\n{text}");
             }
         }
-        // The tail-cut ceiling follows the operation timeout.
+        // A given tail-cut ceiling is kept; the default follows the timeouts
+        // (`the_tail_cut_ceiling_is_the_timeout_that_bounds_the_call`).
         let s = OperatorSpec::parse(specs[1]).unwrap();
         assert!(
             layer_rust(&s, "tail_cut")
@@ -934,11 +1194,11 @@ mod tests {
                 .contains(".max_deadline(Duration::from_secs(3))")
         );
         let mut s = OperatorSpec::parse(specs[0]).unwrap();
-        s.set("layers.timeout.op", "12s").unwrap();
+        s.set("layers.timeout.op", "7s").unwrap();
         assert!(
             layer_rust(&s, "tail_cut")
                 .unwrap()
-                .contains(".max_deadline(Duration::from_secs(12))")
+                .contains(".max_deadline(Duration::from_secs(7))")
         );
     }
 
@@ -976,6 +1236,49 @@ mod tests {
             d.toml.contains("secret_access_key = \"<redacted>\""),
             "{}",
             d.toml
+        );
+        // The Rust never carries a placeholder to paste in a credential's place: the diff
+        // names the option, the whole operator leaves it to the program.
+        assert!(
+            d.rust
+                .contains("~ options.secret_access_key // a secret, not written here"),
+            "{}",
+            d.rust
+        );
+        assert!(
+            d.rust.contains("+ options.session_token // a secret"),
+            "{}",
+            d.rust
+        );
+        let rust = to_rust(&b);
+        assert!(
+            !d.rust.contains(REDACTED) && !rust.contains(REDACTED),
+            "{}\n{rust}",
+            d.rust
+        );
+        assert!(
+            rust.contains("// secret_access_key: a secret, not written here"),
+            "{rust}"
+        );
+        // A `${NAME}` reference is no secret: the TOML keeps it, the Rust reads it.
+        b.set("options.secret_access_key", "${MY_SECRET}").unwrap();
+        let d = diff(&a, &b);
+        assert!(
+            d.toml.contains("secret_access_key = \"${MY_SECRET}\""),
+            "{}",
+            d.toml
+        );
+        assert!(
+            d.rust
+                .contains("~ options.secret_access_key = std::env::var(\"MY_SECRET\")?"),
+            "{}",
+            d.rust
+        );
+        assert!(
+            to_rust(&b)
+                .contains("(\"secret_access_key\".to_owned(), std::env::var(\"MY_SECRET\")?),"),
+            "{}",
+            to_rust(&b)
         );
     }
 
@@ -1019,7 +1322,7 @@ mod tests {
             "{full}"
         );
         assert!(
-            full.contains("use opendal::{HttpTransporter, OperationContext};")
+            full.contains("use opendal::{HttpTransporter, OperationContext, Operator};")
                 && full.contains("use opendal_http_transport_reqwest::ReqwestTransport;"),
             "{full}"
         );
@@ -1032,27 +1335,28 @@ mod tests {
         )
         .unwrap();
         let r = to_rust(&gcs);
-        assert!(r.contains("Operator::via_iter(\n    \"gcs\","), "{r}");
-        assert!(r.contains("(\"bucket\", \"my-bucket\")"), "{r}");
-        assert!(r.contains("(\"root\", \"/data\")"), "{r}");
-        assert!(r.contains("(\"service_account\", \"sa@proj.iam\")"), "{r}");
+        assert!(r.contains("Operator::via_iter(\n        \"gcs\","), "{r}");
+        let option = |k: &str, v: &str| format!("({k:?}.to_owned(), {v:?}.to_owned()),");
+        assert!(r.contains(&option("bucket", "my-bucket")), "{r}");
+        assert!(r.contains(&option("root", "/data")), "{r}");
+        assert!(r.contains(&option("service_account", "sa@proj.iam")), "{r}");
 
         let r2 = OperatorSpec::from_url("r2://assets/img");
         let r2_code = to_rust(&r2);
         assert!(
-            r2_code.contains("Operator::via_iter(\n    \"s3\","),
+            r2_code.contains("Operator::via_iter(\n        \"s3\","),
             "{r2_code}"
         );
-        assert!(r2_code.contains("(\"bucket\", \"assets\")"), "{r2_code}");
+        assert!(r2_code.contains(&option("bucket", "assets")), "{r2_code}");
 
         let lab = OperatorSpec::from_url("lab://demo");
         let lab_code = to_rust(&lab);
         assert!(
-            lab_code.contains("Operator::via_iter(\n    \"s3\","),
+            lab_code.contains("Operator::via_iter(\n        \"s3\","),
             "{lab_code}"
         );
         assert!(
-            lab_code.contains("(\"endpoint\", \"http://127.0.0.1:9000\")"),
+            lab_code.contains(&option("endpoint", "http://127.0.0.1:9000")),
             "{lab_code}"
         );
 
@@ -1060,14 +1364,14 @@ mod tests {
         let dav = OperatorSpec::from_url("webdav://127.0.0.1:8080/files");
         let dav_code = to_rust(&dav);
         assert!(
-            dav_code.contains("Operator::via_iter(\n    \"webdav\","),
+            dav_code.contains("Operator::via_iter(\n        \"webdav\","),
             "{dav_code}"
         );
 
         let fs_rel = OperatorSpec::from_url("fs://./local-dir");
         let fs_rel_code = to_rust(&fs_rel);
         assert!(
-            fs_rel_code.contains("Operator::via_iter(\n    \"fs\","),
+            fs_rel_code.contains("Operator::via_iter(\n        \"fs\","),
             "{fs_rel_code}"
         );
 

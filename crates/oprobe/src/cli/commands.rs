@@ -10,7 +10,7 @@ use crate::app::{Cancel, Ctx, RunOutcome, RunRef, RunRequest, input as i};
 use crate::errors::exit;
 use crate::report::style::dim;
 
-/// A cancel token that the first Ctrl-C trips (the second exits).
+/// A cancel token that the first Ctrl-C (or SIGTERM, SIGHUP) trips (the second exits).
 fn ctrl_c() -> Cancel {
     let cancel = Cancel::new();
     install_ctrl_c(cancel.clone());

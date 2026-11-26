@@ -26,7 +26,7 @@ The app's Profile view shows the same sections with charts ([app](app.md)).
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.1.0/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.2.0/docs/concepts.md#glossary
 ```
 
 (`oprobe demo`; your numbers differ from run to run.)
@@ -103,8 +103,8 @@ Each operation's wall time is split exactly; an instant counts once even when re
 |---|---|---|
 | queue | requests wait for a connection or an in-flight permit | a concurrency limit or a small pool; see `cold_connections` and `throttling` |
 | connect | DNS, TCP, proxy and TLS of a new connection | connections are not reused, or the proxy or TLS is slow (`http.keep_alive`, `http.version`) |
-| send | the request body goes out | upload bandwidth; `write.chunk`, `write.concurrent` |
-| TTFB | waiting for the first byte (the server's work plus one round trip) | the store or the distance to it; stragglers show as a long tail (`layers.tail_cut`) |
+| send | the request body goes out | upload bandwidth; `write.chunk`, `write.concurrent`. Uploads that share one saturated uplink are a `bandwidth_cap` (`layers.throttle.bandwidth`), not hung requests |
+| TTFB | waiting for the first byte (the server's work plus one round trip) | the store or the distance to it; stragglers show as a long tail (`layers.tail_cut`). A TTFB that grows with the requests in flight, in a run that varied them at least twofold, is the service's queue: `throttling` without a 429/503 (`layers.concurrent_limit.http`) |
 | body | the response body arrives | download bandwidth per stream × streams; `read.chunk`, `read.concurrent` |
 | stall | the body waits for your code to read it (client time: its own segment in a waterfall, never part of body) | the consumer, not storage |
 | retry | the retry layer sleeps before the next attempt | throttling or errors; see the findings (`errors` on retried 5xx or lost connections: `layers.retry.min_delay`) |
@@ -123,7 +123,12 @@ Each operation's wall time is split exactly; an instant counts once even when re
   OpenDAL's background tasks.
 - **Open loop** (`--rate`): latency counts from the intended start, and arrivals that never
   started count in every percentile as censored values, so a slow server cannot hide behind fewer
-  requests.
+  requests. A censored value is a lower bound (the arrival had waited that long when the window
+  ended; nothing says how much longer it would have taken), so those percentiles are "at least"
+  values. A p99 limit (`p99_ms`) is therefore checked against the worst the censored arrivals
+  allow: it is breached when more than 1 % of the scheduled arrivals never completed (the p99
+  then has no upper bound), and otherwise when the p99 with each of them counted as slower than
+  every completed operation exceeds it.
 - **Percentiles** are exact when every operation was kept, otherwise from histograms with three
   significant digits. Counts always agree with the totals. The report keeps the run's whole
   latency distribution (`latency_histogram`, 20 bins per decade), and the latency distribution

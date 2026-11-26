@@ -1,0 +1,5 @@
+url = "memory://"
+[layers]
+retry = false
+timeout = false
+cache = { memory = "1MiB" }

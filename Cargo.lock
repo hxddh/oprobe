@@ -4443,19 +4443,14 @@ dependencies = [
 
 [[package]]
 name = "oprobe"
-version = "9.1.0"
+version = "9.2.0"
 dependencies = [
  "anyhow",
  "await-tree",
- "bytes",
  "clap",
  "crossterm",
- "dirs",
  "futures",
  "http",
- "http-body-util",
- "hyper",
- "hyper-util",
  "jsonschema",
  "libc",
  "nsh-base",
@@ -4478,17 +4473,14 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-util",
  "toml 0.8.23",
- "tower-service",
- "url",
  "windows-sys 0.61.2",
  "zstd 0.14.4",
 ]
 
 [[package]]
 name = "oprobe-core"
-version = "9.1.0"
+version = "9.2.0"
 dependencies = [
  "anyhow",
  "await-tree",
@@ -4507,6 +4499,7 @@ dependencies = [
  "libc",
  "opendal",
  "opendal-core",
+ "opendal-http-transport-reqwest",
  "oprobe-trace",
  "rand 0.8.8",
  "rcgen",
@@ -4529,7 +4522,7 @@ dependencies = [
 
 [[package]]
 name = "oprobe-trace"
-version = "9.1.0"
+version = "9.2.0"
 dependencies = [
  "anyhow",
  "await-tree",
@@ -4538,7 +4531,9 @@ dependencies = [
  "hdrhistogram",
  "http",
  "http-body",
+ "http-body-util",
  "httpdate",
+ "hyper",
  "hyper-util",
  "libc",
  "opendal-core",

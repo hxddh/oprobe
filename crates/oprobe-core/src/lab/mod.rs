@@ -196,6 +196,56 @@ pub struct LabConfig {
     /// Answer this share of requests with a random `503 SlowDown` (half) or `500` (half),
     /// unrelated to the load.
     pub server_error_ratio: Option<f64>,
+    /// Fail the parts of multipart uploads from a part number on (a write that breaks
+    /// mid-way).
+    pub part_fault: Option<PartFault>,
+}
+
+/// A fault on `UploadPart` requests: parts numbered `from_part` and above (1-based, as S3
+/// numbers them) are received and then fail as `kind` says; earlier parts are stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartFault {
+    pub from_part: usize,
+    pub kind: PartFaultKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartFaultKind {
+    /// `403 AccessDenied`: a persistent error no client retries.
+    Deny,
+    /// No answer, ever: only a client timeout or a cancellation ends the request.
+    Stall,
+}
+
+/// What the lab saw of multipart uploads (server-side counts, whatever the client reports).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MultipartCounts {
+    /// `CreateMultipartUpload` requests.
+    pub created: u64,
+    /// `UploadPart` requests whose body arrived (failed and stalled ones included).
+    pub parts: u64,
+    /// Bytes of those parts.
+    pub part_bytes: u64,
+    /// `CompleteMultipartUpload` requests.
+    pub completed: u64,
+    /// `AbortMultipartUpload` requests.
+    pub aborted: u64,
+}
+
+impl MultipartCounts {
+    /// Every multipart request but the aborts (which are cleanup).
+    pub fn requests(&self) -> u64 {
+        self.created + self.parts + self.completed
+    }
+}
+
+#[derive(Default)]
+struct MultipartCounters {
+    created: AtomicU64,
+    parts: AtomicU64,
+    part_bytes: AtomicU64,
+    completed: AtomicU64,
+    aborted: AtomicU64,
 }
 
 /// Ask Windows for 1 ms timer resolution while a lab runs in this process (once; it lasts for
@@ -306,7 +356,7 @@ impl Scenario {
                  default workload: small-files, 64 × 64 KiB, 28 workers, 0.5 s warmup, 8 s"
             }
             Scenario::Throttle => {
-                "5 ms latency, 503 SlowDown above 8 concurrent requests; default workload: small-files, 32 workers"
+                "5 ms latency, 503 SlowDown above 8 concurrent requests; default workload: small-files, 48 workers"
             }
             Scenario::Stragglers => "5 ms latency, 3% of requests wait 400 ms",
             Scenario::Lossy => "20 ms latency, responses capped at 4 MiB/s per stream",
@@ -452,11 +502,19 @@ pub const DEMO_CONCURRENCY: usize = 28;
 pub const DEMO_STRAGGLER_EVERY: usize = 40;
 /// Extra delay of a `lab://demo` straggler.
 pub const DEMO_STRAGGLER_MS: u64 = 250;
-/// Workers of the `lab://throttle` default workload: four times its in-flight limit of 8. At
+/// Workers of the `lab://throttle` default workload: six times its in-flight limit of 8. At
 /// the profile default of 16, a few tenths of a percent of the operations met a 503 and its 1 s
 /// backoff, above the p99: the finding's remedy (a cap at the limit) then only queued the
 /// workers, and its prove on p99 could not decide (W8).
-pub const THROTTLE_CONCURRENCY: usize = 32;
+///
+/// 48, not 32: the workers start in step, so each burst rejects `workers − 8` of them, and
+/// those are the slow operations of a trial. The lab serves at most 8 requests per 5 ms
+/// (1 600/s), so a 2 s trial holds up to 3 200 operations and its p99 is the backoff only
+/// when more than 32 are slow. With 32 workers a burst rejects 24: about 1 % of a trial, on
+/// either side of the p99 depending on how fast the machine is (on a fast CI runner the
+/// baseline read 9 ms in some trials and 1 s in others, and the prove could not decide).
+/// With 48 a burst rejects 40.
+pub const THROTTLE_CONCURRENCY: usize = 48;
 /// Workers of the `lab://parquet` default workload (4 requests in flight per op: 6 fit, 8 throttle).
 pub const PARQUET_CONCURRENCY: usize = 8;
 
@@ -780,6 +838,7 @@ struct S3Store {
     objects: RwLock<BTreeMap<String, StoredObject>>,
     uploads: RwLock<HashMap<String, MultipartUploadState>>,
     completed_uploads: RwLock<CompletedUploads>,
+    multipart: MultipartCounters,
     req_seq: AtomicU64,
     upload_seq: AtomicU64,
     active_inflight: AtomicUsize,
@@ -1368,6 +1427,7 @@ async fn handle_s3_request<'a>(
 
     // Multipart Upload APIs
     if method == Method::POST && qmap.contains_key("uploads") {
+        store.multipart.created.fetch_add(1, Ordering::Relaxed);
         let upload_id = format!(
             "mpu-{}",
             store.upload_seq.fetch_add(1, Ordering::Relaxed) + 1
@@ -1412,6 +1472,29 @@ async fn handle_s3_request<'a>(
                 .await
                 .map(|c| c.to_bytes())
                 .unwrap_or_default();
+            store.multipart.parts.fetch_add(1, Ordering::Relaxed);
+            store
+                .multipart
+                .part_bytes
+                .fetch_add(part_bytes.len() as u64, Ordering::Relaxed);
+            match faults.part_fault.filter(|f| part_num >= f.from_part) {
+                Some(PartFault {
+                    kind: PartFaultKind::Deny,
+                    ..
+                }) => {
+                    return Ok(s3_error(
+                        StatusCode::FORBIDDEN,
+                        "AccessDenied",
+                        "Access Denied (lab part fault).",
+                        &req_id,
+                    ));
+                }
+                Some(PartFault {
+                    kind: PartFaultKind::Stall,
+                    ..
+                }) => std::future::pending::<()>().await,
+                None => {}
+            }
             let crc = crate::util::crc32c(&part_bytes);
             let etag = format!("\"{crc:08x}\"");
 
@@ -1445,6 +1528,7 @@ async fn handle_s3_request<'a>(
         }
 
         if method == Method::POST {
+            store.multipart.completed.fetch_add(1, Ordering::Relaxed);
             let _ = req.into_body().collect().await;
             if !faults.multipart_merge_delay.is_zero() {
                 tokio::time::sleep(faults.multipart_merge_delay).await;
@@ -1550,6 +1634,7 @@ async fn handle_s3_request<'a>(
         }
 
         if method == Method::DELETE {
+            store.multipart.aborted.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut ups) = store.uploads.write() {
                 ups.remove(upload_id);
             }
@@ -1892,6 +1977,19 @@ impl LabHandle {
         self.store.uploads.read().map(|m| m.len()).unwrap_or(0)
     }
 
+    /// The multipart requests served so far.
+    pub fn multipart_counts(&self) -> MultipartCounts {
+        let c = &self.store.multipart;
+        let get = |n: &AtomicU64| n.load(Ordering::Relaxed);
+        MultipartCounts {
+            created: get(&c.created),
+            parts: get(&c.parts),
+            part_bytes: get(&c.part_bytes),
+            completed: get(&c.completed),
+            aborted: get(&c.aborted),
+        }
+    }
+
     /// Number of stored objects currently alive in the S3 testbed (used to prove zero leaked data after cleanup).
     pub fn stored_object_count(&self) -> usize {
         self.store.objects.read().map(|m| m.len()).unwrap_or(0)
@@ -2005,6 +2103,7 @@ impl LabServer {
             objects: RwLock::new(BTreeMap::new()),
             uploads: RwLock::new(HashMap::new()),
             completed_uploads: RwLock::new(CompletedUploads::default()),
+            multipart: MultipartCounters::default(),
             req_seq: AtomicU64::new(0),
             upload_seq: AtomicU64::new(0),
             active_inflight: AtomicUsize::new(0),
@@ -2135,6 +2234,7 @@ mod cert_tests {
             objects: RwLock::new(BTreeMap::new()),
             uploads: RwLock::new(HashMap::new()),
             completed_uploads: RwLock::new(CompletedUploads::default()),
+            multipart: MultipartCounters::default(),
             req_seq: AtomicU64::new(0),
             upload_seq: AtomicU64::new(0),
             active_inflight: AtomicUsize::new(0),

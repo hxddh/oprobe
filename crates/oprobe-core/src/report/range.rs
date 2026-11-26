@@ -18,7 +18,6 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::view::{ApiRow, LatencyCdf, StageShare, VerbView};
-use crate::analysis::stats::weighted_quantile_us_ms;
 use crate::model::{OpRow, ReqRow, Run};
 /// `num / den` (0 without a denominator), never −0 (an empty `f64` sum is −0).
 fn ratio(num: f64, den: f64) -> f64 {
@@ -73,9 +72,88 @@ pub struct RangeView {
     pub cdf: LatencyCdf,
 }
 
-/// An operation's weight and latency, the pair the weighted quantiles take.
-fn wq(v: &mut [(u64, f64)], q: f64) -> f64 {
-    weighted_quantile_us_ms(v, q)
+/// Durations (µs) with the weight each stands for, sorted once: every quantile and the
+/// distribution of a range, a verb or an API are read from the one order (a view over a large
+/// trace sorted its rows again for each quantile, then for the distribution and the slowest
+/// operations).
+#[derive(Clone, Debug)]
+pub(crate) struct Weighted {
+    /// `(µs, weight)`, ascending by µs.
+    sorted: Vec<(u64, f64)>,
+    /// The sum of the weights (a negative weight counts for nothing).
+    total: f64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Sorts made by [`Weighted::new`] on this thread (the tests bound them).
+    static SORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Weighted {
+    pub(crate) fn new(mut v: Vec<(u64, f64)>) -> Self {
+        #[cfg(test)]
+        SORTS.with(|n| n.set(n.get() + 1));
+        v.sort_unstable_by_key(|x| x.0);
+        let total = v.iter().map(|x| x.1.max(0.0)).sum();
+        Self { sorted: v, total }
+    }
+
+    /// The weighted nearest-rank quantile `q` in ms, as
+    /// [`crate::analysis::stats::weighted_quantile_us_ms`] defines it: the smallest value
+    /// whose cumulative weight reaches `q` of the total. 0 for no weight.
+    pub(crate) fn quantile_ms(&self, q: f64) -> f64 {
+        if self.sorted.is_empty() || self.total <= 0.0 {
+            return 0.0;
+        }
+        let target = self.total * q.clamp(0.0, 1.0);
+        let mut acc = 0.0;
+        for (us, w) in &self.sorted {
+            acc += w.max(0.0);
+            if acc + 1e-9 * self.total >= target && acc > 0.0 {
+                return *us as f64 / 1000.0;
+            }
+        }
+        self.sorted.last().map_or(0.0, |x| x.0 as f64 / 1000.0)
+    }
+
+    /// The weighted distribution, at most [`LatencyCdf::MAX_POINTS`] points.
+    pub(crate) fn cdf(&self, exact: bool) -> LatencyCdf {
+        let total: f64 = self.sorted.iter().map(|x| x.1).sum();
+        if self.sorted.is_empty() || total <= 0.0 {
+            return LatencyCdf::default();
+        }
+        let n = self.sorted.len();
+        let step = n.div_ceil(LatencyCdf::MAX_POINTS).max(1);
+        let mut acc = 0.0;
+        let mut pts = Vec::new();
+        for (i, (us, w)) in self.sorted.iter().enumerate() {
+            acc += w;
+            if (i + 1) % step == 0 || i + 1 == n {
+                pts.push((*us as f64 / 1000.0, (acc / total).min(1.0)));
+            }
+        }
+        if let Some(last) = pts.last_mut() {
+            last.1 = 1.0;
+        }
+        LatencyCdf { pts, exact }
+    }
+}
+
+/// The first `n` of `items` in the order of `key` (equal ones in the order given, as a stable
+/// sort leaves them): a selection, not a sort of every row.
+fn first_n<T, K: Ord>(items: Vec<T>, n: usize, key: impl Fn(&T) -> K) -> Vec<T> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut v: Vec<(usize, T)> = items.into_iter().enumerate().collect();
+    let order = |x: &(usize, T)| (key(&x.1), x.0);
+    if v.len() > n {
+        v.select_nth_unstable_by_key(n - 1, order);
+        v.truncate(n);
+    }
+    v.sort_unstable_by_key(order);
+    v.into_iter().map(|x| x.1).collect()
 }
 
 impl RangeView {
@@ -102,17 +180,10 @@ impl RangeView {
         // failures, the goodput and the verbs describe the same operations.
         let failed_w: f64 = ops.iter().filter(|o| !o.ok).map(|o| weight(o.op_id)).sum();
         let bytes_w: f64 = ops.iter().map(|o| o.bytes as f64 * weight(o.op_id)).sum();
-        let mut lat: Vec<(u64, f64)> = ops
-            .iter()
-            .map(|o| (o.latency_us, weight(o.op_id)))
-            .collect();
-        let q = |lat: &mut Vec<(u64, f64)>, q: f64| wq(lat, q);
-        let (p50, p90, p99, p999, max) = (
-            q(&mut lat, 0.5),
-            q(&mut lat, 0.9),
-            q(&mut lat, 0.99),
-            q(&mut lat, 0.999),
-            ops.iter().map(|o| o.latency_us).max().unwrap_or(0) as f64 / 1000.0,
+        let lat = Weighted::new(
+            ops.iter()
+                .map(|o| (o.latency_us, weight(o.op_id)))
+                .collect(),
         );
         let req_w = |q: &ReqRow| weight(q.op_id);
         let requests_w: f64 = reqs.iter().map(|q| req_w(q)).sum();
@@ -126,8 +197,6 @@ impl RangeView {
             .filter(|q| q.attempt > 1)
             .map(|q| req_w(q))
             .sum();
-        let mut slow: Vec<&OpRow> = ops.clone();
-        slow.sort_by_key(|o| std::cmp::Reverse(o.latency_us));
         Self {
             since_s: lo,
             until_s: hi,
@@ -144,11 +213,11 @@ impl RangeView {
             ops_per_s: total_w / span,
             goodput_ops_per_s: (total_w - failed_w).max(0.0) / span,
             mib_per_s: bytes_w / span / (1024.0 * 1024.0),
-            p50_ms: p50,
-            p90_ms: p90,
-            p99_ms: p99,
-            p999_ms: p999,
-            max_ms: max,
+            p50_ms: lat.quantile_ms(0.5),
+            p90_ms: lat.quantile_ms(0.9),
+            p99_ms: lat.quantile_ms(0.99),
+            p999_ms: lat.quantile_ms(0.999),
+            max_ms: ops.iter().map(|o| o.latency_us).max().unwrap_or(0) as f64 / 1000.0,
             requests_count: requests_w.round() as u64,
             throttled_requests_count: throttled_w.round() as u64,
             throttled_request_ratio: ratio(throttled_w, requests_w),
@@ -156,8 +225,13 @@ impl RangeView {
             stages: stages(&ops, &weight),
             apis: apis(&reqs, &weight),
             verbs: verbs(&ops, &weight, span),
-            slowest_op_ids: slow.iter().take(Self::SLOWEST).map(|o| o.op_id).collect(),
-            cdf: cdf(&mut lat, !sampled),
+            slowest_op_ids: first_n(ops.clone(), Self::SLOWEST, |o| {
+                std::cmp::Reverse(o.latency_us)
+            })
+            .iter()
+            .map(|o| o.op_id)
+            .collect(),
+            cdf: lat.cdf(!sampled),
         }
     }
 
@@ -230,8 +304,8 @@ fn apis(reqs: &[&ReqRow], weight: &dyn Fn(u64) -> f64) -> Vec<ApiRow> {
                 .map(|(k, c)| (k, c.round() as u64))
                 .collect();
             status.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            let mut ttfb: Vec<(u64, f64)> = qs.iter().map(|q| (q.ttfb_us, w(q))).collect();
-            let mut total: Vec<(u64, f64)> = qs.iter().map(|q| (q.total_us, w(q))).collect();
+            let ttfb = Weighted::new(qs.iter().map(|q| (q.ttfb_us, w(q))).collect());
+            let total = Weighted::new(qs.iter().map(|q| (q.total_us, w(q))).collect());
             let sum = |f: &dyn Fn(&ReqRow) -> f64| qs.iter().map(|q| f(q) * w(q)).sum::<f64>();
             let connected = sum(&|q| f64::from(u8::from(q.status != 0 || q.connect_us() > 0)));
             let is_err = |q: &ReqRow| {
@@ -246,10 +320,10 @@ fn apis(reqs: &[&ReqRow], weight: &dyn Fn(u64) -> f64) -> Vec<ApiRow> {
                 reused_ratio: ratio(sum(&|q| f64::from(u8::from(q.reused))), connected),
                 up_bytes: sum(&|q| q.bytes_up as f64).round() as u64,
                 down_bytes: sum(&|q| q.bytes_down as f64).round() as u64,
-                ttfb_p50_ms: wq(&mut ttfb, 0.5),
-                ttfb_p99_ms: wq(&mut ttfb, 0.99),
-                total_p50_ms: wq(&mut total, 0.5),
-                total_p99_ms: wq(&mut total, 0.99),
+                ttfb_p50_ms: ttfb.quantile_ms(0.5),
+                ttfb_p99_ms: ttfb.quantile_ms(0.99),
+                total_p50_ms: total.quantile_ms(0.5),
+                total_p99_ms: total.quantile_ms(0.99),
             }
         })
         .collect();
@@ -269,8 +343,7 @@ fn verbs(ops: &[&OpRow], weight: &dyn Fn(u64) -> f64, span: f64) -> Vec<VerbView
             let share = |f: &dyn Fn(&OpRow) -> bool| {
                 ratio(os.iter().filter(|o| f(o)).map(|o| weight(o.op_id)).sum(), n)
             };
-            let mut lat: Vec<(u64, f64)> =
-                os.iter().map(|o| (o.latency_us, weight(o.op_id))).collect();
+            let lat = Weighted::new(os.iter().map(|o| (o.latency_us, weight(o.op_id))).collect());
             VerbView {
                 verb: verb.to_owned(),
                 ops_count: n.round() as u64,
@@ -281,8 +354,8 @@ fn verbs(ops: &[&OpRow], weight: &dyn Fn(u64) -> f64, span: f64) -> Vec<VerbView
                     .sum::<f64>()
                     / span
                     / (1024.0 * 1024.0),
-                p50_ms: wq(&mut lat, 0.5),
-                p99_ms: wq(&mut lat, 0.99),
+                p50_ms: lat.quantile_ms(0.5),
+                p99_ms: lat.quantile_ms(0.99),
                 error_ratio: share(&|o| !o.ok),
                 throttled_ratio: share(&|o| o.throttled),
                 requests_per_op: ratio(
@@ -297,29 +370,6 @@ fn verbs(ops: &[&OpRow], weight: &dyn Fn(u64) -> f64, span: f64) -> Vec<VerbView
         .collect();
     v.sort_by_key(|v| std::cmp::Reverse(v.ops_count));
     v
-}
-
-/// The weighted distribution of `lat` (µs, weight), at most [`LatencyCdf::MAX_POINTS`].
-pub(crate) fn cdf(lat: &mut [(u64, f64)], exact: bool) -> LatencyCdf {
-    let total: f64 = lat.iter().map(|x| x.1).sum();
-    if lat.is_empty() || total <= 0.0 {
-        return LatencyCdf::default();
-    }
-    lat.sort_unstable_by_key(|x| x.0);
-    let n = lat.len();
-    let step = n.div_ceil(LatencyCdf::MAX_POINTS).max(1);
-    let mut acc = 0.0;
-    let mut pts = Vec::new();
-    for (i, (us, w)) in lat.iter().enumerate() {
-        acc += w;
-        if (i + 1) % step == 0 || i + 1 == n {
-            pts.push((*us as f64 / 1000.0, (acc / total).min(1.0)));
-        }
-    }
-    if let Some(last) = pts.last_mut() {
-        last.1 = 1.0;
-    }
-    LatencyCdf { pts, exact }
 }
 
 /// One operation as a drill-down lists it.
@@ -368,14 +418,16 @@ pub fn ops_in(
 ) -> Vec<OpLine> {
     let (t0, t1) = ((since_s * 1e6) as i64, (until_s * 1e6) as i64);
     let (l0, l1) = (lo_ms * 1000.0, hi_ms * 1000.0);
-    let mut v: Vec<&OpRow> = run
+    let v: Vec<&OpRow> = run
         .ops
         .iter()
         .filter(|o| o.t_us >= t0 && o.t_us < t1)
         .filter(|o| (o.latency_us as f64) >= l0 && (o.latency_us as f64) < l1)
         .collect();
-    v.sort_by_key(|o| std::cmp::Reverse(o.latency_us));
-    v.into_iter().take(n).map(|o| OpLine::of(run, o)).collect()
+    first_n(v, n, |o| std::cmp::Reverse(o.latency_us))
+        .into_iter()
+        .map(|o| OpLine::of(run, o))
+        .collect()
 }
 
 /// One request as a drill-down lists it.
@@ -402,14 +454,13 @@ pub fn slowest_requests(run: &Run, api: &str, range: Option<(f64, f64)>, n: usiz
         Some((a, b)) => t >= (a * 1e6) as i64 && t < (b * 1e6) as i64,
         None => t >= 0,
     };
-    let mut v: Vec<&ReqRow> = run
+    let v: Vec<&ReqRow> = run
         .reqs
         .iter()
         .filter(|q| (q.api.label() == api || q.api_name() == api) && inside(q.t_us))
         .collect();
-    v.sort_by_key(|q| std::cmp::Reverse(q.total_us));
-    v.into_iter()
-        .take(n)
+    first_n(v, n, |q| std::cmp::Reverse(q.total_us))
+        .into_iter()
         .map(|q| ReqLine {
             op_id: q.op_id,
             key: run.op(q.op_id).map(|o| o.key.clone()).unwrap_or_default(),
@@ -601,5 +652,209 @@ mod tests {
         assert_eq!(ex.len(), 1);
         assert_eq!(ex[0].rows.len(), 2);
         assert_eq!(ex[0].rows[1].attempt, 2);
+    }
+
+    /// A fixed synthetic trace: `n` operations over 100 s on four verbs, latencies from a
+    /// seeded generator with many ties, every seventh failed, every ninth sampled (it stands
+    /// for 2, 4 or 8 operations), one or two requests each on three APIs.
+    fn synthetic(n: u64) -> Run {
+        let mut run = fixture::run();
+        run.ops.clear();
+        run.reqs.clear();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for i in 0..n {
+            let t_us = (i * 100_000_000 / n) as i64;
+            let latency_us = 500 + next() % 400 * 250;
+            run.ops.push(OpRow {
+                op_id: i + 1,
+                verb: Cow::Borrowed(["read.full", "read.range", "stat", "write"][(i % 4) as usize]),
+                key: format!("k{}", i % 97),
+                t_us,
+                latency_us,
+                bytes: next() % 65_536,
+                ok: i % 7 != 3,
+                error_code: None,
+                error: None,
+                throttled: i % 11 == 5,
+                attempts: 1,
+                breakdown: crate::model::OpBreakdownUs {
+                    backend_us: latency_us / 2,
+                    queue_us: latency_us / 2,
+                    ..Default::default()
+                },
+                requests: 1 + (i % 3 == 0) as u32,
+                await_tree: None,
+                weight: if i % 9 == 4 {
+                    (2 << (i % 3)) as f64
+                } else {
+                    1.0
+                },
+            });
+            for k in 0..1 + u64::from(i % 3 == 0) {
+                let mut q = fixture::req(i + 1, t_us + k as i64 * 300, 200, k > 0);
+                q.api = [
+                    crate::trace::Api::GetObject,
+                    crate::trace::Api::HeadObject,
+                    crate::trace::Api::PutObject,
+                ][((i + k) % 3) as usize];
+                q.attempt = k as u32 + 1;
+                q.ttfb_us = 100 + next() % 300 * 50;
+                q.total_us = q.ttfb_us + next() % 200 * 50;
+                run.reqs.push(q);
+            }
+        }
+        run.report.run.window_s = 100.0;
+        run.report.sampling = Default::default();
+        run
+    }
+
+    /// The numbers of a range as 9.1.0 computed them: one sort of the rows per quantile
+    /// ([`weighted_quantile_us_ms`] sorts what it is given), one more for the distribution and
+    /// a full sort for the slowest.
+    #[test]
+    fn a_range_sorts_once_and_reads_what_the_repeated_sorts_gave() {
+        use crate::analysis::stats::weighted_quantile_us_ms as old_q;
+        let run = synthetic(20_000);
+        let weights = run.op_weights();
+        let w = |id: u64| weights.get(&id).copied().unwrap_or(1.0);
+        for (a, b) in [(0.0, 100.0), (12.5, 60.0), (99.0, 100.0), (40.0, 40.2)] {
+            let (lo, hi) = ((a * 1e6) as i64, (b * 1e6) as i64);
+            let ops: Vec<&OpRow> = run
+                .ops
+                .iter()
+                .filter(|o| o.t_us >= lo && o.t_us < hi)
+                .collect();
+            let reqs: Vec<&ReqRow> = run
+                .reqs
+                .iter()
+                .filter(|q| q.t_us >= lo && q.t_us < hi)
+                .collect();
+            SORTS.with(|n| n.set(0));
+            let v = RangeView::of(&run, a, b);
+            let sorts = SORTS.with(|n| n.get());
+            // One order for the range, one per verb, two per API (TTFB and total): however
+            // many rows and however many quantiles are read from each.
+            assert_eq!(sorts, 1 + v.verbs.len() + 2 * v.apis.len(), "[{a}, {b})");
+            assert_eq!((v.verbs.len(), v.apis.len()), (4, 3));
+            assert_eq!(v.rows_count, ops.len() as u64);
+
+            let lat = |ops: &[&OpRow]| -> Vec<(u64, f64)> {
+                ops.iter().map(|o| (o.latency_us, w(o.op_id))).collect()
+            };
+            let mut l = lat(&ops);
+            assert_eq!(
+                [v.p50_ms, v.p90_ms, v.p99_ms, v.p999_ms],
+                [0.5, 0.9, 0.99, 0.999].map(|q| old_q(&mut l, q)),
+                "[{a}, {b})"
+            );
+            // The distribution, as the old `cdf` built it from the order the quantiles left.
+            let total: f64 = l.iter().map(|x| x.1).sum();
+            let step = l.len().div_ceil(LatencyCdf::MAX_POINTS).max(1);
+            let mut acc = 0.0;
+            let mut pts = Vec::new();
+            for (i, (us, wt)) in l.iter().enumerate() {
+                acc += wt;
+                if (i + 1) % step == 0 || i + 1 == l.len() {
+                    pts.push((*us as f64 / 1000.0, (acc / total).min(1.0)));
+                }
+            }
+            pts.last_mut().unwrap().1 = 1.0;
+            assert_eq!(v.cdf.pts, pts, "[{a}, {b})");
+            // The slowest: a stable sort of every row, slowest first.
+            let mut slow = ops.clone();
+            slow.sort_by_key(|o| std::cmp::Reverse(o.latency_us));
+            let slow: Vec<u64> = slow
+                .iter()
+                .take(RangeView::SLOWEST)
+                .map(|o| o.op_id)
+                .collect();
+            assert_eq!(v.slowest_op_ids, slow, "[{a}, {b})");
+            for verb in &v.verbs {
+                let os: Vec<&OpRow> = ops
+                    .iter()
+                    .copied()
+                    .filter(|o| o.verb == verb.verb)
+                    .collect();
+                let mut l = lat(&os);
+                assert_eq!(
+                    [verb.p50_ms, verb.p99_ms],
+                    [old_q(&mut l, 0.5), old_q(&mut l, 0.99)],
+                    "{}",
+                    verb.verb
+                );
+            }
+            for api in &v.apis {
+                let qs: Vec<&ReqRow> = reqs
+                    .iter()
+                    .copied()
+                    .filter(|q| q.api.label() == api.api)
+                    .collect();
+                let mut ttfb: Vec<(u64, f64)> =
+                    qs.iter().map(|q| (q.ttfb_us, w(q.op_id))).collect();
+                let mut total: Vec<(u64, f64)> =
+                    qs.iter().map(|q| (q.total_us, w(q.op_id))).collect();
+                assert_eq!(
+                    [
+                        api.ttfb_p50_ms,
+                        api.ttfb_p99_ms,
+                        api.total_p50_ms,
+                        api.total_p99_ms
+                    ],
+                    [
+                        old_q(&mut ttfb, 0.5),
+                        old_q(&mut ttfb, 0.99),
+                        old_q(&mut total, 0.5),
+                        old_q(&mut total, 0.99)
+                    ],
+                    "{}",
+                    api.api
+                );
+            }
+        }
+        // A verb's distribution over a range: one sort.
+        SORTS.with(|n| n.set(0));
+        let cdf = LatencyCdf::of_range_verb(&run, 0.0, 100.0, "stat").unwrap();
+        assert_eq!(SORTS.with(|n| n.get()), 1);
+        assert_eq!(cdf.pts.last().unwrap().1, 1.0);
+        // The drill-downs select too: what a stable sort of every row listed first.
+        let mut slow: Vec<&OpRow> = run.ops.iter().collect();
+        slow.sort_by_key(|o| std::cmp::Reverse(o.latency_us));
+        let cell: Vec<u64> = ops_in(&run, 0.0, 100.0, 0.0, 1e9, 8)
+            .iter()
+            .map(|o| o.op_id)
+            .collect();
+        assert_eq!(
+            cell,
+            slow.iter().take(8).map(|o| o.op_id).collect::<Vec<_>>()
+        );
+        let mut slow: Vec<&ReqRow> = run
+            .reqs
+            .iter()
+            .filter(|q| q.api == crate::trace::Api::GetObject)
+            .collect();
+        slow.sort_by_key(|q| std::cmp::Reverse(q.total_us));
+        let listed: Vec<(u64, i64)> = slowest_requests(&run, "GetObject", None, 8)
+            .iter()
+            .map(|q| (q.op_id, q.t_us))
+            .collect();
+        assert_eq!(
+            listed,
+            slow.iter()
+                .take(8)
+                .map(|q| (q.op_id, q.t_us))
+                .collect::<Vec<_>>()
+        );
+        // Few rows, and none.
+        assert_eq!(first_n(Vec::<u64>::new(), 5, |x| *x), Vec::<u64>::new());
+        assert_eq!(first_n(vec![3, 1, 2], 5, |x| *x), [1, 2, 3]);
+        assert_eq!(first_n(vec![3, 1, 2], 0, |x| *x), Vec::<i32>::new());
+        assert_eq!(Weighted::new(Vec::new()).quantile_ms(0.5), 0.0);
+        assert_eq!(Weighted::new(Vec::new()).cdf(true), LatencyCdf::default());
     }
 }

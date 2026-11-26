@@ -89,7 +89,7 @@ pub async fn delete_prefix(op: &Operator, prefix: &str) -> CleanupSummary {
     }
     .await;
     if let Err(e) = res {
-        s.error = Some(format!("{e:#}"));
+        s.error = Some(crate::util::strip_url_credentials(&format!("{e:#}")));
     }
     s.duration_ms = t0.elapsed().as_secs_f64() * 1000.0;
     s

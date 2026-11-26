@@ -17,7 +17,8 @@
 //! **Latency family** — when nothing (significant) is throttled:
 //! - [`HypothesisKind::Queueing`]: time to first byte grows with the requests in flight above
 //!   `servers` (`W = s · (1 + max(0, L − c) / c)`), against a constant latency;
-//! - [`HypothesisKind::BandwidthCap`]: each stream's body rate is the aggregate cap divided by
+//! - [`HypothesisKind::BandwidthCap`]: each stream's body rate (response bodies, or request
+//!   bodies on an upload-bound link) is the aggregate cap divided by
 //!   the concurrent streams (`rate = C / n̄`), against a per-stream rate independent of `n̄`.
 //!
 //! [`HypothesisKind::ClientBound`] comes from the client's CPU: a saturated load generator
@@ -69,6 +70,9 @@ struct Obs {
     prefix: u32,
     body: (i64, i64),
     bytes_down: u64,
+    /// When the request body was sent (µs), and its bytes.
+    upload: (i64, i64),
+    bytes_up: u64,
     /// Service time as the server sees it: send + time to first byte (µs).
     svc_us: i64,
 }
@@ -126,7 +130,8 @@ fn observations(reqs: &[&ReqRow], ops: &[&OpRow]) -> (Vec<Obs>, Vec<String>, Vec
                 prefixes.push(pre.to_owned());
                 n
             });
-            let body_start = q.t_us + (q.queue_us + q.connect_us() + q.send_us + q.ttfb_us) as i64;
+            let send_start = q.t_us + (q.queue_us + q.connect_us()) as i64;
+            let body_start = send_start + (q.send_us + q.ttfb_us) as i64;
             Obs {
                 t: iv[i].0,
                 level: level[i],
@@ -137,6 +142,8 @@ fn observations(reqs: &[&ReqRow], ops: &[&OpRow]) -> (Vec<Obs>, Vec<String>, Vec
                 prefix: p,
                 body: (body_start, body_start + q.body_us as i64),
                 bytes_down: q.bytes_down,
+                upload: (send_start, send_start + q.send_us as i64),
+                bytes_up: q.bytes_up,
                 svc_us: iv[i].1 - iv[i].0,
             }
         })
@@ -763,8 +770,14 @@ fn gauss_ll(sse: f64, n: f64) -> f64 {
     -0.5 * n * ((2.0 * std::f64::consts::PI * var).ln() + 1.0)
 }
 
-/// Queueing vs constant latency over the time to first byte by in-flight level.
-fn queueing_fits(obs: &[Obs]) -> Option<(Fit, Fit)> {
+/// The requests in flight must at least double between the quietest and the busiest
+/// well-populated level for one run to assert queueing: a closed loop that keeps its workers
+/// busy varies no load, and a curve over 14 to 16 requests in flight is not a limit (N2).
+const QUEUEING_LOAD_SPAN: u32 = 2;
+
+/// Queueing vs constant latency over the time to first byte by in-flight level, and whether
+/// the run varied its load enough to assert it ([`QUEUEING_LOAD_SPAN`]).
+fn queueing_fits(obs: &[Obs]) -> Option<(Fit, Fit, bool)> {
     // Per-level sufficient statistics of ln(ttfb ms).
     let mut lv: HashMap<u32, (f64, f64, f64)> = HashMap::new();
     for o in obs.iter().filter(|o| o.ok && !o.thr && o.ttfb_us > 0) {
@@ -851,16 +864,64 @@ fn queueing_fits(obs: &[Obs]) -> Option<(Fit, Fit)> {
         // Too small to matter: the queueing fit cannot win.
         q.ll = null.ll - 1.0;
     }
-    Some((q, null))
+    let varied = busiest >= QUEUEING_LOAD_SPAN * lowest;
+    if !varied {
+        q.evidence.push(format!(
+            "the requests in flight stayed between {lowest} and {busiest}: one run that varies no load cannot assert it (`oprobe prove` varies the load)"
+        ));
+    }
+    Some((q, null, varied))
 }
 
-/// Aggregate vs per-stream bandwidth over the body rates of large responses.
-fn bandwidth_fits(obs: &[Obs]) -> Option<(Fit, Fit, f64)> {
-    // Concurrent bodies over time.
-    let mut ev: Vec<(i64, i32)> = obs
+/// The direction of the bodies a bandwidth fit reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Direction {
+    /// Response bodies (`bytes_down` over the body stage).
+    Download,
+    /// Request bodies (`bytes_up` over the send stage).
+    Upload,
+}
+
+/// How the evidence of an upload cap opens; a download cap's opens "the streams share". The
+/// direction of a [`HypothesisKind::BandwidthCap`] is told by its evidence ([`is_upload_cap`]),
+/// not by a field of its own.
+const UPLOAD_CAP: &str = "the upload streams share";
+
+/// `h` is a bandwidth cap fitted on the request bodies (an uplink at its capacity), not on
+/// the response bodies.
+pub fn is_upload_cap(h: &Hypothesis) -> bool {
+    h.kind == HypothesisKind::BandwidthCap
+        && h.evidence
+            .first()
+            .is_some_and(|e| e.starts_with(UPLOAD_CAP))
+}
+
+impl Direction {
+    /// When `o` moved its body in this direction (µs), and how many bytes.
+    fn stream(self, o: &Obs) -> ((i64, i64), u64) {
+        match self {
+            Self::Download => (o.body, o.bytes_down),
+            Self::Upload => (o.upload, o.bytes_up),
+        }
+    }
+}
+
+/// Aggregate vs per-stream bandwidth over the body rates of large transfers in one
+/// direction: responses, or — by the same standards — request bodies (a saturated uplink
+/// slows uploads as a shared cap slows downloads).
+fn bandwidth_fits(obs: &[Obs], dir: Direction) -> Option<(Fit, Fit, f64)> {
+    let streams: Vec<(bool, (i64, i64), u64)> = obs
         .iter()
-        .filter(|o| o.bytes_down > 0 && o.body.1 > o.body.0)
-        .flat_map(|o| [(o.body.0, 1), (o.body.1, -1)])
+        .map(|o| {
+            let (span, bytes) = dir.stream(o);
+            (o.ok, span, bytes)
+        })
+        .collect();
+    // Concurrent bodies over time.
+    let mut ev: Vec<(i64, i32)> = streams
+        .iter()
+        .filter(|(_, span, bytes)| *bytes > 0 && span.1 > span.0)
+        .flat_map(|(_, span, _)| [(span.0, 1), (span.1, -1)])
         .collect();
     if ev.len() < 60 {
         return None;
@@ -888,14 +949,14 @@ fn bandwidth_fits(obs: &[Obs]) -> Option<(Fit, Fit, f64)> {
     };
     let mut xs = Vec::new();
     let mut ys = Vec::new();
-    for o in obs
+    for (_, span, bytes) in streams
         .iter()
-        .filter(|o| o.ok && o.bytes_down >= 128 * 1024 && o.body.1 - o.body.0 >= 1000)
+        .filter(|(ok, span, bytes)| *ok && *bytes >= 128 * 1024 && span.1 - span.0 >= 1000)
     {
-        let d = (o.body.1 - o.body.0) as f64;
-        let nbar = ((area_at(o.body.1) - area_at(o.body.0)) / d).max(1.0);
+        let d = (span.1 - span.0) as f64;
+        let nbar = ((area_at(span.1) - area_at(span.0)) / d).max(1.0);
         xs.push(nbar.ln());
-        ys.push((o.bytes_down as f64 / (d / 1e6)).ln());
+        ys.push((*bytes as f64 / (d / 1e6)).ln());
     }
     let n = xs.len() as f64;
     if n < 30.0 {
@@ -928,7 +989,12 @@ fn bandwidth_fits(obs: &[Obs]) -> Option<(Fit, Fit, f64)> {
         k: 2.0,
         explains: 0.0,
         evidence: vec![format!(
-            "each stream moves ≈{:.1} MiB/s however many run at once (slope {slope:+.2} of ln rate on ln streams): more streams add throughput",
+            "each {}stream moves ≈{:.1} MiB/s however many run at once (slope {slope:+.2} of ln rate on ln streams): more streams add throughput",
+            if dir == Direction::Upload {
+                "upload "
+            } else {
+                ""
+            },
             mib(my.exp())
         )],
     };
@@ -942,7 +1008,11 @@ fn bandwidth_fits(obs: &[Obs]) -> Option<(Fit, Fit, f64)> {
         k: 2.0,
         explains: (-slope).clamp(0.0, 1.0),
         evidence: vec![format!(
-            "the streams share ≈{:.1} MiB/s: a stream's rate falls as 1/n with the streams running beside it (slope {slope:+.2} of ln rate on ln streams, −1 = a shared cap)",
+            "{} ≈{:.1} MiB/s: a stream's rate falls as 1/n with the streams running beside it (slope {slope:+.2} of ln rate on ln streams, −1 = a shared cap)",
+            match dir {
+                Direction::Download => "the streams share",
+                Direction::Upload => UPLOAD_CAP,
+            },
             mib(agg_mean.exp())
         )],
     };
@@ -1078,9 +1148,16 @@ fn fit_rows(reqs: &[&ReqRow], ops: &[&OpRow], inputs: &FitInputs) -> Vec<Hypothe
     // Latency family.
     let mut out: Vec<Hypothesis> = Vec::new();
     let q = queueing_fits(&obs);
-    let bw = bandwidth_fits(&obs);
     let gain = |a: &Fit, b: &Fit| b.bic(n) - a.bic(n);
-    let q_gain = q.as_ref().map_or(f64::NEG_INFINITY, |(q, nl)| gain(q, nl));
+    // The direction whose bodies a shared cap explains better (9.1 fitted downloads only, so
+    // a saturated uplink was left to read as hung requests).
+    let bw = [Direction::Download, Direction::Upload]
+        .into_iter()
+        .filter_map(|d| bandwidth_fits(&obs, d))
+        .max_by(|x, y| gain(&x.0, &x.1).total_cmp(&gain(&y.0, &y.1)));
+    let q_gain = q
+        .as_ref()
+        .map_or(f64::NEG_INFINITY, |(q, nl, _)| gain(q, nl));
     let bw_gain = bw
         .as_ref()
         .map_or(f64::NEG_INFINITY, |(a, p, _)| gain(a, p));
@@ -1089,14 +1166,18 @@ fn fit_rows(reqs: &[&ReqRow], ops: &[&OpRow], inputs: &FitInputs) -> Vec<Hypothe
         let (a, p, _) = bw.clone().expect("gain implies a fit");
         pick = Some(rank(vec![a, p], n, true));
     } else if q_gain > 0.0 {
-        let (qf, nl) = q.clone().expect("gain implies a fit");
-        pick = Some(rank(vec![qf, nl], n, true));
+        let (qf, nl, varied) = q.clone().expect("gain implies a fit");
+        let mut hs = rank(vec![qf, nl], n, true);
+        if !varied {
+            hs[0].confidence = Confidence::Low;
+        }
+        pick = Some(hs);
     }
     match pick {
         Some(mut hs) => {
             // The other family's fit as an unselected alternative.
             if hs[0].kind == HypothesisKind::BandwidthCap
-                && let Some((qf, _)) = q
+                && let Some((qf, _, _)) = q
             {
                 hs.push(to_hypothesis(qf, n, false, Confidence::Low));
             } else if hs[0].kind == HypothesisKind::Queueing
@@ -1127,7 +1208,7 @@ fn fit_rows(reqs: &[&ReqRow], ops: &[&OpRow], inputs: &FitInputs) -> Vec<Hypothe
                     Confidence::Low
                 },
             ));
-            for (alt, _) in q.into_iter() {
+            for (alt, _, _) in q.into_iter() {
                 out.push(to_hypothesis(alt, n, false, Confidence::Low));
             }
             for (alt, _, _) in bw.into_iter() {
@@ -1145,7 +1226,7 @@ fn fit_rows(reqs: &[&ReqRow], ops: &[&OpRow], inputs: &FitInputs) -> Vec<Hypothe
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn req(t_ms: f64, ttfb_ms: f64, status: u16, op_id: u64) -> ReqRow {
@@ -1544,6 +1625,166 @@ mod tests {
         assert_eq!(s.kind, HypothesisKind::Queueing, "{hs:#?}");
         let c = s.params.servers_count.unwrap();
         assert!((3..=5).contains(&c), "{c}");
+    }
+
+    /// Bursts of 1 to 8 transfers of 1 MiB over a link that carries 8 MiB/s in all: each
+    /// stream gets the cap divided by the streams beside it. `upload` puts the bytes in the
+    /// request body (the send stage), else in the response body.
+    pub(crate) fn capped_link(upload: bool) -> (Vec<ReqRow>, Vec<OpRow>) {
+        let (mut reqs, mut ops) = (Vec::new(), Vec::new());
+        let (mib, cap) = (1u64 << 20, 8.0 * (1u64 << 20) as f64);
+        let mut id = 0;
+        let mut t0 = 0i64;
+        for burst in 0..60 {
+            let streams = 1 + burst % 8;
+            let move_us = (mib as f64 / (cap / streams as f64) * 1e6) as u64;
+            for j in 0..streams {
+                id += 1;
+                let mut r = crate::analysis::outliers::test_req(t0 + j as i64, 0);
+                r.op_id = id;
+                (r.send_us, r.ttfb_us) = (10, 5_000);
+                if upload {
+                    r.api = crate::trace::Api::PutObject;
+                    r.method = std::borrow::Cow::Borrowed("PUT");
+                    (r.send_us, r.bytes_up, r.bytes_down) = (move_us, mib, 0);
+                } else {
+                    (r.body_us, r.bytes_down) = (move_us, mib);
+                }
+                r.total_us = r.send_us + r.ttfb_us + r.body_us;
+                reqs.push(r);
+                ops.push(op(id, "k", t0 as f64 / 1000.0));
+            }
+            t0 += move_us as i64 + 50_000;
+        }
+        (reqs, ops)
+    }
+
+    /// 9.1 fitted the cap on response bodies only: a saturated uplink had no limit model.
+    #[test]
+    fn a_saturated_uplink_is_a_bandwidth_cap_on_the_uploads() {
+        let (reqs, ops) = capped_link(true);
+        let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
+        let s = selected(&hs);
+        assert_eq!(s.kind, HypothesisKind::BandwidthCap, "{hs:#?}");
+        assert!(is_upload_cap(s), "{:?}", s.evidence);
+        assert!(s.confidence >= Confidence::Medium, "{s:#?}");
+        let mib_s = s.params.bytes_per_s.unwrap() / (1u64 << 20) as f64;
+        assert!((7.0..9.0).contains(&mib_s), "{mib_s}");
+        assert!(s.explains_ratio > 0.9, "{s:#?}");
+        // The same link on the way down is the cap it always was, and says so.
+        let (reqs, ops) = capped_link(false);
+        let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
+        let s = selected(&hs);
+        assert_eq!(s.kind, HypothesisKind::BandwidthCap, "{hs:#?}");
+        assert!(!is_upload_cap(s));
+        assert!(
+            s.evidence[0].starts_with("the streams share"),
+            "{:?}",
+            s.evidence
+        );
+        // Uploads that each keep their rate whatever runs beside them are no cap.
+        let (mut reqs, ops) = capped_link(true);
+        for r in &mut reqs {
+            r.send_us = 125_000;
+            r.total_us = r.send_us + r.ttfb_us;
+        }
+        let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
+        assert_ne!(selected(&hs).kind, HypothesisKind::BandwidthCap, "{hs:#?}");
+    }
+
+    /// Bursts of `widths(burst)` requests, each waiting ≈10 ms of service behind 4 servers:
+    /// the time to first byte grows with the requests already in flight.
+    pub(crate) fn queueing_bursts(widths: impl Fn(usize) -> usize) -> (Vec<ReqRow>, Vec<OpRow>) {
+        queueing_bursts_of(10.0, widths)
+    }
+
+    /// [`queueing_bursts`] with a service time of `service_ms`.
+    pub(crate) fn queueing_bursts_of(
+        service_ms: f64,
+        widths: impl Fn(usize) -> usize,
+    ) -> (Vec<ReqRow>, Vec<OpRow>) {
+        let mut reqs = Vec::new();
+        let mut ops = Vec::new();
+        let mut id = 0;
+        let mut x = 3u64;
+        for burst in 0..300 {
+            let t0 = burst as f64 * 200.0;
+            for j in 0..widths(burst) {
+                id += 1;
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let noise = 1.0 + ((x >> 40) as f64 / (1u64 << 24) as f64 - 0.5) * 0.2;
+                let lat =
+                    service_ms * (1.0 + ((j as u64 + 1).saturating_sub(4)) as f64 / 4.0) * noise;
+                reqs.push(req(t0 + j as f64 * 0.01, lat, 200, id));
+                ops.push(op(id, "k", t0));
+            }
+        }
+        (reqs, ops)
+    }
+
+    /// The same service under closed loops of `phases` workers, 3 s each: every worker sends
+    /// its next request when the last one ends, so the requests in flight stay at the workers.
+    pub(crate) fn queueing_closed_loops(phases: &[usize]) -> (Vec<ReqRow>, Vec<OpRow>) {
+        let (mut reqs, mut ops) = (Vec::new(), Vec::new());
+        let mut id = 0;
+        let mut x = 7u64;
+        for (phase, workers) in phases.iter().enumerate() {
+            let t0 = phase as f64 * 3100.0;
+            let mut next: Vec<f64> = (0..*workers).map(|w| t0 + w as f64 * 0.01).collect();
+            loop {
+                let (w, at) = next
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .min_by(|p, q| p.1.total_cmp(&q.1))
+                    .unwrap();
+                if at >= t0 + 3000.0 {
+                    break;
+                }
+                id += 1;
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let noise = 1.0 + ((x >> 40) as f64 / (1u64 << 24) as f64 - 0.5) * 0.2;
+                let lat = 10.0 * (1.0 + (*workers as f64 - 4.0).max(0.0) / 4.0) * noise;
+                reqs.push(req(at, lat, 200, id));
+                ops.push(op(id, "k", at));
+                next[w] = at + lat + 0.02;
+            }
+        }
+        (reqs, ops)
+    }
+
+    /// N2: a run that keeps 12 to 19 requests in flight has not varied its load by a factor
+    /// of two. Its curve fits queueing best, but one such run asserts nothing (low confidence,
+    /// and it says why).
+    #[test]
+    fn queueing_is_asserted_only_when_the_load_varied() {
+        let (reqs, ops) = queueing_bursts(|burst| 2 + burst % 14);
+        let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
+        let s = selected(&hs);
+        assert_eq!(s.kind, HypothesisKind::Queueing, "{hs:#?}");
+        assert!(s.confidence >= Confidence::Medium, "{s:#?}");
+        assert_eq!(s.evidence.len(), 1, "{:?}", s.evidence);
+        // The same service seen only between 12 and 19 in flight.
+        let (reqs, ops) = queueing_closed_loops(&[12, 14, 16, 19]);
+        let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
+        let s = selected(&hs);
+        assert_eq!(s.kind, HypothesisKind::Queueing, "{hs:#?}");
+        assert_eq!(s.confidence, Confidence::Low, "{s:#?}");
+        assert!(
+            s.evidence.iter().any(|e| e.contains("varies no load")),
+            "{s:#?}"
+        );
+        assert!(crate::analysis::hypothesis::asserted(&hs).is_none());
+        // Twice the load between the quietest and the busiest phase is a varied load.
+        let (reqs, ops) = queueing_closed_loops(&[8, 12, 16]);
+        let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
+        let s = selected(&hs);
+        assert_eq!(s.kind, HypothesisKind::Queueing, "{hs:#?}");
+        assert!(s.confidence >= Confidence::Medium, "{s:#?}");
     }
 
     #[test]

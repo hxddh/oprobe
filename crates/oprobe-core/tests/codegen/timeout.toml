@@ -1,0 +1,4 @@
+url = "memory://"
+[layers]
+retry = false
+timeout = { op = "30s", io = "2500ms" }

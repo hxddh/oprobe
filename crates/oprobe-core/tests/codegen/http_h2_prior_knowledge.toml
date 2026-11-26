@@ -1,0 +1,5 @@
+url = "s3://bucket/prefix"
+[options]
+endpoint = "http://127.0.0.1:9000"
+[http]
+version = "h2"

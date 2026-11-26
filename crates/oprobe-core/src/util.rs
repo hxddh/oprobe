@@ -267,15 +267,16 @@ pub fn is_secret_key(key: &str) -> bool {
 }
 
 /// Query parameter names whose values must never be printed or persisted: the option names
-/// of [`is_secret_key`] plus the short forms URLs use (`sig` of an Azure SAS, `X-Amz-*`
-/// presigning parameters, session tokens).
+/// of [`is_secret_key`] (an operator URL carries options as its query) and the parameters of
+/// presigned and SAS URLs ([`oprobe_trace::util::is_secret_query_key`]: signatures, tokens,
+/// credentials).
 pub fn is_secret_query_key(key: &str) -> bool {
-    let k = key.to_ascii_lowercase();
-    is_secret_key(&k) || k == "sig" || k.contains("session") || k.contains("signature")
+    is_secret_key(key) || oprobe_trace::util::is_secret_query_key(key)
 }
 
-/// A URL safe to store and to replay: `user:password@` removed and query parameters with
-/// secret names ([`is_secret_query_key`]) dropped; the other parameters stay, in order
+/// A URL safe to store and to replay: its credentials removed ([`strip_url_credentials`]:
+/// `user:password@`, signatures and tokens) and the query parameters named like a secret option
+/// ([`is_secret_query_key`]) dropped; the other parameters stay, in order
 /// (`s3://b/p?region=x&secret_access_key=y` → `s3://b/p?region=x`). Credentials are resolved
 /// again (environment, profile) when the URL is used. Text without `://` is returned unchanged.
 pub fn redact_url(raw: &str) -> String {
@@ -512,6 +513,13 @@ mod tests {
                 "azblob://c/p?sv=2024&sig=hunter2&SessionToken=hunter2&X-Amz-Signature=hunter2&sas_token=hunter2&password=hunter2&endpoint=http://h#f"
             ),
             "azblob://c/p?sv=2024&endpoint=http://h#f"
+        );
+        // A presigned URL given as the operator: every provider's signature and token go.
+        assert_eq!(
+            redact_url(
+                "https://h/k?X-Amz-Credential=AK&X-Amz-Security-Token=T&AWSAccessKeyId=AK&X-Goog-Signature=S&x-oss-security-token=T&q-signature=S&access_token=T&X-Amz-Expires=60"
+            ),
+            "https://h/k?X-Amz-Expires=60"
         );
         // Percent-encoded names are recognised.
         assert_eq!(

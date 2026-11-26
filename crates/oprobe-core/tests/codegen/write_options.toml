@@ -1,0 +1,3 @@
+url = "memory://"
+[write]
+concurrent = 2

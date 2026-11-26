@@ -82,13 +82,33 @@ impl Ctx {
     fn start_without_sidebar(&self) -> Headless {
         let mut app = Headless::start(self.config(Os::Linux, Locale::EN_US)).unwrap();
         app.wait_for("id:sidebar-show").unwrap();
+        self.opened(&mut app);
         app
     }
 
     fn start_on(&self, os: Os, locale: Locale) -> Headless {
         let mut app = Headless::start(self.config(os, locale)).unwrap();
         app.wait_for("id:sidebar").unwrap();
+        self.opened(&mut app);
         app
+    }
+
+    /// Wait until the run the app opens at start has loaded. It loads off the app's thread,
+    /// and the menu bar is rebuilt when it has (`menus::install`): the items get new ids, so a
+    /// menu shortcut pressed across that rebuild names an item that is gone and does nothing.
+    /// A test that pressed one right after the sidebar showed (Ctrl+, in `choose`) then waited
+    /// its whole timeout for a dialog that never opened, on a loaded machine.
+    fn opened(&self, app: &mut Headless) {
+        if App::new(self.paths())
+            .list()
+            .is_ok_and(|l| l.runs.is_empty())
+        {
+            return;
+        }
+        app.wait_until("the run opened at start loading", LONG, |s| {
+            s.matches("id:profile") == Ok(true) || s.matches("id:operator") == Ok(true)
+        })
+        .unwrap();
     }
 
     fn config(&self, os: Os, locale: Locale) -> EngineConfig {
@@ -1167,4 +1187,136 @@ fn an_open_loop_run_shows_its_schedule() {
         &mut app,
         "id:setup-body >> text:/^target 200\\/s · achieved /",
     );
+}
+
+/// Profile `req` with the service layer directly; the run's id.
+fn seed_with(cx: &Ctx, req: RunRequest) -> String {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    match rt
+        .block_on(App::new(cx.paths()).run(req, EventSink::silent(), Cancel::new()))
+        .unwrap()
+    {
+        RunOutcome::Run(set) => set.runs[0].run_id.clone(),
+        RunOutcome::Plan(_) => unreachable!(),
+    }
+}
+
+/// Wait until the store holds `n` runs (the app's run was saved), then until the app lists it.
+fn wait_for_runs(cx: &Ctx, app: &mut Headless, n: usize) {
+    let svc = App::new(cx.paths());
+    app.wait_until(&format!("{n} runs stored"), LONG, |_| {
+        svc.list().is_ok_and(|l| l.runs.len() == n)
+    })
+    .unwrap();
+    let newest = svc.list().unwrap().runs[0].id.clone();
+    wait_long(app, &format!("id:run-{newest}"));
+}
+
+/// The stored runs' specs, oldest first.
+fn specs(cx: &Ctx) -> Vec<oprobe::model::RunSpec> {
+    let svc = App::new(cx.paths());
+    let mut runs = svc.list().unwrap().runs;
+    runs.sort_by(|a, b| a.id.cmp(&b.id));
+    runs.iter()
+        .map(|r| svc.store().load(&r.id).unwrap().report.spec)
+        .collect()
+}
+
+/// An open-loop workload with its own dataset, seed and key popularity, on an operator with
+/// its own HTTP client, layers and read options: nothing of it has a field in New Run.
+fn particular(operator: &str) -> RunRequest {
+    RunRequest {
+        operators: vec![operator.to_owned()],
+        workload: WorkloadInput {
+            preset: Some("range-reads".into()),
+            rate: Some(150.0),
+            concurrency: Some(3),
+            objects: Some(6),
+            object_size: Some("96KiB".into()),
+            seed: Some(7),
+            access: Some("zipf:1.1".into()),
+            duration: Some("600ms".into()),
+            warmup: Some("0s".into()),
+            ..Default::default()
+        },
+        set: [
+            "http.version=h1",
+            "http.keep_alive=false",
+            "layers.retry.max_times=5",
+            "layers.concurrent_limit.http=12",
+            "read.gap=64KiB",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+        ..Default::default()
+    }
+}
+
+/// Run Again repeats the run as it ran. 9.1 rebuilt it from the New Run form's five fields
+/// and a diff of the operator values the Operator page lists: the open-loop rate, the
+/// dataset, the seed and the key popularity were lost (the run came back closed-loop on the
+/// preset's defaults).
+#[test]
+fn run_again_repeats_the_whole_run_of_a_lab() {
+    let cx = Ctx::new();
+    let id = seed_with(&cx, particular("lab://clean"));
+    cx.launch(Some(id));
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "id:profile");
+    // A lab run starts at once.
+    app.press("id:run-again").unwrap();
+    wait_for_runs(&cx, &mut app, 2);
+    let specs = specs(&cx);
+    assert_eq!(specs.len(), 2);
+    assert_eq!(specs[1].profile.workload.rate, Some(150.0));
+    assert_eq!(specs[1], specs[0], "{}", specs[1].command());
+}
+
+/// A real target opens New Run on its plan first: the form shows the run's operator, preset,
+/// duration and concurrency, says what else it keeps, and a field changed there changes only
+/// that. Another operator is another run: nothing is carried over to it.
+#[test]
+fn run_again_on_a_real_target_keeps_what_the_form_has_no_field_for() {
+    let cx = Ctx::new();
+    let id = seed_with(&cx, particular("memory://"));
+    cx.launch(Some(id));
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "id:profile");
+    app.press("id:run-again").unwrap();
+    wait_long(&mut app, "id:new-run-dialog");
+    wait_long(&mut app, "id:run-again-command");
+    wait_long(
+        &mut app,
+        "text:/^oprobe run memory:\\/\\/ --preset range-reads -c 3 -d 600ms --rate 150 /",
+    );
+    wait_long(&mut app, "id:run-plan-ready");
+    // A longer window, everything else as it ran.
+    app.clear("id:run-duration").unwrap();
+    app.type_text("id:run-duration", "700ms").unwrap();
+    wait_long(&mut app, "text:Review Plan");
+    assert!(has(&app, "id:run-again-command"));
+    app.press("id:run-start").unwrap();
+    wait_long(&mut app, "id:run-plan-ready");
+    app.press("id:run-start").unwrap();
+    wait_for_runs(&cx, &mut app, 2);
+    let specs = specs(&cx);
+    assert_eq!(specs.len(), 2);
+    let mut expected = specs[0].clone();
+    expected.profile.workload.duration = specs[1].profile.workload.duration;
+    assert_eq!(specs[1].profile.workload.duration.to_string(), "700ms");
+    assert_eq!(specs[1], expected, "{}", specs[1].command());
+    // New Run afterwards is a new run, and so is another operator in a run being repeated.
+    app.press("id:new-run").unwrap();
+    wait_long(&mut app, "id:new-run-dialog");
+    assert!(!has(&app, "id:run-again-command"));
+    app.press_key("Escape").unwrap();
+    app.wait_for_gone("id:dialog", LONG).unwrap();
+    wait_long(&mut app, "id:profile");
+    app.press("id:run-again").unwrap();
+    wait_long(&mut app, "id:run-again-command");
+    app.clear("id:run-operator").unwrap();
+    app.type_text("id:run-operator", "lab://clean").unwrap();
+    app.wait_for_gone("id:run-again-command", LONG).unwrap();
 }

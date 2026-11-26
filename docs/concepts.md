@@ -49,6 +49,28 @@ deletes the prefix. A run killed before it could clean up leaves its prefix behi
 against the same target deletes it. The guard enforces budgets (`--max-requests`, `--max-bytes`,
 `--max-duration`), `--read-only` and `--dry-run`.
 
+**Budgets hold on the wire.** `--max-requests` and `--max-bytes` count every HTTP request the
+command sends to the target and every body byte, as they are sent and received:
+
+- in every phase before cleanup: the reachability check, the preflight, the dataset upload, the
+  warm-up, the measurement and the verification of written objects;
+- retries and re-sent requests included, each with its body;
+- a request the budget has no room for is never sent, and a download stops at the chunk that
+  crosses the byte budget, so a budget is overshot by at most the response chunks in flight,
+  never by a whole operation;
+- cleanup is never counted and never refused: deleting the run prefix and aborting multipart
+  uploads always run.
+
+In-process services (`memory://`, `fs://`) send no HTTP request: their calls are counted as they
+complete.
+
+**A stopped run leaves no multipart upload.** When a budget, `--max-duration`, Ctrl-C (or
+SIGTERM, SIGHUP) or Stop ends a run, the requests in flight are cut and the operations they
+belong to end at once; they are neither completed nor failed operations, and are not in the
+profile. Every multipart upload a failed, timed-out or stopped write or dataset upload had
+started is aborted (`AbortMultipartUpload`), so no part stays on the target to be billed where no
+object listing shows it. An upload whose abort fails is named in the cleanup error.
+
 ## Profile
 
 A profile is what one operator did on one workload, saved as one `.oprobe` file:
@@ -75,8 +97,9 @@ a workload oprobe chose, so nothing to replay: `prove` needs a run. [Reading the
 ## Finding
 
 A finding names a cause and shows its evidence. It is derived from the profile by fitting simple
-limit models to the requests in flight over time (an in-flight ceiling where 429/503 start, a
-request-rate ceiling, a bandwidth plateau, a hot key) and by reading the stage split (stragglers,
+limit models to the requests in flight over time (an in-flight ceiling where 429/503 start, or
+where the service starts to queue requests without rejecting any; a request-rate ceiling; a
+bandwidth plateau of the downloads or of the uploads; a hot key) and by reading the stage split (stragglers,
 hung I/O, cold connections, small ranges, slow multipart, repeated reads, a busy client).
 
 Every finding has a confidence: **high** only when the model explains most of the effect and
@@ -103,16 +126,29 @@ large a limit should be or how much it would help; claiming so would be a guess.
 1. **Choose the change**: the finding's remedy (the top finding by default), or `--with PATH=VALUE`.
 2. **Size it**: when the remedy has a size (a limit, a chunk), short trials over that one value
    find the knee of the objective, within `--max-throttle`.
-3. **A/B test**: trials of A and B alternate in pairs (the order within each pair drawn from the
-   run's seed); a sequential test on the objective, against a noise floor learned from each
-   side's consecutive trials (the A/A spread until B has its own), stops as soon as it
-   can decide, or when the wall-time budget (`--max-duration`) would be exceeded.
+3. **A/B test**: trials of A and B run in pairs. The order is balanced: the pairs come in blocks
+   of two, one `AB` and one `BA`, and which comes first in a block is drawn from the run's seed.
+   A sequential test on the objective, against a noise floor learned from each side's
+   consecutive trials (the A/A spread until B has its own), stops as soon as it can decide, or
+   when the wall-time budget (`--max-duration`) would be exceeded. A trial that ends throttled
+   is followed by a short cool-down, so the next trial (often the other side) does not start
+   against a limit the last one drained.
 4. **Decide**: `improved`, `worse` (exit 3) or `inconclusive` on the objective: **goodput**
-   (successful operations per second; the default) or **p99**. The objective's interval is
-   Student's t on the paired log ratios (B over A, pair by pair), with a spread no smaller than
-   the A/A noise floor, so it never goes below −100 %. Shares (throttled requests, errors) are
-   compared with Newcombe's interval. Secondary metrics are shown and never decide. Deciding
-   takes at least 3 pairs of trials; with fewer, the verdict is `inconclusive`.
+   (successful operations per second; the default) or **p99**. The verdict is whether the
+   objective's interval excludes no change, and nothing else:
+   - The estimate is the mean of the paired log ratios (B over A, pair by pair), taken as the
+     mean of the `AB` pairs' mean and the `BA` pairs' mean. An effect of the order itself (the
+     second trial of a pair running warmer, or against a refilled limit) cancels in it.
+   - The spread is the larger of the pairs' own spread and the A/A noise floor. The interval
+     never goes below −100 %.
+   - The interval is **sequential**: prove looks after every pair from the third on, so each
+     look is held to a stricter level than one fixed-size test would be (the critical values
+     are calibrated by simulation for the planned number of pairs, `--pairs`). Whenever the
+     proof stops — a decision, the pair limit, the budget — the chance that it calls a change
+     that is none stays under 5 %. An order effect widens the interval; it never moves it.
+   - Shares (throttled requests, errors) are compared with Newcombe's interval. Secondary
+     metrics are shown and never decide (their intervals are plain, not sequential).
+   - Deciding takes at least 3 pairs of trials; with fewer, the verdict is `inconclusive`.
 5. **Save**: every trial is saved as a run, a child of the prove, hidden from `show --list`.
 
 The result is a **proven layer diff**: the objective's change with its interval, the evidence,
@@ -140,7 +176,7 @@ The terms a profile and a proof print, in one line each.
 | **cold connection** | a request that had to open a new connection instead of reusing one |
 | **open loop** | operations start on a schedule (`--rate`), so a slow service cannot hide behind fewer requests |
 | **confidence** | how well a finding's model explains the evidence: high, medium or low |
-| **95 % interval** | the range `[low, high]` that holds the true change in 95 of 100 repeats of the proof; a change whose interval includes 0 is not proven |
+| **95 % interval** | the range `[low, high]` that holds the true change in 95 of 100 repeats of the proof, whenever the proof stopped (it is sequential, and adjusted for the order of the trials in a pair); a change whose interval includes 0 is not proven |
 | **noise floor (`±`)** | how much two runs of the *same* operator differ (the A/A spread); a change smaller than it cannot be told from noise |
 | **pair of trials** | one short run of A (the operator as it is) and one of B (with the change), back to back |
 | **verdict** | `ok`, `review` (look before trusting the numbers), `attention` (a finding costs time) or `critical` (failures or a large cost) |

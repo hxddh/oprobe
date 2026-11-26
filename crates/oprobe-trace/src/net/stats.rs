@@ -151,6 +151,7 @@ mod tests {
                 retry_after_ms: None,
                 error: None,
                 remote: None,
+                server: None,
                 service_op: Some("GetObject"),
                 tls: None,
                 tcp: None,

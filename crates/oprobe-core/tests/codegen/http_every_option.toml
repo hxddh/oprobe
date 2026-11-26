@@ -1,0 +1,11 @@
+url = "s3://bucket/prefix"
+[layers]
+concurrent_limit = { http = 16 }
+[read]
+concurrent = 4
+[http]
+version = "h1"
+keep_alive = false
+proxy = "http://user:PWSEKRIT@127.0.0.1:8888"
+ca_cert = "/etc/ssl/certs/extra.pem"
+insecure = true

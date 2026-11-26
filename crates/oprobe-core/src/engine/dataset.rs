@@ -12,6 +12,7 @@ use rand::{Rng, RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Access, DatasetSpec};
+use crate::errors::OprobeError;
 
 /// Incompressible, de-duplication-proof payload with a CRC32C digest.
 pub fn generate_payload(seed: u64, size: usize) -> (Bytes, u32) {
@@ -34,6 +35,8 @@ pub struct PayloadPool {
 }
 
 impl PayloadPool {
+    /// A pool that [`PayloadPool::slice`] cuts payloads of up to `max_len` bytes from
+    /// ([`super::ops::max_payload`] of the workload's operations).
     pub fn new(max_len: usize) -> Self {
         let len = max_len.max(64 * 1024) + 1024 * 1024;
         Self {
@@ -41,14 +44,21 @@ impl PayloadPool {
         }
     }
 
-    pub fn slice(&self, rng: &mut impl Rng, len: usize) -> Bytes {
-        let max_off = self.buf.len().saturating_sub(len);
+    /// `len` bytes of the pool, at a random offset. A pool smaller than `len` is an error,
+    /// never a shorter payload: the operation would report a size it did not write.
+    pub fn slice(&self, rng: &mut impl Rng, len: usize) -> Result<Bytes> {
+        anyhow::ensure!(
+            len <= self.buf.len(),
+            "the payload pool holds {} B, less than the {len} B an operation writes",
+            self.buf.len()
+        );
+        let max_off = self.buf.len() - len;
         let off = if max_off == 0 {
             0
         } else {
             rng.gen_range(0..max_off) & !7
         };
-        self.buf.slice(off..off + len.min(self.buf.len()))
+        Ok(self.buf.slice(off..off + len))
     }
 }
 
@@ -89,7 +99,8 @@ fn fingerprint(spec: &DatasetSpec, seed: u64) -> String {
 }
 
 /// Best-effort removal of a failed/cancelled upload (bounded: the service may be unreachable,
-/// which is often why the upload failed in the first place).
+/// which is often why the upload failed in the first place). `admin` is the cleanup operator:
+/// outside the gate that stopped the upload.
 async fn remove_partial(admin: &Operator, paths: Vec<String>, manifest: &str, persisted: bool) {
     let mut paths = paths;
     if persisted {
@@ -108,13 +119,29 @@ async fn remove_partial(admin: &Operator, paths: Vec<String>, manifest: &str, pe
     .await;
 }
 
+/// What a dataset is prepared through.
+#[derive(Clone, Copy)]
+pub struct Via<'a> {
+    /// Reads and uploads: behind the run's gate (budgets, cancellation).
+    pub admin: &'a Operator,
+    /// Removes a failed upload: outside the gate that stopped it.
+    pub cleaner: &'a Operator,
+    /// Where the multipart uploads that did not complete are aborted.
+    pub aborts: &'a super::upload::Aborts,
+}
+
+/// The error of a dataset upload the run's cancellation stopped.
+const CANCELLED: &str = "cancelled while uploading the dataset";
+
 impl Dataset {
     /// Prepare the dataset: discover existing objects, reuse a persisted dataset, or upload one.
     ///
-    /// Observes `cancel`; when the upload fails or is cancelled, every object it started
-    /// uploading is deleted again before the error is returned (no test data left behind).
+    /// A cancellation or a spent budget stops the upload's requests at the run's gate, and no
+    /// further object starts once `cancel` fired. When the upload fails or is stopped, every
+    /// multipart upload it left is aborted and every object it started is deleted again
+    /// before the error is returned: no test data is left behind.
     pub async fn prepare(
-        admin: &Operator,
+        via: Via<'_>,
         spec: &DatasetSpec,
         seed: u64,
         run_prefix: &str,
@@ -122,6 +149,11 @@ impl Dataset {
         cancel: &crate::engine::Cancel,
         progress: &(dyn Fn(String) + Send + Sync),
     ) -> Result<Self> {
+        let Via {
+            admin,
+            cleaner,
+            aborts,
+        } = via;
         if let Some(prefix) = &spec.existing_prefix {
             return Self::discover(admin, prefix, spec.objects.max(1) * 64).await;
         }
@@ -174,30 +206,34 @@ impl Dataset {
             .map(|i| {
                 let path = format!("{}obj-{i:05}.bin", parts[i % partitions]);
                 let admin = admin.clone();
-                uploaded
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(path.clone());
                 let size = match &spec.size_dist {
                     Some(d) => d.size_of(seed, i) as usize,
                     None => size,
                 };
+                let uploaded = &uploaded;
                 async move {
+                    if cancel.is_cancelled() {
+                        bail!(CANCELLED);
+                    }
+                    uploaded
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(path.clone());
                     let (data, crc) = tokio::task::spawn_blocking(move || {
                         generate_payload(seed.wrapping_add(i as u64 * 7919), size)
                     })
                     .await
                     .context("payload generation task failed")?;
-                    let mut w = admin
+                    let failed = || format!("cannot upload dataset object `{path}`");
+                    let w = admin
                         .writer_with(&path)
                         .chunk(8 * 1024 * 1024)
                         .concurrent(4)
                         .await
-                        .with_context(|| format!("cannot upload dataset object `{path}`"))?;
-                    w.write(data).await?;
-                    w.close()
-                        .await
-                        .with_context(|| format!("cannot upload dataset object `{path}`"))?;
+                        .with_context(failed)?;
+                    let mut upload = super::upload::Upload::new(&admin, w, &path, aborts);
+                    upload.write(data).await.with_context(failed)?;
+                    upload.close().await.with_context(failed)?;
                     Ok::<_, anyhow::Error>(DataObject {
                         path,
                         size: size as u64,
@@ -207,36 +243,40 @@ impl Dataset {
             })
             .buffered(4)
             .try_collect::<Vec<DataObject>>();
+        // The cancellation needs no `select!` here: the gate stops the requests of a cancelled
+        // run, so each upload ends (and aborts) on its own, and no further one starts.
         let res = async {
-            let objects = tokio::select! {
-                r = upload => r?,
-                _ = cancel.cancelled() => bail!("cancelled while uploading the dataset"),
-            };
+            let objects = upload.await?;
             if persisted {
                 let m = Manifest {
                     objects: objects.clone(),
                     partitions: parts.clone(),
                 };
-                let w = admin.write(&manifest_path, serde_json::to_vec(&m)?);
-                tokio::select! {
-                    r = w => { r?; }
-                    _ = cancel.cancelled() => bail!("cancelled while uploading the dataset"),
-                }
+                admin.write(&manifest_path, serde_json::to_vec(&m)?).await?;
             }
-            Ok(objects)
+            Ok::<_, anyhow::Error>(objects)
         }
         .await;
         let objects = match res {
             Ok(o) => o,
             Err(e) => {
+                aborts.settle().await;
                 let paths =
                     std::mem::take(&mut *uploaded.lock().unwrap_or_else(|e| e.into_inner()));
                 progress(format!(
                     "dataset upload failed; removing {} partially uploaded objects",
                     paths.len()
                 ));
-                remove_partial(admin, paths, &manifest_path, persisted).await;
-                return Err(e);
+                remove_partial(cleaner, paths, &manifest_path, persisted).await;
+                let e = if cancel.is_cancelled() && e.downcast_ref::<OprobeError>().is_none() {
+                    anyhow::anyhow!(CANCELLED)
+                } else {
+                    e
+                };
+                return Err(match aborts.failure() {
+                    Some(unaborted) => e.context(unaborted),
+                    None => e,
+                });
             }
         };
         progress(format!(

@@ -21,18 +21,30 @@ handle.save("prod.oprobe")?; // then: oprobe show prod.oprobe
   (`FoyerLayer`, `MokaLayer`) and `Handle::queue_layer()` measures semaphore wait in outer
   concurrency layers.
 - **Your own sink:** implement `Exporter` and pass it with `Config::exporter`. With the `otel`
-  feature (opentelemetry 0.32), `otel::OtelExporter` records `http.client.request.duration`
-  stage by stage with OpenDAL's `scheme`, `namespace`, `root` and `operation` labels.
-- **Faithful:** for HTTP services the layer installs an instrumented `HttpFetch` built like
+  feature (opentelemetry 0.32), `otel::OtelExporter` records every HTTP request once into the
+  standard `http.client.request.duration` (standard attributes only) and its stages into
+  `oprobe.http.client.request.stage.duration` (`oprobe.stage`, with OpenDAL's `scheme`,
+  `namespace`, `root` and `operation` labels).
+- **Faithful:** for HTTP services the layer installs an instrumented `HttpTransport` built like
   OpenDAL's default reqwest client (rustls with aws-lc-rs, the same pool defaults); the HTTP
   version, keep-alive, extra CA, proxy and in-flight cap are `Config` settings.
+- **Your client stays yours, if you say so:** by default that instrumented client *replaces*
+  the operator's HTTP transport, so add the trace layer **before** any layer that wraps the
+  transport (`ConcurrentLimitLayer::with_http_concurrent_limit` added before it would stop
+  limiting), and a custom client installed with `Operator::with_context` is not used. With
+  `Config::keep_http_transport(true)` the layer wraps the installed transport instead: your
+  client and the limiters beneath carry every request, and the layer records what is visible
+  from outside (no DNS/TCP/TLS split, no connection statistics).
+- **Nothing to leak:** error texts lose the credentials of any URL in them (`user:pass@`,
+  presigned signatures, SAS and STS tokens) before they reach an exporter, a snapshot or a
+  file, and the errors the instrumented client returns quote URLs the same way.
 - **Bounded:** aggregates are exact; trace rows are sampled whole within `Config::max_rows`; a
   month-long timeline keeps under 2 000 intervals.
 - **Cheap:** `cargo bench -p oprobe-trace --bench overhead` compares the same operations with
   and without the layer; the budget is 2 µs per operation.
 - **Stable:** the documented API, the file format and the meaning of every field are stable
   across 9.x; public structs and enums are `#[non_exhaustive]`.
-- **Requires:** OpenDAL 0.59, Tokio, Rust 1.97.
+- **Requires:** OpenDAL 0.59, Tokio, Rust 1.91 (OpenDAL 0.59's own minimum).
 
 Features: `otel` (OpenTelemetry metrics), `schemars` (`JsonSchema` for the snapshot types).
 The `__internal` feature is for the oprobe binary only and has no semver promise.
