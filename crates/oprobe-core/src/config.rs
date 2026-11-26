@@ -1008,7 +1008,8 @@ impl TargetSpec {
                             ))
                             .with_hint(format!(
                                 "use one of {}, lab, memory; or install a build with every \
-                                 service: `cargo install oprobe --features all-services`",
+                                 service: `cargo install --locked --git https://github.com/hxddh/oprobe \
+                                 oprobe --features all-services`",
                                 supported_schemes().join(", ")
                             ))
                         })

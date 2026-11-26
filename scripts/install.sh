@@ -113,7 +113,7 @@ case "$os" in
       *) err "unsupported architecture: $arch" ;;
     esac ;;
   Darwin) target=universal-apple-darwin ;;
-  *) err "unsupported OS: $os (Windows: use install.ps1, the MSI or scoop)" ;;
+  *) err "unsupported OS: $os (Windows: use install.ps1 or the MSI)" ;;
 esac
 
 tmp=$(mktemp -d)

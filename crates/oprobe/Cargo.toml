@@ -8,10 +8,9 @@ repository.workspace = true
 documentation.workspace = true
 description = "A profiler for Apache OpenDAL operators: what your Operator does on the wire, the layer that fixes it, and an A/B test that proves the fix"
 readme = "../../README.md"
-keywords = ["opendal", "s3", "benchmark", "profiler", "object-storage"]
-categories = ["command-line-utilities", "development-tools::profiling"]
-include = ["build.rs", "src/**/*", "Cargo.toml", "LICENSE"]
 default-run = "oprobe"
+# The binary ships as GitHub release assets, not on crates.io.
+publish = false
 
 # The front ends (CLI and app) over `oprobe_core::app`. The library target exists for the
 # integration tests; embed `oprobe-trace` instead.

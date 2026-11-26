@@ -12,20 +12,16 @@ name: Release
 #   oprobe-desktop-<ver>-x86_64-unknown-linux-gnu.tar.gz  (Linux build with windows; needs GTK 4)
 # The app build everywhere: macOS and Windows builds include native windows (`--features gui`);
 # Linux packages have the app in the terminal only, so servers need no GTK (design v6 D4).
-#   SHA256SUMS, oprobe.rb (Homebrew formula `oprobe`), oprobe-app.rb (Homebrew cask `oprobe-app`
-#   for the .dmg), oprobe.json (Scoop manifest), winget-manifests.zip (winget manifests),
-#   latest.json (index of every asset with URL, size and SHA-256), install.sh, install.ps1,
-#   SHA256SUMS.minisig (minisign signature over SHA256SUMS; only when MINISIGN_KEY is set, and
-#   the installers embed the public key only when MINISIGN_PUBKEY is set)
-# After publishing, package managers are updated when their secret exists (skipped with a
-# warning otherwise; stable releases only; docs/releasing.md):
-#   homebrew-tap  TAP_TOKEN     Formula/oprobe.rb + Casks/oprobe-app.rb -> hxddh/homebrew-tap
-#   scoop-bucket  SCOOP_TOKEN   bucket/oprobe.json -> hxddh/scoop-bucket
-#   winget        WINGET_TOKEN  a pull request to microsoft/winget-pkgs (hxddh.oprobe)
+#   SHA256SUMS, latest.json (index of every asset with URL, size and SHA-256), install.sh,
+#   install.ps1, SHA256SUMS.minisig (minisign signature over SHA256SUMS; only when MINISIGN_KEY
+#   is set, and the installers embed the public key only when MINISIGN_PUBKEY is set)
+# The GitHub release is the one distribution channel of the binary: no package manager is
+# updated (Homebrew, Scoop, winget and `cargo install oprobe` were never published and were
+# removed). The embeddable library is the exception, when its secret exists:
 # Every asset gets a SLSA build provenance attestation (`gh attestation verify FILE --repo …`).
 # Supply chain (design v5 §5): every action is pinned by commit SHA, and no release job uses a
 # cache (a poisoned cache could otherwise reach a published binary).
-#   crates.io     CARGO_REGISTRY_TOKEN  oprobe-trace, oprobe-core, oprobe (in that order)
+#   crates.io     CARGO_REGISTRY_TOKEN  oprobe-trace only (skipped with a warning without it)
 #   minisign      MINISIGN_KEY          SHA256SUMS.minisig
 # Nothing is code-signed (no Apple/Microsoft certificates): docs/install.md explains the first open.
 # Release notes are the CHANGELOG section of the version.
@@ -348,7 +344,7 @@ jobs:
           ref: ${{ env.TAG }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { pattern: "dist-*", merge-multiple: true, path: out }
-      - name: Checksums, Homebrew formula + cask, Scoop, winget, latest.json, installers
+      - name: Checksums, latest.json, installers
         env:
           MINISIGN_PUBKEY: ${{ vars.MINISIGN_PUBKEY }}
         run: |
@@ -362,7 +358,7 @@ jobs:
           fi
           (cd out && sha256sum * | sort -k2 > SHA256SUMS)
           scripts/release-manifests.sh "$VERSION" out "${{ github.repository }}"
-          # The checksums cover the generated manifests too.
+          # The checksums cover latest.json too.
           (cd out && rm SHA256SUMS && sha256sum * | sort -k2 > SHA256SUMS)
           cat out/SHA256SUMS
       # A minisign signature over SHA256SUMS, for installs without `gh` (install.sh and
@@ -389,14 +385,9 @@ jobs:
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: out/*
-      # A channel is advertised only when this release publishes to it: its secret is set (the
-      # crates-io, homebrew-tap and scoop-bucket jobs skip without one).
       - name: Release notes from CHANGELOG
         env:
           MINISIGN_PUBKEY: ${{ vars.MINISIGN_PUBKEY }}
-          HAS_CARGO_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
-          HAS_TAP_TOKEN: ${{ secrets.TAP_TOKEN != '' }}
-          HAS_SCOOP_TOKEN: ${{ secrets.SCOOP_TOKEN != '' }}
         run: |
           awk -v v="$VERSION" '$0 ~ "^## \\[?v?"v {f=1; next} f && /^## / {exit} f' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "oprobe $VERSION" > notes.md
@@ -404,19 +395,7 @@ jobs:
             echo
             echo "---"
             echo "**Install:** \`curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$VERSION/install.sh | sh\` (CLI only: \`| sh -s -- --cli\`) ·"
-            if [ "$HAS_TAP_TOKEN" = true ]; then
-              echo "Homebrew: \`brew install hxddh/tap/oprobe\` (the app bundle: \`brew install --cask hxddh/tap/oprobe-app\`) ·"
-            fi
-            if [ "$HAS_SCOOP_TOKEN" = true ]; then
-              echo "Windows: the \`.msi\`, Scoop (\`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket\` then \`scoop install oprobe\`), or \`winget install hxddh.oprobe\` once its winget-pkgs pull request is merged ·"
-            else
-              echo "Windows: the \`.msi\` or \`install.ps1\`, or \`winget install hxddh.oprobe\` once its winget-pkgs pull request is merged ·"
-            fi
-            if [ "$HAS_CARGO_TOKEN" = true ]; then
-              echo "Rust: \`cargo install oprobe --locked\` · the CLI-only build: the \`oprobe-cli-$VERSION-*\` archives."
-            else
-              echo "The CLI-only build: the \`oprobe-cli-$VERSION-*\` archives."
-            fi
+            echo "Windows: the \`.msi\` or \`install.ps1\` · the CLI-only build: the \`oprobe-cli-$VERSION-*\` archives."
             echo "The macOS and Windows packages are not code-signed; first open: [docs/install.md](https://github.com/${{ github.repository }}/blob/v$VERSION/docs/install.md#first-open-of-unsigned-packages)."
             if [ -f out/SHA256SUMS.minisig ] && [ -n "$MINISIGN_PUBKEY" ]; then
               echo "Verify: \`sha256sum -c SHA256SUMS --ignore-missing\`, then \`gh attestation verify <file> --repo ${{ github.repository }}\` or \`minisign -Vm SHA256SUMS -P $MINISIGN_PUBKEY\`."
@@ -433,7 +412,7 @@ jobs:
           fail_on_unmatched_files: true
 
   crates-io:
-    name: Publish to crates.io
+    name: Publish oprobe-trace to crates.io
     needs: [plan, publish]
     runs-on: ubuntu-latest
     env:
@@ -452,126 +431,11 @@ jobs:
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
             echo "::warning::CARGO_REGISTRY_TOKEN not set; skipping crates.io publish"; exit 0
           fi
-          # In dependency order; each `cargo publish` waits until the crate is in the index. A
-          # crate of this version that is already published (a re-run) is skipped. oprobe-core is
-          # internal (no semver promise): oprobe pins it, and it pins oprobe-trace, with `=`.
+          # Only the embeddable library is published; the binary and its engine are not
+          # (`publish = false`). A version already on crates.io (a re-run) is skipped.
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          for crate in oprobe-trace oprobe-core oprobe; do
-            if curl -fsS -A "oprobe-release (github.com/${{ github.repository }})" \
-                 "https://crates.io/api/v1/crates/$crate/$version" >/dev/null 2>&1; then
-              echo "$crate $version is already on crates.io"; continue
-            fi
-            cargo publish --locked -p "$crate"
-          done
-
-  # Package managers. Each job is gated on its secret: without it, the job ends with a warning
-  # and the release stays green. Pre-releases are never published to them.
-  homebrew-tap:
-    name: Homebrew tap (hxddh/homebrew-tap)
-    needs: [plan, meta, publish]
-    if: ${{ !contains(needs.meta.outputs.version, '-') }}
-    runs-on: ubuntu-latest
-    env:
-      VERSION: ${{ needs.meta.outputs.version }}
-      TAG: ${{ needs.plan.outputs.tag }}
-      TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
-    steps:
-      - id: gate
-        run: |
-          if [ -z "$TAP_TOKEN" ]; then
-            echo "::warning::TAP_TOKEN not set; skipping the Homebrew tap update (docs/releasing.md#homebrew)"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+          if curl -fsS -A "oprobe-release (github.com/${{ github.repository }})" \
+               "https://crates.io/api/v1/crates/oprobe-trace/$version" >/dev/null 2>&1; then
+            echo "oprobe-trace $version is already on crates.io"; exit 0
           fi
-      - name: Download the formula and the cask
-        if: steps.gate.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: gh release download "$TAG" --repo "$REPO" --pattern oprobe.rb --pattern oprobe-app.rb --dir manifests
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        if: steps.gate.outputs.skip != 'true'
-        with:
-          repository: hxddh/homebrew-tap
-          token: ${{ secrets.TAP_TOKEN }}
-          path: tap
-      - name: Commit and push
-        if: steps.gate.outputs.skip != 'true'
-        run: |
-          mkdir -p tap/Formula tap/Casks
-          cp manifests/oprobe.rb tap/Formula/oprobe.rb
-          cp manifests/oprobe-app.rb tap/Casks/oprobe-app.rb
-          cd tap
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/oprobe.rb Casks/oprobe-app.rb
-          if git diff --cached --quiet; then echo "the tap already has oprobe $VERSION"; exit 0; fi
-          git commit -m "oprobe $VERSION"
-          git push
-
-  scoop-bucket:
-    name: Scoop bucket (hxddh/scoop-bucket)
-    needs: [plan, meta, publish]
-    if: ${{ !contains(needs.meta.outputs.version, '-') }}
-    runs-on: ubuntu-latest
-    env:
-      VERSION: ${{ needs.meta.outputs.version }}
-      TAG: ${{ needs.plan.outputs.tag }}
-      SCOOP_TOKEN: ${{ secrets.SCOOP_TOKEN }}
-    steps:
-      - id: gate
-        run: |
-          if [ -z "$SCOOP_TOKEN" ]; then
-            echo "::warning::SCOOP_TOKEN not set; skipping the Scoop bucket update (docs/releasing.md#scoop)"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Download the manifest
-        if: steps.gate.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: gh release download "$TAG" --repo "$REPO" --pattern oprobe.json --dir manifests
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        if: steps.gate.outputs.skip != 'true'
-        with:
-          repository: hxddh/scoop-bucket
-          token: ${{ secrets.SCOOP_TOKEN }}
-          path: bucket-repo
-      - name: Commit and push
-        if: steps.gate.outputs.skip != 'true'
-        run: |
-          mkdir -p bucket-repo/bucket
-          cp manifests/oprobe.json bucket-repo/bucket/oprobe.json
-          cd bucket-repo
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add bucket/oprobe.json
-          if git diff --cached --quiet; then echo "the bucket already has oprobe $VERSION"; exit 0; fi
-          git commit -m "oprobe: update to version $VERSION"
-          git push
-
-  # winget-releaser forks microsoft/winget-pkgs into the token owner's account and opens a pull
-  # request with the new version (both MSIs). It updates an existing package: the first version
-  # of hxddh.oprobe is submitted by hand from winget-manifests.zip (docs/releasing.md#winget).
-  winget:
-    name: winget pull request (hxddh.oprobe)
-    needs: [plan, meta, publish]
-    if: ${{ !contains(needs.meta.outputs.version, '-') }}
-    runs-on: windows-latest
-    env:
-      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
-    steps:
-      - id: gate
-        shell: bash
-        run: |
-          if [ -z "$WINGET_TOKEN" ]; then
-            echo "::warning::WINGET_TOKEN not set; skipping the winget pull request (submit winget-manifests.zip by hand; docs/releasing.md#winget)"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          fi
-      - uses: vedantmgoyal9/winget-releaser@b7370d4d152efdce803a26cc6ca9eee58cb2ad54 # v2
-        if: steps.gate.outputs.skip != 'true'
-        with:
-          identifier: hxddh.oprobe
-          version: ${{ needs.meta.outputs.version }}
-          release-tag: ${{ needs.plan.outputs.tag }}
-          installers-regex: '\.msi$'
-          token: ${{ secrets.WINGET_TOKEN }}
+          cargo publish --locked -p oprobe-trace

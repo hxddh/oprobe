@@ -127,10 +127,9 @@ oprobe prove last --with layers.retry.max_times=5 --max-duration 5m -o json > pr
 | 平台 | |
 |---|---|
 | macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh`（`-s -- --cli` 只装命令行，不含应用） |
-| Homebrew（发布后） | `brew install hxddh/tap/oprobe`（应用包：`brew install --cask hxddh/tap/oprobe-app`） |
-| Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`、`.msi`、Scoop（发布后；`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket`，`scoop install oprobe`）或 `winget install hxddh.oprobe` |
+| Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` 或 `.msi` |
 | Debian / Ubuntu、Fedora / RHEL | 发布页上的 `.deb` / `.rpm` |
-| Rust（crates.io，发布后） | `cargo install oprobe --locked`（`--no-default-features --features cli` 只装命令行；Linux 上 `--features gui` 启用原生窗口） |
+| Rust（从源码） | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.1 oprobe`（`--no-default-features --features cli` 只装命令行；Linux 上 `--features gui` 启用原生窗口） |
 
 macOS 和 Windows 安装包**没有代码签名**：首次打开需要确认一次（[方法](docs/install.md#first-open-of-unsigned-packages)）。每个文件在 `SHA256SUMS` 中都有 SHA-256，并带有 SLSA 构建来源证明；安装脚本会校验 SHA-256，并在 GitHub CLI 已登录时校验来源证明（[校验方法](docs/install.md#verifying-a-download)）。
 

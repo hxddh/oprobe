@@ -106,14 +106,25 @@ async fn depth_in() {
     let p = lab.profile("bkt");
     let reqs = rows(p, 300).await;
     if oprobe::net::tcpinfo::SUPPORTED {
-        // Every connection is sampled: its first request always, then at most every 10 ms.
-        let conns: std::collections::BTreeSet<u64> = reqs.iter().map(|r| r.conn_id).collect();
-        let sampled: std::collections::BTreeSet<u64> = reqs
+        // A connection is sampled once its socket has been found, which happens beside its
+        // requests (9.3: no request waits for the lookup). A connection that carried a request
+        // or two before the lookup answered has none (Linux CI: one of four), so the claim is
+        // about the connection that carried the most requests: it outlasts any lookup.
+        let mut per_conn: std::collections::BTreeMap<u64, (usize, usize)> = Default::default();
+        for r in &reqs {
+            let e = per_conn.entry(r.conn_id).or_default();
+            e.0 += 1;
+            e.1 += usize::from(r.tcp.is_some());
+        }
+        let (busiest, (carried, sampled)) = per_conn
             .iter()
-            .filter(|r| r.tcp.is_some())
-            .map(|r| r.conn_id)
-            .collect();
-        assert_eq!(sampled, conns, "{mode:?}");
+            .max_by_key(|(_, (n, _))| *n)
+            .map(|(id, counts)| (*id, *counts))
+            .unwrap();
+        assert!(
+            sampled > 0,
+            "{mode:?}: connection {busiest} carried {carried} requests and none was sampled: {per_conn:?}"
+        );
         let t = reqs.iter().find_map(|r| r.tcp.as_deref()).unwrap();
         assert!(t.cwnd > 0 && t.rtt_us > 0, "{t:?}");
         let k = oprobe::net::stats::tcp_kernel(&reqs).unwrap();

@@ -27,7 +27,7 @@ cargo bench -p oprobe-trace --bench overhead       # oprobe-trace overhead (budg
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --features gui --all-targets -- -D warnings
-cargo package --workspace
+cargo package -p oprobe-trace
 ```
 
 **Isolation.** Tests never touch the user's files: integration tests point `OPROBE_DATA_DIR` and

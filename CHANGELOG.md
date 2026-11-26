@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v9.3.1 — 2026-11-26
+
+### Removed
+
+- **Homebrew, Scoop, winget and crates.io for the binary.** None of them was ever published, and
+  their jobs, manifests and documentation are gone. The binary ships as GitHub release assets
+  (with `install.sh` and `install.ps1`) and installs from source with
+  `cargo install --locked --git https://github.com/hxddh/oprobe --tag vX.Y.Z oprobe`.
+  `oprobe-trace` remains the one crate published to crates.io, when the release has a token.
+
+### Known issues
+
+- A limit on requests in flight that a run crosses only in one burst (workers that start in
+  step and then back off) can be reported as a `rate_limit`: a token bucket of that burst fits
+  the same responses. The remedy path is the same (`layers.concurrent_limit.http`); the cap
+  `prove` sizes may differ. The test for it now crosses the limit throughout its window.
+
 ## v9.3.0 — 2026-11-26
 
 9.3 is a truth-and-stop release. A deep review of 9.2 (`docs/design/v9.2-review.md`: a bug hunt on
