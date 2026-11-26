@@ -436,7 +436,8 @@ mod tests {
             .build()
             .unwrap();
         let upload = rt.block_on(async {
-            let op = Operator::via_iter("memory", [] as [(String, String); 0]).unwrap();
+            let target = crate::config::TargetSpec::from_url("memory://").unwrap();
+            let op = base_operator(&target).unwrap();
             let w = op.writer("kept").await.unwrap();
             Upload::new(&op, w, "kept", &aborts)
         });
