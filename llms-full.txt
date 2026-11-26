@@ -408,18 +408,35 @@ command sends to the target and every body byte, as they are sent and received:
 - a request the budget has no room for is never sent, and a download stops at the chunk that
   crosses the byte budget, so a budget is overshot by at most the response chunks in flight,
   never by a whole operation;
-- cleanup is never counted and never refused: deleting the run prefix and aborting multipart
-  uploads always run.
+- once a budget is spent, nothing more is sent: a request without a body is refused too, since
+  its answer would only be cut. A body that does not fit in what is left of `--max-bytes` is
+  refused and the error says so ("the next request (8.0 MiB) does not fit the byte budget: 1 B
+  of 4.0 MiB used");
+- cleanup is never counted and never refused: deleting the run prefix, deleting the preflight's
+  probe object and aborting multipart uploads always run.
 
 In-process services (`memory://`, `fs://`) send no HTTP request: their calls are counted as they
 complete.
 
 **A stopped run leaves no multipart upload.** When a budget, `--max-duration`, Ctrl-C (or
-SIGTERM, SIGHUP) or Stop ends a run, the requests in flight are cut and the operations they
-belong to end at once; they are neither completed nor failed operations, and are not in the
-profile. Every multipart upload a failed, timed-out or stopped write or dataset upload had
-started is aborted (`AbortMultipartUpload`), so no part stays on the target to be billed where no
-object listing shows it. An upload whose abort fails is named in the cleanup error.
+SIGTERM, SIGHUP), a closed terminal or Stop ends a run, the requests in flight are cut and the
+operations they belong to end at once; they are neither completed nor failed operations, and are
+not in the profile (an open-loop run counts them in neither its arrivals nor its achieved rate).
+Every multipart upload a failed, timed-out or stopped write or dataset upload had started is
+aborted (`AbortMultipartUpload`), so no part stays on the target to be billed where no object
+listing shows it.
+
+Stopping is bounded. An upload that was being created when the run stopped has 10 s to answer
+(its answer carries the id it is aborted with), each abort 30 s, and the run waits at most 45 s
+for all of them before it deletes its test data. An upload whose abort failed, whose creation
+never answered or that was still in flight after that wait is named in the cleanup error: check
+the target for it (`aws s3api list-multipart-uploads`, or a lifecycle rule that aborts
+incomplete uploads).
+
+**A closed stderr stops the run like a signal.** Progress goes to stderr. When its reader is
+gone (the terminal or SSH session closed, `oprobe run … 2>&1 | head`), the first line that cannot
+be written stops the command as Ctrl-C does: it cleans up, saves the partial run and exits 130.
+With `-q` nothing is written while the run measures, so it runs to its end.
 
 ## Profile
 
@@ -1952,8 +1969,9 @@ runtime, `3` the proven change is worse, `4` budget, `5` safety refusal, `130` i
 ### `usage.invalid_argument` (exit 2)
 
 A flag or argument is malformed: an unknown flag, a value that does not parse
-(`--max-bytes lots`), an unknown `--set` path. With `-o json` argument errors are JSON too. Fix
-the argument; `--help` lists what the command accepts.
+(`--max-bytes lots`), an unknown `--set` path, or an address `oprobe lab --bind` cannot listen
+on (the port is taken: `--bind 127.0.0.1:0` takes a free one). With `-o json` argument errors
+are JSON too. Fix the argument; `--help` lists what the command accepts.
 
 <a id="usage-unknown_target"></a>
 ### `usage.unknown_target` (exit 2)
@@ -2003,8 +2021,10 @@ The service refused the credentials or the operation (`AccessDenied`, `Signature
 ### `net.unreachable` (exit 1, retryable)
 
 Nothing answered (`connection refused`, reset, no route). Check the endpoint and port; is MinIO or
-`oprobe lab` running? Behind an egress proxy check `HTTPS_PROXY` / `NO_PROXY`, or set
-`http.proxy = "none"`.
+`oprobe lab` running? When the requests go through a proxy (`http.proxy`, or `HTTPS_PROXY` /
+`HTTP_PROXY` / `ALL_PROXY` unless `NO_PROXY` exempts the endpoint), the proxy is what the client
+connects to, and the message names it ("connection refused by the proxy 127.0.0.1:3128"): check
+that it is running, or connect directly with `--set http.proxy=none`.
 
 <a id="net-dns"></a>
 ### `net.dns` (exit 1, retryable)
@@ -2065,8 +2085,11 @@ command. Budgets cover the whole command: every operator of `run`, every trial o
 every HTTP request sent to the target before cleanup (the preflight, the dataset upload and
 retries included). The request the budget had no room for was not sent, the operations in flight
 were cut, their multipart uploads aborted, the partial run saved and the test data cleaned up.
-When the budget runs out during the preflight or the dataset upload there is no run to save.
-Raise the budget or shorten the run; `--dry-run` shows the estimates.
+When the budget runs out during the preflight or the dataset upload there is no run to save (and
+nothing is left on the target: the preflight's probe object is deleted outside the budget).
+"the next request (8.0 MiB) does not fit the byte budget: 1 B of 4.0 MiB used" means
+`--max-bytes` is smaller than one request body (a multipart part, an object): raise it above
+that size. Raise the budget or shorten the run; `--dry-run` shows the estimates.
 
 <a id="safety-read_only"></a>
 ### `safety.read_only` (exit 5)
@@ -2095,9 +2118,17 @@ The change made things worse on the objective: `prove`'s verdict is `worse`. Rea
 <a id="run-interrupted"></a>
 ### `run.interrupted` (exit 130, retryable)
 
-Ctrl-C, SIGTERM, SIGHUP or Stop ended the command. The requests in flight were cut, the multipart
-uploads they belonged to aborted, and the test data cleaned up, unless a second signal ended the
-cleanup too. Run it again.
+Ctrl-C, SIGTERM, SIGHUP, a closed stderr (the terminal or SSH session went away, or
+`2>&1 | head` read enough) or Stop ended the command, at any point: while it opened the target,
+uploaded its dataset or measured. The requests in flight were cut, the multipart uploads they
+belonged to aborted, and the test data cleaned up, unless a second signal ended the cleanup too.
+A run that was measuring is saved as a partial run. Run it again.
+
+"N multipart uploads could not be aborted and may still hold parts (…)" in the message or in the
+cleanup error names uploads the stop could not remove: an abort the service refused or did not
+answer within 30 s, an upload whose creation did not answer within 10 s of the stop, or one
+still in flight 45 s after it. Their parts are billed until the upload is aborted: list and abort
+them with the service's tools (`aws s3api list-multipart-uploads` / `abort-multipart-upload`).
 
 <a id="internal"></a>
 ### `internal` (exit 1)
