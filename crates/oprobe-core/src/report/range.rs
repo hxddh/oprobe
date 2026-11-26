@@ -7,6 +7,11 @@
 //! **What counts.** An operation counts in the range it started in (as the timeline's
 //! goodput and the heatmap); a request in the range it was sent in.
 //!
+//! **Open loop.** An arrival that never started has no row: the timeline counts it in the
+//! interval it was due in. A range counts those of its intervals (`missed_arrivals_count`) in
+//! its percentiles as the whole run does, each at the least it can have taken, and says so
+//! (`latency_at_least`): a range of an overloaded run does not read faster than the run.
+//!
 //! **Sampled rows.** When the run kept only a share of its rows, each kept row stands for
 //! [`Run::op_weights`] operations (failed, throttled and the slowest rows stand for
 //! themselves): counts are weighted estimates and the quantiles weighted, so the always-kept
@@ -52,7 +57,16 @@ pub struct RangeView {
     pub p90_ms: f64,
     pub p99_ms: f64,
     pub p999_ms: f64,
+    /// The slowest operation that started in the range.
     pub max_ms: f64,
+    /// Open-loop arrivals due in the range that never started (the timeline's count of each
+    /// interval, by the share of it the range covers).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub missed_arrivals_count: u64,
+    /// The percentiles are lower bounds ("at least"): they count the arrivals that never
+    /// started, each at the least it can have taken.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub latency_at_least: bool,
     /// Requests sent in the range, retries included.
     pub requests_count: u64,
     pub throttled_requests_count: u64,
@@ -70,6 +84,38 @@ pub struct RangeView {
     #[serde(skip)]
     #[schemars(skip)]
     pub cdf: LatencyCdf,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// The least an open-loop arrival that never started can have waited, when it was dropped:
+/// the engine drops an arrival once it is more than the operator's timeout, and never less
+/// than a second, behind its schedule (`engine::runner`).
+const DROPPED_AFTER_US: f64 = 1e6;
+
+/// The open-loop arrivals due in `[lo, hi)` that never started, as `(lower bound µs, count)`
+/// per timeline interval. The timeline counts them in the interval they were due in; an
+/// interval the range covers in part gives that share of its count. Each was either dropped
+/// behind its schedule (it had waited more than [`DROPPED_AFTER_US`]) or still waiting when
+/// the window ended (it had waited at least from its interval's end to the window's): its
+/// latency is at least the smaller of the two.
+fn missed_arrivals(run: &Run, lo: f64, hi: f64) -> Vec<(u64, f64)> {
+    let window = run.report.run.window_s;
+    run.report
+        .timeline
+        .iter()
+        .filter(|p| p.missed_arrivals > 0)
+        .filter_map(|p| {
+            let len = if p.len_s > 0.0 { p.len_s } else { 1.0 };
+            let end = p.t_s + len;
+            let covered = (hi.min(end) - lo.max(p.t_s)).max(0.0) / len;
+            let count = p.missed_arrivals as f64 * covered;
+            let waited_us = ((window - end).max(0.0) * 1e6).min(DROPPED_AFTER_US);
+            (count > 0.0).then_some((waited_us.max(1.0) as u64, count))
+        })
+        .collect()
 }
 
 /// Durations (µs) with the weight each stands for, sorted once: every quantile and the
@@ -180,9 +226,15 @@ impl RangeView {
         // failures, the goodput and the verbs describe the same operations.
         let failed_w: f64 = ops.iter().filter(|o| !o.ok).map(|o| weight(o.op_id)).sum();
         let bytes_w: f64 = ops.iter().map(|o| o.bytes as f64 * weight(o.op_id)).sum();
+        // The arrivals that never started count in the percentiles at their lower bound, as
+        // in the whole run's (no coordinated omission).
+        let missed = missed_arrivals(run, lo, hi);
+        let missed_w: f64 = missed.iter().map(|m| m.1).sum();
+        let missed_count = missed_w.round() as u64;
         let lat = Weighted::new(
             ops.iter()
                 .map(|o| (o.latency_us, weight(o.op_id)))
+                .chain(missed.into_iter().filter(|_| missed_count > 0))
                 .collect(),
         );
         let req_w = |q: &ReqRow| weight(q.op_id);
@@ -218,6 +270,8 @@ impl RangeView {
             p99_ms: lat.quantile_ms(0.99),
             p999_ms: lat.quantile_ms(0.999),
             max_ms: ops.iter().map(|o| o.latency_us).max().unwrap_or(0) as f64 / 1000.0,
+            missed_arrivals_count: missed_count,
+            latency_at_least: missed_count > 0,
             requests_count: requests_w.round() as u64,
             throttled_requests_count: throttled_w.round() as u64,
             throttled_request_ratio: ratio(throttled_w, requests_w),
@@ -231,7 +285,7 @@ impl RangeView {
             .iter()
             .map(|o| o.op_id)
             .collect(),
-            cdf: lat.cdf(!sampled),
+            cdf: lat.cdf(!sampled && missed_count == 0),
         }
     }
 
@@ -565,6 +619,73 @@ mod tests {
         // The whole window, and an empty range.
         assert_eq!(RangeView::of(&run, 0.0, 10.0).ops_count, 100);
         assert!(RangeView::of(&run, 20.0, 30.0).is_empty());
+    }
+
+    /// K2-11. A range of an open-loop run read its percentiles from the operations that
+    /// started, and said nothing of the arrivals that never did: a second in which the
+    /// service fell behind read as fast as the rest. The range counts the missed arrivals
+    /// of its intervals, in its percentiles too (each at the least it waited), and marks
+    /// them "at least", as the whole run's are.
+    #[test]
+    fn a_range_of_an_open_loop_run_counts_its_missed_arrivals() {
+        let mut run = run();
+        // One timeline interval a second; in seconds 6 and 7 ten arrivals each never started.
+        run.report.timeline = (0..10)
+            .map(|t| crate::trace::TimelinePoint {
+                t_s: t as f64,
+                len_s: 1.0,
+                ops_count: 10,
+                missed_arrivals: if t == 6 || t == 7 { 10 } else { 0 },
+                ..Default::default()
+            })
+            .collect();
+        // A range without them is as before: exact, nothing "at least".
+        let calm = RangeView::of(&run, 0.0, 5.0);
+        assert_eq!(calm.missed_arrivals_count, 0);
+        assert!(!calm.latency_at_least && calm.cdf.exact);
+        let json = serde_json::to_value(&calm).unwrap();
+        assert!(
+            json.get("missed_arrivals_count").is_none() && json.get("latency_at_least").is_none()
+        );
+        // [5 s, 8 s): thirty operations started (ten of them 101..110 ms), twenty arrivals
+        // never did. Of the fifty scheduled, the p50 is the 25th: a started one; the p90 is
+        // the 45th: past the thirty that started, a missed arrival at its lower bound (they
+        // were dropped after waiting at least a second).
+        let v = RangeView::of(&run, 5.0, 8.0);
+        assert_eq!((v.ops_count, v.missed_arrivals_count), (30, 20));
+        assert!(v.latency_at_least && !v.cdf.exact);
+        assert_eq!(v.p50_ms, 105.0);
+        assert_eq!(v.p90_ms, 1000.0);
+        assert_eq!(v.p99_ms, 1000.0);
+        // 9.2's numbers, from the rows alone: a p90 of 107 ms beside twenty lost arrivals.
+        let rows_only = {
+            let mut r = run.clone();
+            r.report
+                .timeline
+                .iter_mut()
+                .for_each(|p| p.missed_arrivals = 0);
+            RangeView::of(&r, 5.0, 8.0)
+        };
+        assert_eq!((rows_only.p50_ms, rows_only.p90_ms), (8.0, 107.0));
+        // The slowest operation is of those that started.
+        assert_eq!(v.max_ms, 110.0);
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["missed_arrivals_count"], 20);
+        assert_eq!(json["latency_at_least"], true);
+        // A range that covers part of an interval counts that share of its arrivals.
+        assert_eq!(RangeView::of(&run, 6.5, 7.0).missed_arrivals_count, 5);
+        // An arrival still waiting when the window ended had waited at least from its
+        // interval's end: the last interval's bound is no second.
+        run.report.timeline[9].missed_arrivals = 40;
+        let end = RangeView::of(&run, 9.0, 10.0);
+        assert_eq!((end.ops_count, end.missed_arrivals_count), (10, 40));
+        assert!(end.latency_at_least && end.p50_ms < 1.0, "{}", end.p50_ms);
+        // The text says so.
+        let text = crate::report::terminal::range_section(&run, &v);
+        assert!(text.contains("p50 ≥ 105"), "{text}");
+        assert!(text.contains("20 open-loop arrivals"), "{text}");
+        let text = crate::report::terminal::range_section(&run, &calm);
+        assert!(!text.contains('≥') && !text.contains("arrivals"), "{text}");
     }
 
     #[test]

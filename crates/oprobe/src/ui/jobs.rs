@@ -34,15 +34,6 @@ pub async fn off_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'stati
     rx.await.ok()
 }
 
-/// One trial of a Prove: baseline (A) or candidate (B), and its objective value.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Trial {
-    pub candidate: bool,
-    pub value: f64,
-    /// Operations it counted (the objective's resolution).
-    pub ops: u64,
-}
-
 /// The verdict of a Prove with its evidence and the proven diff.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Proved {
@@ -57,6 +48,9 @@ pub struct Proved {
     pub ab: Vec<AbPair>,
     /// The A/B pairs the prove planned at most (the boundary of its interval).
     pub max_pairs: usize,
+    /// The result says what it planned: `delta` is the sequential interval of that plan. A
+    /// result of 9.1 or earlier does not: its `delta` is a fixed-sample interval.
+    pub sequential: bool,
     /// Last completed A/B pair's stored `(baseline_run_id, candidate_run_id)`, for Compare.
     pub trial_ids: Option<(String, String)>,
     /// The other metrics (shown, never decisive).
@@ -93,6 +87,7 @@ impl Proved {
         });
         let max_pairs = p.planned_pairs();
         Self {
+            sequential: p.pairs_max_count.is_some(),
             prove_id: p.prove_id,
             run_id: p.run_id,
             objective: p.objective,
@@ -199,8 +194,8 @@ pub struct State {
     pub errors: u64,
     pub throttled: u64,
     pub cleaning: bool,
-    /// Prove's trials as they finish.
-    pub trials: Vec<Trial>,
+    /// Prove's A/B trials as they finish (core pairs them: `app::prove::ab_pairs`).
+    pub trials: Vec<crate::app::prove::ProveTrial>,
     /// The A/B pairs the running prove planned at most (`--pairs`).
     pub prove_pairs: usize,
     /// Operators measured so far (a run of several operators).
@@ -210,11 +205,21 @@ pub struct State {
 
 const SPARK_POINTS: usize = 240;
 
+/// What a job is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobKind {
+    Run,
+    Prove,
+}
+
 /// A running `run` or `prove`.
 #[derive(Clone)]
 pub struct Job {
     state: Arc<Mutex<State>>,
     cancel: Cancel,
+    kind: JobKind,
+    /// What it works on: a run's operators, a prove's run.
+    label: Arc<str>,
 }
 
 impl Job {
@@ -232,7 +237,8 @@ impl Job {
         self.peek().outcome.is_some()
     }
 
-    fn start(total_s: f64, is_prove: bool) -> (Self, EventSink) {
+    fn start(total_s: f64, kind: JobKind, label: &str) -> (Self, EventSink) {
+        let is_prove = kind == JobKind::Prove;
         let state = Arc::new(Mutex::new(State {
             total_s,
             ..Default::default()
@@ -277,6 +283,8 @@ impl Job {
             Self {
                 state,
                 cancel: Cancel::new(),
+                kind,
+                label: label.into(),
             },
             sink,
         )
@@ -317,7 +325,7 @@ impl Job {
             .and_then(|d| crate::util::parse_duration(d).ok())
             .unwrap_or(Duration::from_secs(10))
             .as_secs_f64();
-        let (job, sink) = Self::start(total, false);
+        let (job, sink) = Self::start(total, JobKind::Run, &req.operators.join(" "));
         let (state, cancel) = (job.state.clone(), job.cancel.clone());
         runtime().spawn(async move {
             let res = app
@@ -341,9 +349,8 @@ impl Job {
 
     /// `App::prove`: A/B-test a change of `base` (the run's operator).
     pub fn prove(app: App, req: ProveRequest, base: OperatorSpec) -> Self {
-        let p99 = req.objective == crate::app::ProveObjective::P99;
         let scheme = crate::operator::resolve::scheme_of(&base.url, None);
-        let (job, sink) = Self::start(0.0, true);
+        let (job, sink) = Self::start(0.0, JobKind::Prove, &req.run);
         job.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -352,24 +359,12 @@ impl Job {
         sink.bus()
             .subscribe(Arc::new(move |e: &crate::events::Event| {
                 use crate::app::prove::TrialKind;
-                if let crate::events::EventKind::Trial { trial } = &e.kind {
-                    let candidate = match trial.kind {
-                        TrialKind::Baseline => false,
-                        TrialKind::Candidate => true,
-                        // Sizing sweeps are never A/B pairs.
-                        TrialKind::Sizing => return,
-                    };
-                    let value = if p99 {
-                        trial.p99_ms
-                    } else {
-                        trial.goodput_ops_per_s
-                    };
+                // Sizing sweeps are never A/B pairs.
+                if let crate::events::EventKind::Trial { trial } = &e.kind
+                    && trial.kind != TrialKind::Sizing
+                {
                     let mut s = st_trials.lock().unwrap_or_else(|e| e.into_inner());
-                    s.trials.push(Trial {
-                        candidate,
-                        value,
-                        ops: trial.ops_count,
-                    });
+                    s.trials.push(trial.clone());
                 }
             }));
         let (state, cancel) = (job.state.clone(), job.cancel.clone());
@@ -382,48 +377,6 @@ impl Job {
         });
         job
     }
-}
-
-/// Prove's pairs so far: each two trials of a pair run back to back, in either order (prove
-/// balances the orders), and the order is part of the pair.
-pub fn ab_live(trials: &[Trial]) -> Vec<AbPair> {
-    let mut out = Vec::new();
-    let mut open: Option<&Trial> = None;
-    for t in trials {
-        match open.take() {
-            Some(o) if o.candidate != t.candidate => {
-                let (a, b) = if t.candidate { (o, t) } else { (t, o) };
-                out.push(AbPair {
-                    baseline: a.value,
-                    candidate: b.value,
-                    ops_count: a.ops.min(b.ops),
-                    // The live trials carry no p99 spread; the stored result's pairs do.
-                    resolution: 0.0,
-                    candidate_first: o.candidate,
-                });
-            }
-            _ => open = Some(t),
-        }
-    }
-    out
-}
-
-/// Prove's pairs so far: each candidate with the baseline just before it, and the change of
-/// the objective (candidate / baseline − 1).
-pub fn pairs(trials: &[Trial]) -> Vec<(f64, f64, f64)> {
-    let mut out = Vec::new();
-    let mut last_a = None;
-    for t in trials {
-        if t.candidate {
-            if let Some(a) = last_a.take() {
-                let d = if a > 0.0 { t.value / a - 1.0 } else { 0.0 };
-                out.push((a, t.value, d));
-            }
-        } else {
-            last_a = Some(t.value);
-        }
-    }
-    out
 }
 
 /// Every job that has not ended, so quitting can stop them and wait for their cleanup.
@@ -443,20 +396,72 @@ pub fn busy() -> bool {
     !l.is_empty()
 }
 
-/// Stop every job and wait (at most `timeout`) until each has cleaned up; whether all did.
-pub fn shutdown(timeout: Duration) -> bool {
-    let jobs: Vec<Job> = LIVE.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    for j in &jobs {
+/// A job quitting waits for: what it is, what it works on, and whether it has stopped
+/// measuring and is removing its test data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Left {
+    pub kind: JobKind,
+    pub label: String,
+    pub cleaning: bool,
+}
+
+/// Ask every job to stop (each still removes its test data).
+pub fn stop_all() {
+    for j in LIVE.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         j.stop();
     }
-    let deadline = std::time::Instant::now() + timeout;
-    while jobs.iter().any(|j| !j.finished()) {
+}
+
+/// The jobs that have not ended.
+pub fn left() -> Vec<Left> {
+    let mut l = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    l.retain(|j| !j.finished());
+    l.iter()
+        .map(|j| Left {
+            kind: j.kind,
+            label: j.label.to_string(),
+            cleaning: j.peek().cleaning,
+        })
+        .collect()
+}
+
+/// Give up on the jobs that have not ended (quitting waited long enough): they are no
+/// longer waited for. What they were.
+pub fn abandon() -> Vec<Left> {
+    let left = left();
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    left
+}
+
+/// Stop every job and wait (at most `grace`) until each has cleaned up. The jobs that had
+/// not by then are given up on: what they were.
+pub fn shutdown(grace: Duration) -> Vec<Left> {
+    stop_all();
+    let deadline = std::time::Instant::now() + grace;
+    while busy() {
         if std::time::Instant::now() >= deadline {
-            return false;
+            return abandon();
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    true
+    Vec::new()
+}
+
+/// What was left of a job quitting gave up on, for the log and the terminal (the app's
+/// dialog says it in the app's language).
+pub fn left_line(l: &Left) -> String {
+    let what = match l.kind {
+        JobKind::Run => format!("the run of {}", l.label),
+        JobKind::Prove => format!("the prove of run {}", l.label),
+    };
+    let state = if l.cleaning {
+        "was still removing its test data"
+    } else {
+        "had not stopped"
+    };
+    format!(
+        "{what} {state} when oprobe quit: objects under its `oprobe-run-*/` prefix may be left on the target (the next run against it removes them)"
+    )
 }
 
 #[cfg(test)]
@@ -494,53 +499,5 @@ mod tests {
         assert!(zh.contains("被限流 +0.500 pp"), "{zh}");
         assert!(zh.contains("百分点"), "{zh}");
         super::super::i18n::set(super::super::i18n::Lang::En);
-    }
-
-    #[test]
-    fn live_pairs_take_either_order() {
-        let t = |candidate, value| Trial {
-            candidate,
-            value,
-            ops: 100,
-        };
-        let p = ab_live(&[
-            t(false, 100.0),
-            t(true, 120.0),
-            t(true, 99.0),
-            t(false, 90.0),
-            t(false, 80.0),
-            t(true, 88.0),
-        ]);
-        let got: Vec<(f64, f64, u64, bool)> = p
-            .iter()
-            .map(|p| (p.baseline, p.candidate, p.ops_count, p.candidate_first))
-            .collect();
-        assert_eq!(
-            got,
-            [
-                (100.0, 120.0, 100, false),
-                (90.0, 99.0, 100, true),
-                (80.0, 88.0, 100, false)
-            ]
-        );
-    }
-
-    #[test]
-    fn pairs_take_the_baseline_before_each_candidate() {
-        let t = |candidate, value| Trial {
-            candidate,
-            value,
-            ops: 100,
-        };
-        let p = pairs(&[
-            t(false, 100.0),
-            t(false, 100.0),
-            t(true, 120.0),
-            t(false, 90.0),
-            t(true, 99.0),
-        ]);
-        assert_eq!(p.len(), 2);
-        assert!((p[0].2 - 0.2).abs() < 1e-9);
-        assert!((p[1].2 - 0.1).abs() < 1e-9);
     }
 }

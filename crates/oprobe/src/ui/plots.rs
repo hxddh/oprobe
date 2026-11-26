@@ -7,6 +7,7 @@
 //! so each is tested without a window.
 
 use crate::analysis::capacity::Confidence;
+use crate::analysis::stats::Interval;
 use crate::app::ProveObjective;
 use crate::app::prove::{AbPair, Converged, convergence};
 use crate::report::view::{ConcurrencyView, EvidenceChart, LatencyCdf, TimelineView};
@@ -574,7 +575,12 @@ fn noise_band(floor: f64) -> (f64, f64) {
 /// its trials counted (the noise floor is never below that resolution) and the order they ran
 /// in; with `max_pairs`, the pairs the prove planned at most, the interval is the verdict's own
 /// (sequential, order-adjusted).
-pub fn prove(ab: &[AbPair], p99: bool, max_pairs: usize) -> Option<Plot> {
+///
+/// `stored` is the interval of a result that did not decide on that sequential interval (one
+/// of oprobe 9.1 or earlier: a fixed-sample interval, narrower): redrawn from its pairs, the
+/// chart could end on an interval that includes no change beside a stored `improved`. The
+/// chart then ends on the stored interval, the verdict's, and its band says so.
+pub fn prove(ab: &[AbPair], p99: bool, max_pairs: usize, stored: Option<Interval>) -> Option<Plot> {
     if ab.is_empty() {
         return None;
     }
@@ -583,7 +589,10 @@ pub fn prove(ab: &[AbPair], p99: bool, max_pairs: usize) -> Option<Plot> {
     } else {
         ProveObjective::Goodput
     };
-    let conv: Vec<Converged> = convergence(obj, ab, max_pairs);
+    let mut conv: Vec<Converged> = convergence(obj, ab, max_pairs);
+    if let (Some(stored), Some(last)) = (stored, conv.last_mut()) {
+        last.interval = stored;
+    }
     let n = ab.len() as f64;
     let d: Vec<(f64, f64)> = ab
         .iter()
@@ -643,7 +652,12 @@ pub fn prove(ab: &[AbPair], p99: bool, max_pairs: usize) -> Option<Plot> {
                 alpha: 0.12,
             },
             Band {
-                label: tr("plot.interval").to_owned(),
+                label: tr(if stored.is_some() {
+                    "plot.interval_stored"
+                } else {
+                    "plot.interval"
+                })
+                .to_owned(),
                 token: "series-a",
                 pts: conv
                     .iter()
@@ -655,7 +669,10 @@ pub fn prove(ab: &[AbPair], p99: bool, max_pairs: usize) -> Option<Plot> {
             },
         ],
         rules: vec![Rule::at_y(0.0, "axis", "")],
-        notes: Vec::new(),
+        notes: stored
+            .map(|_| (n - 0.5, n + 0.5, tr("plot.interval_stored_note").to_owned()))
+            .into_iter()
+            .collect(),
         y2: None,
     })
 }
@@ -1116,7 +1133,7 @@ mod tests {
         let ab: Vec<AbPair> = (0..6)
             .map(|i| pair(i, 100.0 + i as f64, 120.0 + (i % 3) as f64, 10_000))
             .collect();
-        let p = prove(&ab, false, 6).unwrap();
+        let p = prove(&ab, false, 6, None).unwrap();
         let est = &p.lines[0].pts;
         let dots = &p.lines[1].pts;
         assert_eq!((est.len(), dots.len()), (6, 6));
@@ -1128,13 +1145,13 @@ mod tests {
         assert_eq!(p.rules[0].y, Some(0.0));
         assert!(p.y.min <= 0.0 && p.y.max >= 0.2);
         // p99: lower is better; each dot is still candidate / baseline − 1.
-        let q = prove(&[pair(0, 50.0, 40.0, 10_000)], true, 6).unwrap();
+        let q = prove(&[pair(0, 50.0, 40.0, 10_000)], true, 6, None).unwrap();
         assert!((q.lines[1].pts[0].1 + 0.2).abs() < 1e-9);
-        assert!(prove(&[], false, 6).is_none());
+        assert!(prove(&[], false, 6, None).is_none());
         // The band is the verdict's interval: the one of the prove's plan.
         let planned = crate::app::prove::convergence(ProveObjective::Goodput, &ab, 6);
         assert_eq!(band[5].1, planned[5].interval.low);
-        let longer = prove(&ab, false, 12).unwrap();
+        let longer = prove(&ab, false, 12, None).unwrap();
         let wide = &longer.bands[1].pts;
         assert!(wide[5].2 - wide[5].1 > w(5), "a longer plan, a wider look");
         // Few operations per trial: the noise floor is their resolution, as in the verdict.
@@ -1149,9 +1166,55 @@ mod tests {
         .enumerate()
         .map(|(i, (a, b))| pair(i, *a, *b, 35))
         .collect();
-        let f = prove(&few, false, 6).unwrap();
+        let f = prove(&few, false, 6, None).unwrap();
         let last = f.bands[1].pts.last().unwrap();
         assert!(last.1 < 0.0 && last.2 > 0.0, "{last:?}");
+    }
+
+    /// K3-6. A result of 9.1 stored a fixed-sample interval and its verdict; redrawn from its
+    /// pairs with today's sequential interval (wider), the chart ended on an interval that
+    /// includes no change beside the stored `improved`. It ends on the stored interval, and
+    /// the band and the last pair's readout say which interval that is.
+    #[test]
+    fn a_stored_proves_chart_ends_on_its_stored_interval() {
+        let pair = |i: usize, baseline: f64, candidate: f64, ops_count: u64| AbPair {
+            baseline,
+            candidate,
+            ops_count,
+            resolution: 0.0,
+            candidate_first: i % 2 == 1,
+        };
+        // Pairs today's sequential test does not decide: its interval includes no change.
+        let few: Vec<AbPair> = [
+            (37.0, 38.0),
+            (37.0, 40.0),
+            (37.0, 37.0),
+            (38.0, 39.0),
+            (37.0, 39.0),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, (a, b))| pair(i, *a, *b, 35))
+        .collect();
+        let redrawn = prove(&few, false, 6, None).unwrap();
+        let last = *redrawn.bands[1].pts.last().unwrap();
+        assert!(last.1 < 0.0 && last.2 > 0.0, "{last:?}");
+        // What 9.1 stored with its verdict `improved`.
+        let stored = Interval {
+            estimate: 0.035,
+            low: 0.004,
+            high: 0.067,
+        };
+        crate::ui::i18n::set(crate::ui::i18n::Lang::En);
+        let p = prove(&few, false, 6, Some(stored)).unwrap();
+        assert_eq!(*p.bands[1].pts.last().unwrap(), (5.0, 0.004, 0.067));
+        assert_eq!(*p.lines[0].pts.last().unwrap(), (5.0, 0.035));
+        // The pairs before it are redrawn as they are; the dots are the pairs' own.
+        assert_eq!(p.bands[1].pts[..4], redrawn.bands[1].pts[..4]);
+        assert_eq!(p.lines[1].pts, redrawn.lines[1].pts);
+        assert!(p.bands[1].label.contains("9.1"), "{}", p.bands[1].label);
+        assert!(p.note_at(5.0).is_some_and(|n| n.contains("9.1")));
+        assert!(p.note_at(4.0).is_none() && redrawn.note_at(5.0).is_none());
     }
 
     #[test]

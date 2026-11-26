@@ -161,3 +161,9 @@ zstd stream of the header with the operator spec and workload, columnar segments
 request rows, the per-second timeline, and the report). `oprobe-trace` writes `oprobe.trace/9`
 files (one JSON document: the aggregates, service posture and sampled rows). `oprobe show FILE`
 and the app open both, as well as standalone `.prove.json` (`oprobe.prove/9`) files.
+
+A run file keeps every row up to `max_requests` rows (`[defaults]`, 1 000 000). Past that the
+rows are thinned, each kept row carrying the operations it stands for; failed and throttled
+operations are kept in full for twice as long, then thinned the same way. However long the run
+and whatever it met, the file stays within what `show` and the app read (4 GiB of rows): a run
+that reaches that keeps its aggregates exact and stops keeping rows.

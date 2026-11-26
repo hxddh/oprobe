@@ -203,12 +203,12 @@ multipart and repeated reads (not bandwidth cap or client bound). `prove` refuse
 
 | Flag | Meaning |
 |---|---|
-| `--list` | list the stored runs (prove trials hidden) |
+| `--list` | list the stored runs (prove trials hidden) and the proves; a long change is cut in the list (`show PROVE` prints it whole) |
 | `--all` | with `--list`: include the prove trials |
-| `--rm RUN…` | delete stored runs |
+| `--rm RUN…` | delete stored runs (a run named twice is deleted once) |
 | `--detail` | every section of the profile: the timeline (one row per interval of 1 s, or 10 s after ten minutes; long runs merge rows), the spread of the requests over keys, sizes, prefixes and remotes, the operator and the five slowest operations |
 | `--by stage\|api\|conn` | group the requests by stage, storage API or connection |
-| `--since DURATION` | only the time range from this far into the window: its goodput, latency quantiles, failures, requests, retries and throttling, where the time went, the verbs, the requests by API and the slowest operations, recomputed from the trace rows (`-o json`: the `range` object). With `--by`, only the range's requests are grouped |
+| `--since DURATION` | only the time range from this far into the window: its goodput, latency quantiles, failures, requests, retries and throttling, where the time went, the verbs, the requests by API and the slowest operations, recomputed from the trace rows (`-o json`: the `range` object). With `--by`, only the range's requests are grouped. In an open-loop run (`--rate`), the arrivals due in the range that never started are counted (`missed_arrivals_count`) and count in its percentiles, each at the least it waited, as in the whole run: the percentiles are then "at least" values, printed with `≥` (`latency_at_least`) |
 | `--until DURATION` | only the time range up to this far into the window (default: its end) |
 
 An operation counts in the range it started in, a request in the range it was sent in. When the

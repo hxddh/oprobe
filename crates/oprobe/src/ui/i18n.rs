@@ -608,6 +608,14 @@ static EN: &[(&str, &str)] = &[
     ("plot.pair_delta", "each pair"),
     ("plot.estimate", "estimate"),
     ("plot.interval", "95 % interval"),
+    (
+        "plot.interval_stored",
+        "95 % interval, ending on the one oprobe 9.1 stored (not sequential)",
+    ),
+    (
+        "plot.interval_stored_note",
+        "the interval oprobe 9.1 stored with its verdict (fixed-sample, not sequential)",
+    ),
     ("plot.noise", "noise floor (A/A)"),
     ("plot.evidence", "Evidence"),
     ("verb.ops", "{} ops"),
@@ -643,6 +651,40 @@ static EN: &[(&str, &str)] = &[
         "oprobe stops it and removes its test data before it quits.",
     ),
     ("quit.confirm", "Stop and Quit"),
+    ("quit.stopping_title", "Stopping before oprobe quits"),
+    ("quit.run_stopping", "Stopping the run of {}…"),
+    (
+        "quit.run_cleaning",
+        "Removing the test data of the run of {}…",
+    ),
+    ("quit.prove_stopping", "Stopping the prove of run {}…"),
+    (
+        "quit.prove_cleaning",
+        "Removing the test data of the prove of run {}…",
+    ),
+    (
+        "quit.waited",
+        "{} s so far. oprobe quits when this is done, and waits {} s at most.",
+    ),
+    ("quit.gave_up_title", "The cleanup did not finish"),
+    ("quit.run_left_stopping", "The run of {} had not stopped."),
+    (
+        "quit.run_left_cleaning",
+        "The run of {} was still removing its test data.",
+    ),
+    (
+        "quit.prove_left_stopping",
+        "The prove of run {} had not stopped.",
+    ),
+    (
+        "quit.prove_left_cleaning",
+        "The prove of run {} was still removing its test data.",
+    ),
+    (
+        "quit.left_detail",
+        "Objects under its oprobe-run-…/ prefix may be left on the target. The next run against the same target removes them; oprobe quits by itself if the cleanup still finishes.",
+    ),
+    ("quit.anyway", "Quit Anyway"),
     ("notify.run_done", "The run finished"),
     ("notify.run_failed", "The run failed"),
     ("notify.run_stopped", "The run stopped"),
@@ -836,6 +878,10 @@ static EN: &[(&str, &str)] = &[
     (
         "range.counts",
         "{} operations · {} requests in the {} selected · failed per operation, throttled per request",
+    ),
+    (
+        "range.missed",
+        "{} arrivals never started: the percentiles are at least these",
     ),
     (
         "range.sampled",
@@ -1320,6 +1366,14 @@ static ZH: &[(&str, &str)] = &[
     ("plot.pair_delta", "每一对"),
     ("plot.estimate", "估计"),
     ("plot.interval", "95 % 区间"),
+    (
+        "plot.interval_stored",
+        "95 % 区间，终点为 oprobe 9.1 存储的区间（非序贯）",
+    ),
+    (
+        "plot.interval_stored_note",
+        "oprobe 9.1 随结论存储的区间（固定样本，非序贯）",
+    ),
     ("plot.noise", "噪声底线（A/A）"),
     ("plot.evidence", "证据"),
     ("verb.ops", "{} 次"),
@@ -1348,6 +1402,28 @@ static ZH: &[(&str, &str)] = &[
     ("quit.title_prove", "有证明正在进行。要停止它并退出吗？"),
     ("quit.detail", "oprobe 会先停止它并清理测试数据，然后退出。"),
     ("quit.confirm", "停止并退出"),
+    ("quit.stopping_title", "退出前正在停止"),
+    ("quit.run_stopping", "正在停止对 {} 的运行…"),
+    ("quit.run_cleaning", "正在清理对 {} 的运行的测试数据…"),
+    ("quit.prove_stopping", "正在停止对运行 {} 的证明…"),
+    ("quit.prove_cleaning", "正在清理对运行 {} 的证明的测试数据…"),
+    (
+        "quit.waited",
+        "已等待 {} 秒。完成后 oprobe 即退出，最多等待 {} 秒。",
+    ),
+    ("quit.gave_up_title", "清理未能完成"),
+    ("quit.run_left_stopping", "对 {} 的运行尚未停止。"),
+    ("quit.run_left_cleaning", "对 {} 的运行仍在清理测试数据。"),
+    ("quit.prove_left_stopping", "对运行 {} 的证明尚未停止。"),
+    (
+        "quit.prove_left_cleaning",
+        "对运行 {} 的证明仍在清理测试数据。",
+    ),
+    (
+        "quit.left_detail",
+        "目标上其 oprobe-run-…/ 前缀下可能留有对象。下次对同一目标的运行会将其删除；如果清理仍然完成，oprobe 会自行退出。",
+    ),
+    ("quit.anyway", "仍然退出"),
     ("notify.run_done", "运行已完成"),
     ("notify.run_failed", "运行失败"),
     ("notify.run_stopped", "运行已停止"),
@@ -1506,6 +1582,7 @@ static ZH: &[(&str, &str)] = &[
         "range.counts",
         "{} 次操作 · {} 个请求 · 所选 {} · 失败按操作计，限流按请求计",
     ),
+    ("range.missed", "{} 次到达从未开始：百分位数至少为所示值"),
     (
         "range.sampled",
         "记录行经过抽样（保留 {}）：这些计数是估计值，每行按其代表的操作数加权。",

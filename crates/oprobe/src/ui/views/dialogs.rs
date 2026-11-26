@@ -1,6 +1,7 @@
-//! The app's dialogs (design app-native "Windows and dialogs"): New Run, Settings, About and,
-//! on a terminal, the confirmation before deleting runs (a window asks with the system's
-//! alert). Each is modal over the window, closed by Escape; Return anywhere in New Run presses
+//! The app's dialogs (design app-native "Windows and dialogs"): New Run, Settings, About, on
+//! a terminal the confirmation before deleting runs (a window asks with the system's alert),
+//! and the wait for stopped jobs before the app quits. Each is modal over the window, closed
+//! by Escape (the wait before quitting ends by itself); Return anywhere in New Run presses
 //! its default button. Buttons follow the platform's order (macOS and GNOME end with the
 //! default button, Windows starts with it). On macOS Settings is a window of its own that
 //! applies each change at once; elsewhere it is a preferences dialog with a close button.
@@ -27,8 +28,11 @@ pub fn dialogs(s: Store) -> impl IntoElement {
                     Dialog::Settings => (tr("settings.title"), preferences(s)),
                     Dialog::About => (tr("menu.about"), about(s)),
                     Dialog::Delete(ids) => (tr("delete.title"), delete(s, ids.clone())),
+                    Dialog::Quitting => (tr("quit.stopping_title"), quitting(s)),
                 };
-                modal_frame(s, label, content)
+                // The wait before quitting is not cancelled: its jobs are stopped already.
+                let closes = d != Dialog::Quitting;
+                modal_frame(s, label, content, closes)
             })
         })
     })
@@ -36,7 +40,12 @@ pub fn dialogs(s: Store) -> impl IntoElement {
 
 /// A dialog over the window: dimmed behind, centred, fading in unless the user asked for
 /// less motion.
-fn modal_frame(s: Store, label: &'static str, content: View) -> impl IntoElement {
+fn modal_frame(s: Store, label: &'static str, content: View, closes: bool) -> impl IntoElement {
+    let cancel = move || {
+        if closes {
+            s.dialog.set(None);
+        }
+    };
     // Escape cancels wherever the focus is, a field included.
     on_key_with(
         "escape",
@@ -44,7 +53,7 @@ fn modal_frame(s: Store, label: &'static str, content: View) -> impl IntoElement
             when: nsh_core::keymap::When::Always,
             ..Default::default()
         },
-        move |_| s.dialog.set(None),
+        move |_| cancel(),
     );
     nsh_base::dialog()
         .label(label)
@@ -53,7 +62,7 @@ fn modal_frame(s: Store, label: &'static str, content: View) -> impl IntoElement
         } else {
             ModalAnimation::Fade
         })
-        .on_cancel(move || s.dialog.set(None))
+        .on_cancel(cancel)
         .child(
             view()
                 .flex_1()
@@ -578,6 +587,63 @@ fn about(s: Store) -> View {
                 .test_id("dialog-done"),
             ),
         )
+}
+
+/// One job quitting waits for: what it is doing, or (given up on) what it was doing.
+fn left_line(l: &crate::ui::jobs::Left, gave_up: bool) -> String {
+    use crate::ui::jobs::JobKind;
+    let key = match (l.kind, l.cleaning, gave_up) {
+        (JobKind::Run, false, false) => "quit.run_stopping",
+        (JobKind::Run, true, false) => "quit.run_cleaning",
+        (JobKind::Prove, false, false) => "quit.prove_stopping",
+        (JobKind::Prove, true, false) => "quit.prove_cleaning",
+        (JobKind::Run, false, true) => "quit.run_left_stopping",
+        (JobKind::Run, true, true) => "quit.run_left_cleaning",
+        (JobKind::Prove, false, true) => "quit.prove_left_stopping",
+        (JobKind::Prove, true, true) => "quit.prove_left_cleaning",
+    };
+    fill(key, &[&l.label])
+}
+
+/// Quitting waits for the jobs it stopped: what each is doing and for how long, then (past
+/// `STOP_GRACE`) what was left, with a button to quit anyway. It closes when the app quits.
+fn quitting(s: Store) -> View {
+    let grace = s.stop_grace().as_secs();
+    view()
+        .gap(px(12.0))
+        .test_id("quit-dialog")
+        .child(dynamic(move || {
+            let q = s.quitting.get();
+            untracked(|| {
+                q.map(|q| {
+                    let mut v = view().gap(px(8.0)).child(title(tr(if q.gave_up {
+                        "quit.gave_up_title"
+                    } else {
+                        "quit.stopping_title"
+                    })));
+                    for l in &q.left {
+                        v = v.child(body(left_line(l, q.gave_up)).test_id("quit-left"));
+                    }
+                    if q.gave_up {
+                        v.child(
+                            body(tr("quit.left_detail"))
+                                .text_color(move || theme().muted_foreground),
+                        )
+                        .child(
+                            view().flex_row().justify_end().w_full().child(
+                                btn(tr("quit.anyway"), || Kind::Danger, move || s.quit_anyway())
+                                    .test_id("quit-anyway"),
+                            ),
+                        )
+                    } else {
+                        v.child(
+                            small(fill("quit.waited", &[&q.waited_s, &grace]))
+                                .test_id("quit-progress"),
+                        )
+                    }
+                })
+            })
+        }))
 }
 
 /// Delete on a terminal (a window asks with the system's alert).

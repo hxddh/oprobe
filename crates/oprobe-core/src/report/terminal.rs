@@ -1169,6 +1169,18 @@ pub fn wrap_text(s: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// `2.0–6.0 s`, with the digits a short range needs to show its length (`0.000–0.001 s`,
+/// not `0.0–0.0 s`): one decimal, and as many more as the length's first digit lies after.
+pub fn range_span(since_s: f64, until_s: f64) -> String {
+    let span = until_s - since_s;
+    let decimals = if span > 0.0 {
+        ((-span.log10() - 1e-9).ceil() as usize).clamp(1, 6)
+    } else {
+        6
+    };
+    format!("{since_s:.decimals$}–{until_s:.decimals$} s")
+}
+
 /// `show --since/--until`: one time range of a run, recomputed from its trace rows
 /// ([`super::range::RangeView`]): the numbers, where the time went, the verbs, the requests by
 /// API and the slowest operations of the range.
@@ -1191,8 +1203,9 @@ pub fn range_section_with(run: &Run, v: &super::range::RangeView, detail: bool) 
         "{} {}",
         bold(&r.target.display),
         dim(&format!(
-            "· {:.1}–{:.1} s of the {:.1} s window",
-            v.since_s, v.until_s, r.run.window_s
+            "· {} of the {:.1} s window",
+            range_span(v.since_s, v.until_s),
+            r.run.window_s
         ))
     );
     if v.sampled {
@@ -1207,6 +1220,13 @@ pub fn range_section_with(run: &Run, v: &super::range::RangeView, detail: bool) 
     }
     if v.is_empty() {
         let _ = writeln!(out, "\n  no operation started in this range");
+        if v.missed_arrivals_count > 0 {
+            let _ = writeln!(
+                out,
+                "  {} open-loop arrivals due in it never started",
+                v.missed_arrivals_count
+            );
+        }
         return out;
     }
     section(&mut out, "Range");
@@ -1218,11 +1238,14 @@ pub fn range_section_with(run: &Run, v: &super::range::RangeView, detail: bool) 
             v.goodput_ops_per_s, v.ops_per_s, v.mib_per_s
         ),
     );
+    // With arrivals that never started the percentiles are lower bounds, as the whole
+    // run's are: "at least".
+    let at_least = if v.latency_at_least { "≥ " } else { "" };
     kv(
         &mut out,
         "latency",
         &format!(
-            "p50 {} · p90 {} · p99 {} · p99.9 {} · max {}",
+            "p50 {at_least}{} · p90 {at_least}{} · p99 {at_least}{} · p99.9 {at_least}{} · max {}",
             fmt_ms(v.p50_ms),
             fmt_ms(v.p90_ms),
             fmt_ms(v.p99_ms),
@@ -1240,6 +1263,16 @@ pub fn range_section_with(run: &Run, v: &super::range::RangeView, detail: bool) 
             v.error_ratio * 100.0
         ),
     );
+    if v.missed_arrivals_count > 0 {
+        kv(
+            &mut out,
+            "missed",
+            &format!(
+                "{} open-loop arrivals due in this range never started: the percentiles count each at the least it waited, so they are \"at least\" values (max is of the operations that started)",
+                v.missed_arrivals_count
+            ),
+        );
+    }
     kv(
         &mut out,
         "requests",
@@ -1352,6 +1385,26 @@ mod tests {
     }
 
     use super::*;
+
+    /// `show --until 1ms` printed "0.0–0.0 s of the 10.0 s window": a short range reads
+    /// with the digits it needs.
+    #[test]
+    fn a_short_range_reads_as_a_range() {
+        assert_eq!(range_span(2.0, 6.0), "2.0–6.0 s");
+        assert_eq!(range_span(0.1, 0.2), "0.1–0.2 s");
+        assert_eq!(range_span(0.0, 0.001), "0.000–0.001 s");
+        assert_eq!(range_span(0.0, 0.05), "0.00–0.05 s");
+        assert_eq!(range_span(1.25, 1.5), "1.2–1.5 s");
+        assert_eq!(range_span(0.0, 0.00000001), "0.000000–0.000000 s");
+        set(false);
+        let run = super::super::fixture::run();
+        let v = super::super::range::RangeView::of(&run, 0.0, 0.001);
+        let text = range_section(&run, &v);
+        assert!(
+            text.contains("0.000–0.001 s of the 10.0 s window"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn full_report_fits_80_columns_and_detail_adds_sections() {

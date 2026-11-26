@@ -11,9 +11,7 @@ use nsh_core::element::desktop::{WindowRef, quit};
 use nsh_core::prelude::*;
 use nsh_core::storage::Storage;
 
-use crate::app::{
-    App, ProveObjective, ProveRequest, RunRef, RunRequest, TrashedRuns, WorkloadInput,
-};
+use crate::app::{App, ProveObjective, ProveRequest, RunForm, RunRef, RunRequest, TrashedRuns};
 use crate::operator::resolve::{quote_operator_arg, split_operators};
 use crate::ui::data::{self, PlanView, ProfileModel, RunRow};
 use crate::ui::i18n::{self, Lang};
@@ -60,6 +58,18 @@ pub enum Dialog {
     About,
     /// Asks before deleting these runs (on a terminal; a window asks with the system's alert).
     Delete(Vec<String>),
+    /// Quitting waits for the jobs it stopped ([`Store::quitting`]): it closes when the app
+    /// quits.
+    Quitting,
+}
+
+/// Quitting waits for the jobs it stopped: how long it has, what it still waits for, and
+/// whether it has given up on them (`STOP_GRACE` passed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Quitting {
+    pub waited_s: u64,
+    pub left: Vec<jobs::Left>,
+    pub gave_up: bool,
 }
 
 /// Where the keyboard moves the selection in the sidebar.
@@ -101,11 +111,13 @@ pub const SIDEBAR_MAX: f32 = 420.0;
 const RECENT_MAX: usize = 6;
 
 /// What the app starts with: where runs and the config file are (tests point them at a
-/// temporary directory), and a run to open.
+/// temporary directory), a run to open, and how long quitting waits for the jobs it stops
+/// (`None`: `STOP_GRACE`; tests give up at once).
 #[derive(Clone, Debug, Default)]
 pub struct Launch {
     pub paths: Option<crate::store::Paths>,
     pub open: Option<String>,
+    pub stop_grace: Option<Duration>,
 }
 
 static LAUNCH: std::sync::Mutex<Option<Launch>> = std::sync::Mutex::new(None);
@@ -154,6 +166,8 @@ pub struct Store {
     pub settings_open: Signal<bool>,
     /// A system alert (Delete, Quit) is on screen: the menus' actions wait.
     pub alert: Signal<bool>,
+    /// Quitting waits for the jobs it stopped (the Quitting dialog shows it).
+    pub quitting: Signal<Option<Quitting>>,
     /// A file is dragged over the window.
     pub drag_over: Signal<bool>,
     pub lang: Signal<Lang>,
@@ -195,18 +209,14 @@ pub struct Store {
     run_job: Stored<Option<Job>>,
     prove_job: Stored<Option<Job>>,
     prove_run_id: Stored<Option<String>>,
-    /// The run `Run Again` repeats, behind the New Run form while the dialog is open.
-    replay: Stored<Option<Replay>>,
+    /// The request of the run `Run Again` repeats (`App::replaying`), behind the New Run form
+    /// while the dialog is open: what the form has no field for comes from it.
+    replay: Stored<Option<RunRequest>>,
+    /// Since when quitting waits for the jobs it stopped, and how long it does.
+    quit_since: Stored<Option<std::time::Instant>>,
+    stop_grace: Stored<Duration>,
     /// Monotonic generation counter so stale async `load_run` / `compare` completions never overwrite newer selections.
     load_seq: Stored<u64>,
-}
-
-/// A run to repeat (`Run Again`): the request that replays its spec
-/// ([`RunRequest::replaying`]) and its command line, to show what the form has no field for.
-#[derive(Clone)]
-struct Replay {
-    request: RunRequest,
-    command: String,
 }
 
 /// The store of the running app.
@@ -261,6 +271,7 @@ impl Store {
             dialog: signal(None),
             settings_open: signal(false),
             alert: signal(false),
+            quitting: signal(None),
             drag_over: signal(false),
             lang: signal(choice.unwrap_or_else(i18n::system)),
             lang_choice: signal(choice),
@@ -298,6 +309,8 @@ impl Store {
             prove_job: stored(None),
             prove_run_id: stored(None),
             replay: stored(None),
+            quit_since: stored(None),
+            stop_grace: stored(l.stop_grace.unwrap_or(crate::app::STOP_GRACE)),
             load_seq: stored(0),
         };
         s.refresh();
@@ -469,59 +482,43 @@ impl Store {
             .with(|s| s.as_ref().is_some_and(|s| s.outcome.is_none()))
     }
 
-    /// The run request of the form (the key of a message for the notice bar when it is not
-    /// one).
-    fn form_request(&self) -> Result<RunRequest, &'static str> {
+    /// The form's fields as the service layer takes them (the key of a message for the notice
+    /// bar when a field does not read).
+    fn form_fields(&self) -> Result<RunForm, &'static str> {
         let f = self.form;
-        let operators = split_operators(&f.operator.get_untracked());
+        let operators = split_operators(&f.operator.get());
         if operators.is_empty() {
             return Err("runs.need_operator");
         }
         let nonempty =
-            |s: Signal<String>| Some(s.get_untracked().trim().to_owned()).filter(|v| !v.is_empty());
+            |s: Signal<String>| Some(s.get().trim().to_owned()).filter(|v| !v.is_empty());
         let concurrency = match nonempty(f.concurrency).map(|c| c.parse::<usize>()) {
             Some(Ok(n)) if n > 0 => Some(n),
             Some(_) => return Err("runs.bad_concurrency"),
             None => None,
         };
-        let existing = nonempty(f.existing);
-        let read_only = existing.is_some();
-        // The fields say what they show; a run being repeated keeps everything else of it.
-        let base = untracked(|| self.replayed())
-            .map(|r| r.request)
-            .unwrap_or_default();
-        Ok(RunRequest {
+        Ok(RunForm {
             operators,
-            workload: WorkloadInput {
-                preset: Some(f.preset.get_untracked().to_owned()),
-                duration: nonempty(f.duration),
-                concurrency,
-                existing,
-                ..base.workload
-            },
-            safety: crate::app::Safety {
-                read_only,
-                ..Default::default()
-            },
-            ..base
+            preset: Some(f.preset.get().to_owned()),
+            duration: nonempty(f.duration),
+            concurrency,
+            existing: nonempty(f.existing),
         })
     }
 
-    /// The run the form repeats: the one `Run Again` took, while the form still names its
-    /// operator and preset (another operator or preset is another run).
-    fn replayed(&self) -> Option<Replay> {
-        let f = self.form;
-        let operators = split_operators(&f.operator.get());
-        let preset = f.preset.get();
-        self.replay.with(|r| r.clone()).filter(|r| {
-            r.request.operators == operators && r.request.workload.preset.as_deref() == Some(preset)
-        })
+    /// The run request the form sends (`RunForm::request`: the fields over the run being
+    /// repeated, if one is).
+    fn form_request(&self) -> Result<RunRequest, &'static str> {
+        let form = untracked(|| self.form_fields())?;
+        Ok(self.replay.with(|r| form.request(r.as_ref())))
     }
 
-    /// The command of the run the form repeats (its rate, dataset, seed and operator values
-    /// have no field in the form: they are kept as this command names them).
+    /// While the form repeats a run: the command of the request it sends now (the rate, the
+    /// dataset, the seed and the operator's values have no field: the command names them).
     pub fn replayed_command(&self) -> Option<String> {
-        self.replayed().map(|r| r.command)
+        let form = self.form_fields().ok()?;
+        self.replay
+            .with(|r| r.as_ref().and_then(|r| form.repeat_command(r)))
     }
 
     /// Plan the form's run (`App::plan`): what it writes, reads and deletes, its budgets.
@@ -940,7 +937,7 @@ impl Store {
     }
 
     /// Run the selected run again, as it ran: its operator and its whole workload
-    /// ([`RunRequest::replaying`] of its spec). Local `lab://` targets start at once; real
+    /// (`App::replaying` of its spec). Local `lab://` targets start at once; real
     /// storage targets open New Run with their plan so writes are reviewed first. A production
     /// trace has no workload to repeat: New Run opens on its operator.
     pub fn run_again(&self) {
@@ -963,23 +960,29 @@ impl Store {
             }
             return;
         }
-        let request = RunRequest::replaying(&report.spec);
-        let w = &request.workload;
+        let request = self.app().replaying(&report.spec);
+        let shown = RunForm::of(&request);
         batch(|| {
-            f.operator
-                .set(quote_operator_arg(&report.spec.operator_ref));
-            if let Some(p) = PRESETS.iter().find(|p| Some(**p) == w.preset.as_deref()) {
+            f.operator.set(
+                shown
+                    .operators
+                    .iter()
+                    .map(|o| quote_operator_arg(o))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            if let Some(p) = PRESETS
+                .iter()
+                .find(|p| Some(**p) == shown.preset.as_deref())
+            {
                 f.preset.set(p);
             }
-            f.duration.set(w.duration.clone().unwrap_or_default());
+            f.duration.set(shown.duration.unwrap_or_default());
             f.concurrency
-                .set(w.concurrency.map(|c| c.to_string()).unwrap_or_default());
-            f.existing.set(w.existing.clone().unwrap_or_default());
+                .set(shown.concurrency.map(|c| c.to_string()).unwrap_or_default());
+            f.existing.set(shown.existing.unwrap_or_default());
         });
-        self.replay.replace(Some(Replay {
-            command: report.spec.command(),
-            request,
-        }));
+        self.replay.replace(Some(request));
         if untracked(|| self.form_is_lab()) {
             self.start_run();
             self.replay.replace(None);
@@ -1431,7 +1434,8 @@ impl Store {
     /// a run or a prove goes on, ask first ("Stop and Quit" or Cancel); else quit.
     /// A terminal quits with Ctrl+C, which stops a job and waits for its cleanup (`term`).
     pub fn request_quit(&self) {
-        if crate::ui::kit::in_terminal() {
+        // Already quitting: the Quitting dialog shows the wait.
+        if crate::ui::kit::in_terminal() || self.quit_since.with(|q| q.is_some()) {
             return;
         }
         if !untracked(|| self.running() || self.proving()) {
@@ -1465,10 +1469,50 @@ impl Store {
         });
     }
 
-    /// Stop the jobs and quit (the app's quit handler waits for their cleanup).
+    /// Stop the jobs, then quit once they have removed their test data: the Quitting dialog
+    /// shows the wait (`poll` follows it). After `STOP_GRACE` it gives up, says what was left
+    /// and offers to quit anyway.
     pub fn stop_and_quit(&self) {
-        self.stop_run();
-        self.stop_prove();
+        jobs::stop_all();
+        self.quit_since.replace(Some(std::time::Instant::now()));
+        self.follow_quit();
+        if self.quit_since.with(|q| q.is_some()) {
+            self.dialog.set(Some(Dialog::Quitting));
+        }
+    }
+
+    /// How long quitting waits for the jobs it stops.
+    pub fn stop_grace(&self) -> Duration {
+        self.stop_grace.with(|g| *g)
+    }
+
+    /// Quit once the stopped jobs have ended; until then say how the wait goes.
+    fn follow_quit(&self) {
+        let Some(since) = self.quit_since.with(|q| *q) else {
+            return;
+        };
+        let left = jobs::left();
+        if left.is_empty() {
+            self.quit_since.replace(None);
+            quit();
+            return;
+        }
+        let waited = since.elapsed();
+        let now = Quitting {
+            waited_s: waited.as_secs(),
+            left,
+            gave_up: waited >= self.stop_grace(),
+        };
+        if self.quitting.with_untracked(|q| q.as_ref() != Some(&now)) {
+            self.quitting.set(Some(now));
+        }
+    }
+
+    /// Quit without waiting any longer for the jobs quitting gave up on (what they left is
+    /// in the log).
+    pub fn quit_anyway(&self) {
+        self.quit_since.replace(None);
+        report_left(&jobs::abandon());
         quit();
     }
 
@@ -1496,6 +1540,7 @@ impl Store {
 
     /// Copy the jobs' states into the signals; act on the ones that ended.
     fn poll(&self) {
+        self.follow_quit();
         if let Some(job) = self.run_job.with(|j| j.clone()) {
             let st = job.peek();
             let ended = st.outcome.clone();
@@ -1584,13 +1629,23 @@ impl Default for Store {
     }
 }
 
-/// Stop the running jobs when the app quits and wait (bounded) for their cleanup.
-pub fn finish_jobs() {
+/// Stop the running jobs when the app quits and wait (at most `grace`) for their cleanup;
+/// what a job then left behind is said on stderr and in the log.
+pub fn finish_jobs(grace: Duration) {
     if jobs::busy() {
-        eprintln!("oprobe: stopping the running job and cleaning up its test data…");
-        if !jobs::shutdown(Duration::from_secs(30)) {
-            eprintln!("oprobe: the running job did not finish cleaning up in time");
+        if !grace.is_zero() {
+            eprintln!("oprobe: stopping the running job and cleaning up its test data…");
         }
+        report_left(&jobs::shutdown(grace));
+    }
+}
+
+/// Say what quitting left behind (stderr, and the log a desktop launch has instead).
+fn report_left(left: &[jobs::Left]) {
+    for l in left {
+        let line = jobs::left_line(l);
+        eprintln!("oprobe: {line}");
+        crate::ui::log_fatal(&line);
     }
 }
 

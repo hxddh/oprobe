@@ -248,6 +248,8 @@ struct Numbers {
     errors: f64,
     throttled: f64,
     counts: String,
+    /// The percentiles are lower bounds (a range with arrivals that never started).
+    at_least: bool,
 }
 
 fn tiles(m: &ProfileModel, cx: Ctx) -> View {
@@ -267,6 +269,7 @@ fn tiles(m: &ProfileModel, cx: Ctx) -> View {
                 &fmt::clock_s(m.window_s),
             ],
         ),
+        at_least: false,
     };
     let whole = Rc::new(whole);
     view().test_id("tiles").child(dynamic(move || {
@@ -282,14 +285,24 @@ fn tiles(m: &ProfileModel, cx: Ctx) -> View {
                     p999: v.p999_ms,
                     errors: v.error_ratio,
                     throttled: v.throttled_request_ratio,
-                    counts: fill(
-                        "range.counts",
-                        &[
-                            &fmt::count(v.ops_count),
-                            &fmt::count(v.requests_count),
-                            &fmt::clock_s(v.span_s()),
-                        ],
-                    ),
+                    counts: {
+                        let counts = fill(
+                            "range.counts",
+                            &[
+                                &fmt::count(v.ops_count),
+                                &fmt::count(v.requests_count),
+                                &fmt::clock_s(v.span_s()),
+                            ],
+                        );
+                        if v.missed_arrivals_count > 0 {
+                            let missed =
+                                fill("range.missed", &[&fmt::count(v.missed_arrivals_count)]);
+                            format!("{counts} · {missed}")
+                        } else {
+                            counts
+                        }
+                    },
+                    at_least: v.latency_at_least,
                 })
             }
             None => whole.clone(),
@@ -301,6 +314,15 @@ fn tiles(m: &ProfileModel, cx: Ctx) -> View {
 fn numbers_view(n: &Numbers) -> View {
     let t = |label: &'static str, v: String, tone: Tone| {
         tile(tr(label), move || v.clone().into(), move || tone)
+    };
+    // A lower bound reads "≥ 1.20 s".
+    let at_least = n.at_least;
+    let pct = |ms: f64| {
+        if at_least {
+            format!("≥ {}", fmt::dur_ms(ms))
+        } else {
+            fmt::dur_ms(ms)
+        }
     };
     view()
         .gap(px(6.0))
@@ -316,9 +338,9 @@ fn numbers_view(n: &Numbers) -> View {
                     format!("{} MiB/s", fmt::sig3(n.mib)),
                     Tone::Neutral,
                 ))
-                .child(t("metric.p50", fmt::dur_ms(n.p50), Tone::Neutral))
-                .child(t("metric.p99", fmt::dur_ms(n.p99), Tone::Neutral))
-                .child(t("metric.p999", fmt::dur_ms(n.p999), Tone::Neutral))
+                .child(t("metric.p50", pct(n.p50), Tone::Neutral))
+                .child(t("metric.p99", pct(n.p99), Tone::Neutral))
+                .child(t("metric.p999", pct(n.p999), Tone::Neutral))
                 .child(t(
                     "metric.errors_of_ops",
                     fmt::ratio(n.errors),

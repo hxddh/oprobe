@@ -103,7 +103,8 @@ A profile is what one operator did on one workload, saved as one `.oprobe` file:
 
 Each operation's wall time splits exactly into queue + backend + retry + client, so "network,
 server or my code?" has a measured answer. Long runs keep every aggregate exact and sample whole
-operations (failed, throttled and slowest ones are always kept), so memory stays bounded.
+operations (failed, throttled and slowest ones first: a run that fails for hours thins those
+too), so memory and the run file stay bounded.
 
 `.oprobe` files come from `oprobe run` and from [`oprobe-trace`](embedding.md) in production;
 `oprobe show FILE` and the app open both. A production trace has the same shape: every OpenDAL
