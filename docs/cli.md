@@ -89,8 +89,9 @@ The proof is made of **trials**: short runs of the current operator (A) and the 
 plus the sizing trials. It starts by printing how many trials it may take and the ETA of the
 whole proof; `--dry-run` prints the same estimate (and the plan of one trial) and sends nothing.
 
-A verdict other than `inconclusive` needs at least **3 pairs** of trials (one A and one B, in an
-order drawn per pair from the run's seed, and said so in `notes`): when the
+A verdict other than `inconclusive` needs at least **3 pairs** of trials (one A and one B). The
+orders are balanced in blocks of two pairs, one `AB` and one `BA`, and which comes first in a
+block is drawn from the run's seed (`notes` says so). When the
 budget allows fewer, the verdict is `inconclusive` (exit 0) with a note. When no pair ran at all,
 the text says `not measured` and prints no diff; `-o json` still prints a valid result
 (`verdict: "inconclusive"`, `pairs_count: 0`, a note). When the changed operator's trials
@@ -100,12 +101,28 @@ throttle more than `--max-throttle` allows, and more than the current operator's
 `prove` refuses a run that cannot be judged on performance (its first finding is `invalid_run`:
 it failed, or it is partial and too short); profile the operator again first.
 
-The objective's interval is Student's t on the paired log ratios of the objective (B over A, pair
-by pair), with a spread no smaller than the noise floor: the spread a pair's ratio would have
-from the trial-to-trial spread of A and of B alone, each learned from that side's consecutive
-trials (until B has two trials, it is assumed as noisy as A: the A/A spread; a floor learned from
-a single A/A difference is doubled). Shares, such as throttled requests, are
-compared with Newcombe's interval.
+The verdict is whether the objective's interval excludes no change. The interval is on the
+paired log ratios of the objective (B over A, pair by pair):
+
+- Its estimate is the mean of the `AB` pairs' mean and the `BA` pairs' mean, so an effect of the
+  order itself (the second trial of a pair running better or worse) cancels.
+- Its spread is no smaller than the noise floor: the spread a pair's ratio would have from the
+  trial-to-trial spread of A and of B alone, each learned from that side's consecutive trials
+  (until B has two trials, it is assumed as noisy as A: the A/A spread; a floor learned from a
+  single A/A difference is doubled).
+- It is sequential: `prove` looks after every pair from the third on, and the interval of each
+  look is as wide as the plan of `--pairs` looks requires, so that the verdict is wrong about a
+  change that is none in fewer than 5 % of proofs, whenever the proof stops. A plan of more
+  pairs therefore needs clearer evidence at its early looks. `pairs_max_count` in the result is
+  that plan.
+
+Shares, such as throttled requests, are compared with Newcombe's interval; the secondary
+metrics' intervals are plain 95 % intervals, shown and never decisive.
+
+A trial that ends throttled (429/503) is followed by a cool-down before the next trial starts:
+the longest `Retry-After` it saw, at least twice the trial warm-up (250 ms to 2 s), at most 5 s.
+The cool-down counts in the budget, Ctrl-C interrupts it, and `notes` says how often it
+happened.
 
 `--max-duration` is the one wall-time budget of the whole proof: no trial starts that would not
 end within it. When a budget (`--max-duration`, `--max-requests`, `--max-bytes`) stops the prove

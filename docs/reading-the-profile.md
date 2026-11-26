@@ -103,8 +103,8 @@ Each operation's wall time is split exactly; an instant counts once even when re
 |---|---|---|
 | queue | requests wait for a connection or an in-flight permit | a concurrency limit or a small pool; see `cold_connections` and `throttling` |
 | connect | DNS, TCP, proxy and TLS of a new connection | connections are not reused, or the proxy or TLS is slow (`http.keep_alive`, `http.version`) |
-| send | the request body goes out | upload bandwidth; `write.chunk`, `write.concurrent` |
-| TTFB | waiting for the first byte (the server's work plus one round trip) | the store or the distance to it; stragglers show as a long tail (`layers.tail_cut`) |
+| send | the request body goes out | upload bandwidth; `write.chunk`, `write.concurrent`. Uploads that share one saturated uplink are a `bandwidth_cap` (`layers.throttle.bandwidth`), not hung requests |
+| TTFB | waiting for the first byte (the server's work plus one round trip) | the store or the distance to it; stragglers show as a long tail (`layers.tail_cut`). A TTFB that grows with the requests in flight, in a run that varied them at least twofold, is the service's queue: `throttling` without a 429/503 (`layers.concurrent_limit.http`) |
 | body | the response body arrives | download bandwidth per stream × streams; `read.chunk`, `read.concurrent` |
 | stall | the body waits for your code to read it (client time: its own segment in a waterfall, never part of body) | the consumer, not storage |
 | retry | the retry layer sleeps before the next attempt | throttling or errors; see the findings (`errors` on retried 5xx or lost connections: `layers.retry.min_delay`) |

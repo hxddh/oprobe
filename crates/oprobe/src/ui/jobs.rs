@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::app::prove::AbPair;
 use crate::app::{App, Cancel, EventSink, ProveOutcome, ProveRequest, RunOutcome, RunRequest};
 use crate::engine::Progress;
 use crate::events::Live;
@@ -52,8 +53,10 @@ pub struct Proved {
     pub delta: (f64, f64, f64),
     pub significant: bool,
     pub pairs: u64,
-    /// The objective of each A/B pair, `(baseline, candidate, fewest operations)`, in order.
-    pub ab: Vec<(f64, f64, u64)>,
+    /// The A/B pairs in order: each one's objective, fewest operations and trial order.
+    pub ab: Vec<AbPair>,
+    /// The A/B pairs the prove planned at most (the boundary of its interval).
+    pub max_pairs: usize,
     /// Last completed A/B pair's stored `(baseline_run_id, candidate_run_id)`, for Compare.
     pub trial_ids: Option<(String, String)>,
     /// The other metrics (shown, never decisive).
@@ -76,7 +79,6 @@ impl Proved {
     pub fn from_output(p: crate::app::ProveOutput) -> Self {
         use crate::app::prove::TrialKind;
         let v = crate::report::view::ProveView::of(&p);
-        let p99 = p.objective == crate::app::ProveObjective::P99;
         let trial_ids = (0..p.pairs_count).rev().find_map(|pair| {
             let a = p
                 .trials
@@ -89,6 +91,7 @@ impl Proved {
             (!a.run_id.is_empty() && !b.run_id.is_empty())
                 .then(|| (a.run_id.clone(), b.run_id.clone()))
         });
+        let max_pairs = p.planned_pairs();
         Self {
             prove_id: p.prove_id,
             run_id: p.run_id,
@@ -101,7 +104,8 @@ impl Proved {
             ),
             significant: p.objective_delta.low > 0.0 || p.objective_delta.high < 0.0,
             pairs: p.pairs_count,
-            ab: ab_pairs(&p.trials, p99),
+            ab: crate::app::prove::ab_pairs(p.objective, &p.trials),
+            max_pairs,
             trial_ids,
             secondary: p.secondary.iter().map(Secondary::of).collect(),
             change: p.change,
@@ -197,6 +201,8 @@ pub struct State {
     pub cleaning: bool,
     /// Prove's trials as they finish.
     pub trials: Vec<Trial>,
+    /// The A/B pairs the running prove planned at most (`--pairs`).
+    pub prove_pairs: usize,
     /// Operators measured so far (a run of several operators).
     pub done_count: usize,
     pub outcome: Option<Outcome>,
@@ -338,6 +344,10 @@ impl Job {
         let p99 = req.objective == crate::app::ProveObjective::P99;
         let scheme = crate::operator::resolve::scheme_of(&base.url, None);
         let (job, sink) = Self::start(0.0, true);
+        job.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prove_pairs = req.pairs;
         let st_trials = job.state.clone();
         sink.bus()
             .subscribe(Arc::new(move |e: &crate::events::Event| {
@@ -374,39 +384,21 @@ impl Job {
     }
 }
 
-/// The objective of each complete A/B pair of a prove's trials, by pair number.
-pub fn ab_pairs(trials: &[crate::app::prove::ProveTrial], p99: bool) -> Vec<(f64, f64, u64)> {
-    use crate::app::prove::TrialKind;
-    let v = |t: &crate::app::prove::ProveTrial| if p99 { t.p99_ms } else { t.goodput_ops_per_s };
-    type Side = Option<(f64, u64)>;
-    let mut by: std::collections::BTreeMap<u64, (Side, Side)> = Default::default();
-    for t in trials {
-        let Some(pair) = t.pair else { continue };
-        let e = by.entry(pair).or_default();
-        match t.kind {
-            TrialKind::Baseline => e.0 = Some((v(t), t.ops_count)),
-            TrialKind::Candidate => e.1 = Some((v(t), t.ops_count)),
-            TrialKind::Sizing => {}
-        }
-    }
-    by.into_values()
-        .filter_map(|(a, b)| {
-            let ((a, na), (b, nb)) = (a?, b?);
-            Some((a, b, na.min(nb)))
-        })
-        .collect()
-}
-
-/// Prove's pairs so far as `(baseline, candidate, fewest operations)`: each two trials of a
-/// pair run back to back, in either order (prove draws the order of each pair).
-pub fn ab_live(trials: &[Trial]) -> Vec<(f64, f64, u64)> {
+/// Prove's pairs so far: each two trials of a pair run back to back, in either order (prove
+/// balances the orders), and the order is part of the pair.
+pub fn ab_live(trials: &[Trial]) -> Vec<AbPair> {
     let mut out = Vec::new();
     let mut open: Option<&Trial> = None;
     for t in trials {
         match open.take() {
             Some(o) if o.candidate != t.candidate => {
                 let (a, b) = if t.candidate { (o, t) } else { (t, o) };
-                out.push((a.value, b.value, a.ops.min(b.ops)));
+                out.push(AbPair {
+                    baseline: a.value,
+                    candidate: b.value,
+                    ops_count: a.ops.min(b.ops),
+                    candidate_first: o.candidate,
+                });
             }
             _ => open = Some(t),
         }
@@ -517,9 +509,17 @@ mod tests {
             t(false, 80.0),
             t(true, 88.0),
         ]);
+        let got: Vec<(f64, f64, u64, bool)> = p
+            .iter()
+            .map(|p| (p.baseline, p.candidate, p.ops_count, p.candidate_first))
+            .collect();
         assert_eq!(
-            p,
-            [(100.0, 120.0, 100), (90.0, 99.0, 100), (80.0, 88.0, 100)]
+            got,
+            [
+                (100.0, 120.0, 100, false),
+                (90.0, 99.0, 100, true),
+                (80.0, 88.0, 100, false)
+            ]
         );
     }
 

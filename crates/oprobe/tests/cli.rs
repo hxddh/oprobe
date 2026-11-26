@@ -563,6 +563,82 @@ fn demo_is_run_lab_demo() {
     assert!(slowest_ttfb >= 250.0, "{r}");
 }
 
+/// 9.2: the A/B pairs run in a balanced order (9.1 drew each pair's order alone), the result
+/// names the plan its sequential interval belongs to, and a trial that ended throttled is
+/// followed by a cool-down before the next one (the uncapped baseline of `lab://throttle`
+/// throttles in every trial).
+#[test]
+fn prove_balances_the_ab_order_and_cools_down_after_throttling() {
+    let env = Env::new();
+    // A quick retry keeps the throttled trials short (OpenDAL's default backs off for seconds).
+    let o = env.run(&[
+        "run",
+        "lab://throttle",
+        "-d",
+        "1s",
+        "--warmup",
+        "0s",
+        "--set",
+        "layers.retry.min_delay=20ms",
+        "--set",
+        "layers.retry.jitter=on",
+        "-q",
+        "-o",
+        "json",
+    ]);
+    assert!(matches!(code(&o), 0 | 3), "{}", stderr(&o));
+    let o = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "layers.concurrent_limit.http=8",
+        "--objective",
+        "p99",
+        "--trial",
+        "300ms",
+        "--pairs",
+        "4",
+        "-o",
+        "json",
+        "-q",
+    ]);
+    assert!(matches!(code(&o), 0 | 3), "{}\n{}", stdout(&o), stderr(&o));
+    let v = json(&o);
+    validate("prove", &v);
+    assert_eq!(v["pairs_max_count"], 4, "{v:#}");
+    let pairs = v["pairs_count"].as_u64().unwrap();
+    assert!((3..=4).contains(&pairs), "{v:#}");
+    // The first trial of each pair, in the order the trials ran.
+    let mut first: Vec<Option<&str>> = vec![None; pairs as usize];
+    for t in v["trials"].as_array().unwrap() {
+        if let Some(p) = t["pair"].as_u64() {
+            first[p as usize].get_or_insert(t["kind"].as_str().unwrap());
+        }
+    }
+    for block in first.chunks_exact(2) {
+        assert_ne!(block[0], block[1], "one AB and one BA per block: {first:?}");
+    }
+    let notes: Vec<&str> = v["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("A/B order") && n.contains("balanced") && n.contains("sequential")),
+        "{notes:?}"
+    );
+    let cooled: Vec<&&str> = notes.iter().filter(|n| n.contains("cooled down")).collect();
+    assert_eq!(cooled.len(), 1, "said once: {notes:?}");
+    assert!(cooled[0].contains("ended throttled"), "{notes:?}");
+    // The verdict is the interval: it never says more than the interval does.
+    let d = &v["objective_delta"];
+    let excludes = d["low"].as_f64().unwrap() > 0.0 || d["high"].as_f64().unwrap() < 0.0;
+    assert!(v["verdict"] == "inconclusive" || excludes, "{v:#}");
+}
+
 #[test]
 fn prove_judges_a_change_and_hides_its_trials() {
     let env = Env::new();
