@@ -140,8 +140,11 @@ pub fn decode_run(r: impl Read) -> Result<Run> {
         } else if msg.contains("not an oprobe run file") {
             invalid("pass an `.oprobe` run file, a report `.json` or an `oprobe-trace` file")
         } else if msg.contains(super::runfile::TOO_LARGE) {
+            // No setting makes this file readable. A run of this oprobe never writes one
+            // (`RunFileStream` keeps to what a reader takes); one of 9.2 or earlier could,
+            // from a long run with many failed operations.
             invalid(
-                "re-run the workload with a lower `max_requests` (`[defaults]` in the config file)",
+                "run the workload again with this oprobe: it keeps a run file within what it reads",
             )
         } else {
             invalid("the run file is damaged or truncated: copy it again, or re-run the workload")
@@ -806,30 +809,6 @@ pub(crate) mod tests {
             let hint = b.hint.unwrap_or_default();
             assert!(hint.contains("`.oprobe` run file"), "{hint}");
         }
-    }
-
-    /// A run file written by oprobe 9.1.0 itself (`oprobe run lab://throttle -d 400ms -c 4
-    /// --objects 8 --object-size 4KiB --set warmup=0s`): later versions read it as it is,
-    /// within the limits of what a run file may decode to.
-    #[test]
-    fn a_run_file_written_by_9_1_0_still_loads() {
-        let bytes = include_bytes!("testdata/run-9.1.0.oprobe");
-        let run = decode_run(&bytes[..]).unwrap();
-        assert_eq!(run.report.run.id, "20261126-013555-ab60");
-        assert_eq!(run.report.run.oprobe_version, "9.1.0");
-        assert_eq!(run.report.spec.operator_ref, "lab://throttle");
-        assert_eq!((run.ops.len(), run.reqs.len()), (229, 229));
-        assert_eq!(run.report.summary.ops, 229);
-        assert!(
-            run.ops
-                .iter()
-                .all(|o| !o.key.is_empty() && o.latency_us > 0)
-        );
-        assert!(
-            run.reqs
-                .iter()
-                .all(|q| matches!(q.method.as_ref(), "GET" | "HEAD" | "PUT"))
-        );
     }
 
     use crate::model::*;

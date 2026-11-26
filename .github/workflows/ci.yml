@@ -350,8 +350,8 @@ jobs:
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.cli && '--no-default-features --features cli' || (matrix.features && format('--features {0}', matrix.features) || '') }}
-      # The size target of design v6 §4 (≤ 35 MB for the binary with the app): reported in the
-      # job summary, not enforced.
+      # Size has no hard target (it must not cost usability or function): reported in the job
+      # summary, so a jump is seen.
       - name: Binary size
         shell: bash
         run: |

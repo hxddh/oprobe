@@ -1,5 +1,5 @@
 //! The front-end side of the measurement pipeline ([`crate::engine::measure`]): progress for
-//! this output mode, `--no-save` and the report files, budget-breach and Ctrl-C messages.
+//! this output mode, `--no-save` and the report files, budget-breach and interruption messages.
 //! Used by `run` (each operator), `demo` and every trial of `prove`.
 
 use std::sync::Arc;
@@ -139,9 +139,13 @@ pub async fn measure_to_breach(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Resu
         }
         return Ok(m);
     }
-    if m.cancelled {
-        ctx.out
-            .warn("interrupted — partial results: they cover only the time before Ctrl-C");
+    // A run says so. A trial of a prove does not: an interrupted prove keeps no partial
+    // result, and says that itself. ("Interrupted", not "Ctrl-C": a SIGTERM, a SIGHUP, a
+    // closed terminal and the app's Stop end here too.)
+    if m.cancelled && !trial {
+        ctx.out.warn(
+            "interrupted: partial results, they cover only the time before the run was stopped",
+        );
     }
     Ok(m)
 }

@@ -266,6 +266,10 @@
           },
           "type": "array"
         },
+        "operator_rust": {
+          "description": "The whole of `b` as Rust that compiles as written ([`to_rust`]: `build_operator()`,\n`reader()`, `writer()`), secrets left to the credential chain. The `rust` lines above\nshow a change and do not paste.",
+          "type": "string"
+        },
         "rust": {
           "description": "The changed layers and options as Rust (`+` added, `~` changed, `-` removed).",
           "type": "string"
@@ -343,7 +347,7 @@
           "type": "number"
         },
         "feasible": {
-          "description": "Within `--max-throttle` and the error ratio a run allows (1 %).",
+          "description": "Within `--max-throttle` and the error ratio a run allows (1 %), and, for the remedy of\na `rate_limit` finding, sending no more requests per second than the fitted limit.",
           "type": "boolean"
         },
         "goodput_ops_per_s": {
@@ -359,6 +363,11 @@
           "type": "integer"
         },
         "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_spread_ratio": {
+          "description": "How far off this trial's p99 can be, as a log ratio: a quarter of the log width of the\nlatencies at the ranks 0.99·n ± 2·√(0.0099·n) of its n operations (the p99's\norder-statistic interval). Above 0.17 those latencies differ by more than 2×: the p99\nsits on a cliff. Absent when 0, and in results of 9.2 and earlier.",
           "format": "double",
           "type": "number"
         },
@@ -773,13 +782,10 @@
       "type": "integer"
     },
     "pairs_max_count": {
-      "description": "The A/B pairs the prove planned at most (`--pairs`): the interval's sequential boundary\nis the one of that plan. Absent in results of 9.1 and earlier, whose interval was the\nfixed-sample one.",
+      "description": "The A/B pairs the prove planned at most (`--pairs`): the interval's sequential boundary\nis the one of that plan.",
       "format": "uint64",
       "minimum": 0,
-      "type": [
-        "integer",
-        "null"
-      ]
+      "type": "integer"
     },
     "prove_id": {
       "description": "This prove (its trials are runs with this `parent_id`).",
@@ -855,6 +861,7 @@
     "objective_delta",
     "noise_floor_ratio",
     "pairs_count",
+    "pairs_max_count",
     "max_throttle_ratio",
     "secondary",
     "trials",

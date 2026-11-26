@@ -5,6 +5,7 @@ use std::time::SystemTime;
 
 use super::report::*;
 use super::{ReqRow, Run, RunId};
+use crate::analysis::censoring::StalledOpenLoop;
 use crate::analysis::diagnosis::{Severity, check_sla, diagnose};
 use crate::analysis::hypothesis::HypothesisKind;
 use crate::config::{Knobs, OpKind, Profile};
@@ -126,10 +127,23 @@ pub(super) fn finish(run: &mut Run, breached: bool) {
     };
 }
 
+/// How a run varies its own load: the flag a headline names. `prove` has nothing to prove on
+/// a run with no finding, so the headline never points at it.
+const VARY_THE_LOAD: &str = "`--set shape=ramp:FROM..TO/D` (arrivals per second, over D)";
+
 /// The verdict line (design v6 §3): the top finding's cause; with no finding, where the time
-/// went — and when nothing throttled and no load was varied, that a plateau is not a limit
-/// one run can size (N2: prove sizes it).
+/// went — and when nothing throttled, that a run at a steady load shows no limit, and how to
+/// vary the load (N2). An open loop that stalled says so first, with its arithmetic
+/// ([`StalledOpenLoop`]): its latencies are lower bounds, whatever the findings say.
 pub fn headline(r: &Report) -> String {
+    let what = what_happened(r);
+    match StalledOpenLoop::of(r.open_loop.as_ref(), r.summary.latency.p99) {
+        Some(stalled) if r.summary.ops > 0 => format!("{}. {what}", stalled.describe()),
+        _ => what,
+    }
+}
+
+fn what_happened(r: &Report) -> String {
     if let Some(f) = r.findings.first() {
         return f.cause.clone();
     }
@@ -137,30 +151,29 @@ pub fn headline(r: &Report) -> String {
         return "No operations completed in the measurement window.".into();
     }
     let kind = r.capacity.selected().map(|h| h.kind);
-    let stage = r.stages.bottleneck.label();
-    match kind {
-        Some(HypothesisKind::Queueing) => format!(
-            "Inconclusive: latency grows with the requests in flight ({stage}), but one run varies no load — prove sizes a change."
-        ),
-        _ if r.resilience.throttled_responses == 0
-            && matches!(
-                r.stages.bottleneck,
-                crate::analysis::diagnosis::Bottleneck::ServerLatency
-                    | crate::analysis::diagnosis::Bottleneck::Download
-                    | crate::analysis::diagnosis::Bottleneck::Upload
-            ) =>
-        {
-            format!(
-                "No limit reached: {stage} dominates (p50 {} · p99 {}); one run varies no load — prove sizes a change.",
-                crate::util::fmt_ms(r.summary.latency.p50),
-                crate::util::fmt_ms(r.summary.latency.p99)
-            )
-        }
-        _ => format!(
-            "No finding: {stage} dominates (p50 {} · p99 {}).",
-            crate::util::fmt_ms(r.summary.latency.p50),
-            crate::util::fmt_ms(r.summary.latency.p99)
-        ),
+    let found = format!(
+        "No finding: {} dominates (p50 {} · p99 {}).",
+        r.stages.bottleneck.label(),
+        crate::util::fmt_ms(r.summary.latency.p50),
+        crate::util::fmt_ms(r.summary.latency.p99)
+    );
+    // The time is the service's and nothing was rejected: a limit, if there is one, shows
+    // only when the load changes, and this run held it steady.
+    let service_bound = matches!(
+        r.stages.bottleneck,
+        crate::analysis::diagnosis::Bottleneck::ServerLatency
+            | crate::analysis::diagnosis::Bottleneck::Download
+            | crate::analysis::diagnosis::Bottleneck::Upload
+    );
+    if r.resilience.throttled_responses == 0
+        && !r.is_trace()
+        && (kind == Some(HypothesisKind::Queueing) || service_bound)
+    {
+        format!(
+            "{found} The load was not varied, so this run cannot show a limit: vary it with {VARY_THE_LOAD}."
+        )
+    } else {
+        found
     }
 }
 
@@ -592,4 +605,108 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
 /// Build only the report (the trace rows are dropped).
 pub fn build_report(i: ReportInput<'_>) -> Report {
     build_run(i).report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::diagnosis::Bottleneck;
+    use crate::analysis::hypothesis::Hypothesis;
+
+    fn report() -> Report {
+        let mut r: Report =
+            serde_json::from_value(crate::analysis::findings::tests::empty_report_json()).unwrap();
+        r.run.id = "r1".into();
+        r.summary.ops = 1000;
+        r.summary.latency.p50 = 8.0;
+        r.summary.latency.p99 = 21.0;
+        r.stages.bottleneck = Bottleneck::ServerLatency;
+        r
+    }
+
+    /// K2-5: a healthy run read "Inconclusive: latency grows with the requests in flight … —
+    /// prove sizes a change", and `prove` refused it (there is no finding to prove). The
+    /// headline says the load was not varied and how to vary it, and names no command that
+    /// fails.
+    #[test]
+    fn a_healthy_run_says_how_to_vary_the_load_and_never_points_at_prove() {
+        let mut r = report();
+        let no_model = headline(&r);
+        r.capacity.hypotheses = vec![Hypothesis {
+            kind: HypothesisKind::Queueing,
+            selected: true,
+            ..Default::default()
+        }];
+        r.stages.bottleneck = Bottleneck::Client;
+        for h in [no_model, headline(&r)] {
+            assert!(h.starts_with("No finding: "), "{h}");
+            assert!(h.contains("(p50 8.00ms · p99 21.0ms)"), "{h}");
+            assert!(h.contains("The load was not varied"), "{h}");
+            assert!(h.contains("`--set shape=ramp:FROM..TO/D`"), "{h}");
+            assert!(!h.contains("prove") && !h.contains("Inconclusive"), "{h}");
+        }
+        // What the headline names exists: `--set` takes the key and the shape parses.
+        let mut o = crate::model::spec::Overrides::new();
+        o.set("shape", "ramp:50..350/3s").unwrap();
+        // The client's own time dominates and no model saw growth: nothing to vary.
+        r.capacity.hypotheses.clear();
+        let h = headline(&r);
+        assert_eq!(
+            h,
+            "No finding: client processing dominates (p50 8.00ms · p99 21.0ms)."
+        );
+    }
+
+    /// K4-1: a stalled open loop is judged with no limit. The headline leads with the
+    /// arrivals that never completed and what they leave known of the p99, and the verdict
+    /// follows the failed check.
+    #[test]
+    fn a_stalled_open_loop_leads_the_headline() {
+        let mut run = Run {
+            report: report(),
+            ops: vec![],
+            reqs: vec![],
+        };
+        let stalled = |missed: u64| crate::trace::OpenLoopStats {
+            target_rate: 1000.0,
+            achieved_rate: 400.0,
+            missed,
+            censored_count: missed,
+            intended_count: 3000,
+            ..Default::default()
+        };
+        run.report.summary.latency.p99 = 1805.0;
+        run.report.open_loop = Some(stalled(1808));
+        run.report.verdict.sla.enforced = true;
+        finish(&mut run, true);
+        let h = &run.report.verdict.headline;
+        assert!(
+            h.starts_with(
+                "1808 of 3000 scheduled arrivals never completed (60.3%): the p99 is at least 1.80s and has no upper bound. "
+            ),
+            "{h}"
+        );
+        assert_eq!(run.report.verdict.level, VerdictLevel::Critical);
+        // The finding's cause follows the stall.
+        run.report.findings = vec![Finding {
+            code: "client_bound".into(),
+            severity: Severity::Warning,
+            cause: "The client process set the pace.".into(),
+            ..Default::default()
+        }];
+        finish(&mut run, true);
+        let h = &run.report.verdict.headline;
+        assert!(
+            h.ends_with("has no upper bound. The client process set the pace."),
+            "{h}"
+        );
+        // Within 1 % of the arrivals the p99 is still bounded: the headline is the finding's.
+        run.report.open_loop = Some(stalled(30));
+        finish(&mut run, false);
+        assert_eq!(
+            run.report.verdict.headline,
+            "The client process set the pace."
+        );
+        assert_eq!(run.report.verdict.level, VerdictLevel::Attention);
+    }
 }

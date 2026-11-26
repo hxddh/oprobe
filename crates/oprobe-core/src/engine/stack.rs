@@ -12,7 +12,16 @@ use crate::trace::EffectiveKnobs;
 /// The chunk OpenDAL writes with when asked for `requested` bytes: it raises it to the
 /// service's minimum multipart part size and lowers it to the maximum
 /// (`opendal_core` `WriteContext::calculate_chunk_size`).
+///
+/// 0 for a `write.chunk` left unset (`requested` 0): OpenDAL then fixes no part size. It
+/// buffers up to the service's minimum and sends each write as it comes (its chunk is not
+/// "exact"), so the parts are as large as the caller's writes; the profile shows the parts
+/// that were uploaded. 9.2 reported the minimum as the part size and warned that a
+/// `chunk_size 0B` nobody asked for was outside the service's limits.
 pub fn effective_write_chunk(cap: &opendal::Capability, requested: usize) -> usize {
+    if requested == 0 {
+        return 0;
+    }
     let mut size = requested;
     if let Some(max) = cap.write_multi_max_size {
         size = size.min(max);
@@ -218,5 +227,31 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(r.first_backoff_mean(), ms(75));
+    }
+
+    /// K2-10: a default `large-objects` run (no `write.chunk`) warned that "chunk_size 0B is
+    /// outside s3's multipart part-size limits" and reported 5 MiB parts beside the 8 MiB
+    /// ones it uploaded. Unset, OpenDAL fixes no part size.
+    #[test]
+    fn an_unset_write_chunk_is_no_part_size() {
+        let cap = opendal::Capability {
+            write_multi_min_size: Some(5 << 20),
+            write_multi_max_size: Some(5 << 30),
+            ..Default::default()
+        };
+        assert_eq!(effective_write_chunk(&cap, 0), 0);
+        let mut k = Knobs {
+            chunk_size: crate::util::ByteSize(0),
+            ..Knobs::default()
+        };
+        let e = effective_knobs(&cap, &k);
+        assert_eq!((e.requested_chunk_size, e.write_chunk_size), (0, 0));
+        assert!(!e.write_chunk_clamped());
+        assert_eq!(e.service_min_part_size, Some(5 << 20));
+        // A requested size is still clamped to what the service takes, and says so.
+        assert_eq!(effective_write_chunk(&cap, 1 << 20), 5 << 20);
+        assert_eq!(effective_write_chunk(&cap, 8 << 20), 8 << 20);
+        k.chunk_size = crate::util::ByteSize::mib(1);
+        assert!(effective_knobs(&cap, &k).write_chunk_clamped());
     }
 }

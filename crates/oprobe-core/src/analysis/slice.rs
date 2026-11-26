@@ -1,12 +1,12 @@
-//! Re-slicing a run's request rows (`oprobe analyze`): filters (`--window`, `--where`),
-//! group-by tables (`--by api|conn|remote|stage|second|status`) and per-stage latency tables.
+//! Re-slicing a run's request rows: group-by tables
+//! (`--by api|conn|remote|stage|second|status`) and per-stage latency tables.
 
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::outliers::dominant_stage;
+use super::outliers::Stage;
 use crate::model::ReqRow;
 
 /// How to group request rows.
@@ -27,17 +27,6 @@ pub enum By {
 }
 
 impl By {
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s.trim().to_ascii_lowercase().as_str() {
-            "api" => Self::Api,
-            "conn" | "connection" => Self::Conn,
-            "remote" | "ip" => Self::Remote,
-            "stage" => Self::Stage,
-            "second" | "time" | "t" => Self::Second,
-            "status" => Self::Status,
-            _ => return None,
-        })
-    }
     pub fn label(self) -> &'static str {
         match self {
             Self::Api => "api",
@@ -58,7 +47,7 @@ impl By {
                 .remote
                 .map(|a| a.ip().to_string())
                 .unwrap_or_else(|| NO_CONNECTION.into()),
-            Self::Stage => dominant_stage(r).to_owned(),
+            Self::Stage => Stage::dominant(r).name().to_owned(),
             Self::Second => (r.t_us.div_euclid(1_000_000)).to_string(),
             Self::Status => r.status.to_string(),
         }
@@ -68,114 +57,6 @@ impl By {
 /// The group of the requests that had no connection (reset or refused before one was
 /// reported): `--by conn` and the remotes table count them under this row.
 pub const NO_CONNECTION: &str = "no connection";
-
-/// Request filters: `--window A..B` and `--where k=v,…`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct Filter {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from_s: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to_s: Option<f64>,
-    /// `attribute = value` conditions (all must hold): `api`, `status`, `protocol`, `remote`,
-    /// `conn`, `stage`, `connection` (`cold`/`warm`), `attempt` (`first`/`retry`), `method`,
-    /// `op` (operation id).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub conditions: Vec<(String, String)>,
-}
-
-/// Attributes `--where` accepts.
-pub const WHERE_KEYS: [&str; 10] = [
-    "api",
-    "status",
-    "protocol",
-    "remote",
-    "conn",
-    "stage",
-    "connection",
-    "attempt",
-    "method",
-    "op",
-];
-
-impl Filter {
-    /// Parse `--window A..B` (seconds; either side may be empty).
-    pub fn parse_window(&mut self, s: &str) -> Result<(), String> {
-        let (a, b) = s.split_once("..").ok_or_else(|| {
-            format!("invalid window `{s}` (expected A..B in seconds, e.g. 5..10)")
-        })?;
-        let num = |x: &str| -> Result<Option<f64>, String> {
-            let x = x.trim().trim_end_matches('s');
-            if x.is_empty() {
-                Ok(None)
-            } else {
-                x.parse::<f64>()
-                    .map(Some)
-                    .map_err(|_| format!("invalid window bound `{x}`"))
-            }
-        };
-        self.from_s = num(a)?;
-        self.to_s = num(b)?;
-        if let (Some(a), Some(b)) = (self.from_s, self.to_s)
-            && b <= a
-        {
-            return Err(format!("empty window `{s}`"));
-        }
-        Ok(())
-    }
-
-    /// Parse `--where k=v[,k=v…]`.
-    pub fn parse_where(&mut self, s: &str) -> Result<(), String> {
-        for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-            let (k, v) = part
-                .split_once('=')
-                .ok_or_else(|| format!("invalid condition `{part}` (expected key=value)"))?;
-            let k = k.trim().to_ascii_lowercase();
-            if !WHERE_KEYS.contains(&k.as_str()) {
-                return Err(format!(
-                    "unknown attribute `{k}` (one of: {})",
-                    WHERE_KEYS.join(", ")
-                ));
-            }
-            self.conditions.push((k, v.trim().to_owned()));
-        }
-        Ok(())
-    }
-
-    pub fn matches(&self, r: &ReqRow) -> bool {
-        let t = r.t_us as f64 / 1e6;
-        if self.from_s.is_some_and(|a| t < a) || self.to_s.is_some_and(|b| t >= b) {
-            return false;
-        }
-        self.conditions.iter().all(|(k, v)| {
-            let eq = |x: &str| x.eq_ignore_ascii_case(v);
-            match k.as_str() {
-                "api" => eq(r.api.label()) || eq(r.api_name()),
-                "status" => eq(&r.status.to_string()),
-                "protocol" => eq(&format!("{:?}", r.protocol)),
-                "remote" => r
-                    .remote
-                    .is_some_and(|a| eq(&a.ip().to_string()) || eq(&a.to_string())),
-                "conn" => eq(&r.conn_id.to_string()),
-                "stage" => eq(dominant_stage(r)),
-                "connection" => eq(if r.reused { "warm" } else { "cold" }),
-                "attempt" => {
-                    eq(if r.attempt > 1 { "retry" } else { "first" }) || eq(&r.attempt.to_string())
-                }
-                "method" => eq(&r.method),
-                "op" => eq(&r.op_id.to_string()),
-                _ => false,
-            }
-        })
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.from_s.is_none() && self.to_s.is_none() && self.conditions.is_empty()
-    }
-
-    pub fn apply<'a>(&self, reqs: &'a [ReqRow]) -> Vec<&'a ReqRow> {
-        reqs.iter().filter(|r| self.matches(r)).collect()
-    }
-}
 
 /// One group of a `--by` table.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -421,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn filters_and_groups() {
+    fn groups() {
         let mut reqs = Vec::new();
         for i in 0..100i64 {
             let mut r = test_req(i * 50_000, 1000 + i as u64 * 10);
@@ -431,13 +312,6 @@ mod tests {
             }
             reqs.push(r);
         }
-        let mut f = Filter::default();
-        f.parse_window("1..3").unwrap();
-        f.parse_where("api=GetObject").unwrap();
-        let v = f.apply(&reqs);
-        assert_eq!(v.len(), 36);
-        assert!(f.parse_where("bogus=1").is_err());
-        assert!(Filter::default().parse_window("5..1").is_err());
         let g = group(&reqs.iter().collect::<Vec<_>>(), By::Status);
         assert_eq!(g[0].key, "200");
         assert_eq!(g[1].throttled_count, 10);
@@ -447,8 +321,21 @@ mod tests {
         let t = stage_table(&reqs.iter().collect::<Vec<_>>());
         assert_eq!(t.len(), 3);
         assert_eq!(t.last().unwrap().api, "all");
-        let mut w = Filter::default();
-        w.parse_where("status=503").unwrap();
-        assert_eq!(w.apply(&reqs).len(), 10);
+    }
+
+    /// K2-3: `--by stage` groups a request that spent its time receiving its body under
+    /// `body`.
+    #[test]
+    fn the_body_stage_is_named_body() {
+        let mut reqs: Vec<ReqRow> = (0..10).map(|i| test_req(i * 1_000, 1_000)).collect();
+        for r in reqs.iter_mut().take(4) {
+            (r.ttfb_us, r.body_us) = (100, 890);
+        }
+        let g = group(&reqs.iter().collect::<Vec<_>>(), By::Stage);
+        let keys: Vec<(&str, u64)> = g
+            .iter()
+            .map(|r| (r.key.as_str(), r.requests_count))
+            .collect();
+        assert_eq!(keys, [("ttfb", 6), ("body", 4)]);
     }
 }

@@ -419,6 +419,7 @@ mod tests {
             remote: None,
             server: None,
             service_op: None,
+            service: None,
             tls: None,
             tcp: None,
             detail: None,

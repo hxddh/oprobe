@@ -584,8 +584,36 @@ mod host_transport {
         assert_eq!(down, 5 * requests);
         assert_eq!(snap.summary.ops, 3);
         assert_eq!(snap.resilience.network_errors, 0, "{:?}", snap.resilience);
-        // The connections are the host client's own business: none is reported dialed.
-        assert_eq!(snap.connections.dialed, 0, "{:?}", snap.connections);
+        // The connections are the host client's own business: none is reported dialed, and
+        // none reused either. What nobody observed is not a number (9.2 counted every answered
+        // request as warm: "100 % reused").
+        let c = &snap.connections;
+        assert_eq!(
+            (c.dialed, c.reused_requests, c.reuse_pct),
+            (0, 0, 0.0),
+            "{c:?}"
+        );
+        assert_eq!(c.http1_requests + c.http2_requests, requests, "{c:?}");
+        assert!(!c.observed(), "{c:?}");
+        assert!(
+            snap.apis.iter().all(|a| a.reused_pct == 0.0),
+            "{:?}",
+            snap.apis
+        );
+
+        // The file says whose client carried the requests, and does not describe the
+        // instrumented client it did not use (9.2 wrote that client's `http_version` and
+        // `keep_alive`).
+        let path = super::temp_file("keep-transport");
+        handle.save(&path).unwrap();
+        let doc = super::read_json(&path);
+        let service = doc["service"].as_object().unwrap();
+        assert_eq!(service["http_transport"], "installed", "{service:?}");
+        assert!(!service.contains_key("http_version"), "{service:?}");
+        assert!(!service.contains_key("keep_alive"), "{service:?}");
+        let reqs = doc["rows"]["reqs"].as_array().unwrap();
+        assert_eq!(reqs.len() as u64, requests);
+        assert!(reqs.iter().all(|r| r["conn_id"] == 0), "{reqs:#?}");
     }
 
     /// The default is the opposite, and says so: the layer's instrumented client replaces
@@ -603,6 +631,15 @@ mod host_transport {
         assert!(op.read("k").await.is_err());
         assert_eq!(client.load(Ordering::Relaxed), 0);
         assert_eq!(gate.load(Ordering::Relaxed), 0);
-        assert!(handle.snapshot().resilience.network_errors >= 1);
+        let snap = handle.snapshot();
+        assert!(snap.resilience.network_errors >= 1);
+        assert!(snap.connections.observed(), "{:?}", snap.connections);
+        // The file describes the instrumented client, as every 9.x file does.
+        let path = super::temp_file("own-transport");
+        handle.save(&path).unwrap();
+        let service = super::read_json(&path)["service"].clone();
+        assert_eq!(service["http_version"], "auto", "{service}");
+        assert_eq!(service["keep_alive"], true, "{service}");
+        assert!(service.get("http_transport").is_none(), "{service}");
     }
 }

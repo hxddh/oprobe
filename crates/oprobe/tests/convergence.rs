@@ -8,8 +8,10 @@
 //! the tail but cannot raise goodput when spare workers already keep the service at its limit,
 //! so the throttle-family cases prove on p99; stragglers and serial reads prove on goodput.
 //!
-//! Timing on a loaded machine can blur one short run, so a run that does not show its fault is
-//! repeated (at most 3 times); no test bounds wall-clock time.
+//! No run is repeated until it passes (9.2 retried up to 3 times, which hid scenarios that
+//! decided one time in three). Every scenario decides by construction: its workload sits
+//! well inside or well outside the lab's limit, by arithmetic that holds on a machine twice as
+//! fast or twice as slow (the comments say which), and no test bounds wall-clock time.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -62,23 +64,18 @@ impl Env {
             .unwrap_or_else(|e| panic!("oprobe {args:?}: stdout is not JSON ({e}); {stderr}"))
     }
 
-    /// `oprobe run ARGS` until the report has finding `code` (at most 3 runs); the run's
-    /// report.
-    fn run_until(&self, args: &[&str], code: &str) -> Value {
-        let mut last = Value::Null;
-        for _ in 0..3 {
-            let mut a = vec!["run"];
-            a.extend_from_slice(args);
-            let v = self.json(&a);
-            last = v["runs"][0]["report"].clone();
-            if finding(&last, code).is_some() {
-                return last;
-            }
-        }
-        panic!(
-            "{args:?}: no `{code}` finding in 3 runs: {:#}",
-            last["findings"]
+    /// `oprobe run ARGS`, once: the run's report, which has finding `code`.
+    fn run_finding(&self, args: &[&str], code: &str) -> Value {
+        let mut a = vec!["run"];
+        a.extend_from_slice(args);
+        let r = self.json(&a)["runs"][0]["report"].clone();
+        assert!(
+            finding(&r, code).is_some(),
+            "{args:?}: no `{code}` finding: {:#}\n{:#}",
+            r["findings"],
+            r["capacity"]["hypotheses"]
         );
+        r
     }
 
     /// The finding's `next` command exactly as printed (the output flags aside): it must be an
@@ -145,10 +142,15 @@ fn improved(p: &Value) {
 
 /// An in-flight limit of 8: the cap is sized at the limit and removes the 1 s backoffs from
 /// the tail.
+///
+/// 32 workers against 8 slots: 24 are rejected as soon as they start, however they line up
+/// (a worker that finds no slot is rejected, and sleeps 1 s), so every run throttles. A 1 s
+/// trial holds at most 8 × 1 s / 5 ms = 1 600 operations, of which those 24 are 1.5 % or
+/// more: the baseline's p99 is the backoff on any machine.
 #[test]
 fn an_inflight_limit_is_capped_at_the_limit() {
     let env = Env::new();
-    let r = env.run_until(&["lab://throttle", "-c", "32", "-d", "2s"], "throttling");
+    let r = env.run_finding(&["lab://throttle", "-c", "32", "-d", "2s"], "throttling");
     let f = check_finding(&r, "throttling", Some("layers.concurrent_limit.http"));
     assert_eq!(f["remedy"]["with"][0], "layers.retry.jitter");
     let p = env.prove(
@@ -172,42 +174,36 @@ fn an_inflight_limit_is_capped_at_the_limit() {
     );
 }
 
-/// A token bucket of 300 requests/s: a rate limit, sized from rate × latency so the capped
+/// A token bucket of 100 requests/s: a rate limit, sized from rate × latency so the capped
 /// client stays under the rate. The client retries quickly with jitter: with OpenDAL's default
 /// (1 s, no jitter) the workers wake in step and a 2 s run of a token bucket cannot be told
 /// from an in-flight limit — the remedy path is the same either way.
+///
+/// The lab's numbers decide the cap on every machine (`lab::RATELIMIT_LATENCY_MS`): one
+/// request in flight sends at most 82 requests/s, two at least 133.
 #[test]
 fn a_rate_limit_is_capped_under_the_rate() {
     let env = Env::new();
-    // A loaded machine can starve one short run below the rate: up to 3 runs.
-    let fitted = |r: &Value| {
-        finding(r, "rate_limit")
-            .and_then(|f| f["evidence"]["values"]["fitted_requests_per_s"].as_f64())
-            .unwrap_or(0.0)
-    };
-    let mut r = Value::Null;
-    for _ in 0..3 {
-        r = env.run_until(
-            &[
-                "lab://ratelimit",
-                "-d",
-                "2s",
-                "--set",
-                "layers.retry.min_delay=50ms",
-                "--set",
-                "layers.retry.jitter=on",
-            ],
-            "rate_limit",
-        );
-        if (240.0..=360.0).contains(&fitted(&r)) {
-            break;
-        }
-    }
+    let limit = oprobe::lab::RATELIMIT_REQUESTS_PER_S;
+    let r = env.run_finding(
+        &[
+            "lab://ratelimit",
+            "-d",
+            "2s",
+            "--set",
+            "layers.retry.min_delay=50ms",
+            "--set",
+            "layers.retry.jitter=on",
+        ],
+        "rate_limit",
+    );
     check_finding(&r, "rate_limit", Some("layers.concurrent_limit.http"));
-    let rps = fitted(&r);
+    let rps = finding(&r, "rate_limit").unwrap()["evidence"]["values"]["fitted_requests_per_s"]
+        .as_f64()
+        .unwrap();
     assert!(
-        (240.0..=360.0).contains(&rps),
-        "fitted {rps}/s, the lab allows 300"
+        (limit * 0.8..=limit * 1.2).contains(&rps),
+        "fitted {rps}/s, the lab allows {limit}"
     );
     assert!(
         r["capacity"]["inflight_ceiling"].is_null(),
@@ -219,13 +215,16 @@ fn a_rate_limit_is_capped_under_the_rate() {
         &["--objective", "p99"],
     );
     let n: u64 = sized(&p).parse().unwrap();
-    assert!((1..=3).contains(&n), "sized {n}");
+    assert_eq!(
+        n, 1,
+        "one request in flight fits under the rate, two do not"
+    );
     improved(&p);
-    // The capped client runs at (and not above) the lab's rate.
+    // The capped client runs under the lab's rate.
     for t in p["trials"].as_array().unwrap() {
         if t["kind"] == "candidate" {
             let gp = t["goodput_ops_per_s"].as_f64().unwrap();
-            assert!(gp <= 300.0 * 1.15, "{gp} ops/s over a 300/s limit");
+            assert!(gp <= limit, "{gp} ops/s over a {limit}/s limit");
         }
     }
 }
@@ -233,26 +232,21 @@ fn a_rate_limit_is_capped_under_the_rate() {
 /// The default `lab://ratelimit` (OpenDAL's default retry: 1 s backoff, no jitter) is a rate
 /// limit, not an in-flight limit: the workers wake in step and throttle only above a couple of
 /// requests in flight, but the bursts the bucket serves after each lull are more than any cap
-/// of that size carries (design 6.3 A1). A run that saw no throttling is repeated; no run may
-/// name an in-flight limit.
+/// of that size carries (design 6.3 A1).
+///
+/// 16 workers ask for 16 / 12 ms = 1 300 requests/s of a bucket that refills 100: every run
+/// throttles, on any machine. Between the wakes one worker runs alone (it sends 82
+/// requests/s at most, under the rate), so the bucket refills, and each wake is served a
+/// burst of up to 30 within a few milliseconds.
 #[test]
 fn the_default_rate_limit_lab_is_a_rate_limit() {
     let env = Env::new();
-    let mut found = None;
-    for _ in 0..3 {
-        let v = env.json(&["run", "lab://ratelimit"]);
-        let r = v["runs"][0]["report"].clone();
-        assert!(
-            finding(&r, "throttling").is_none(),
-            "the rate limit read as an in-flight limit: {:#}",
-            r["capacity"]["hypotheses"]
-        );
-        if finding(&r, "rate_limit").is_some() {
-            found = Some(r);
-            break;
-        }
-    }
-    let r = found.expect("a rate_limit finding in 3 runs");
+    let r = env.run_finding(&["lab://ratelimit"], "rate_limit");
+    assert!(
+        finding(&r, "throttling").is_none(),
+        "the rate limit read as an in-flight limit: {:#}",
+        r["capacity"]["hypotheses"]
+    );
     let f = check_finding(&r, "rate_limit", Some("layers.concurrent_limit.http"));
     assert!(
         r["capacity"]["inflight_ceiling"].is_null(),
@@ -284,13 +278,15 @@ fn the_default_rate_limit_lab_is_a_rate_limit() {
     improved(&p);
 }
 
-/// The default `lab://throttle` (48 workers over an in-flight limit of 8): the finding's
+/// The default `lab://throttle` (64 workers over an in-flight limit of 8): the finding's
 /// `next`, run exactly as printed, proves the cap `improved` on p99 (W8: 9.0's `next` named no
-/// objective, and at 16 workers the throttled operations' backoffs sat above the p99).
+/// objective, and at 16 workers the throttled operations' backoffs sat above the p99). The
+/// 56 workers the lab rejects are 1.75 % of the most a 2 s trial can hold
+/// (`lab::THROTTLE_CONCURRENCY`).
 #[test]
 fn the_default_throttle_lab_proves_its_next_command() {
     let env = Env::new();
-    let r = env.run_until(&["lab://throttle"], "throttling");
+    let r = env.run_finding(&["lab://throttle"], "throttling");
     let f = check_finding(&r, "throttling", Some("layers.concurrent_limit.http"));
     let p = env.run_next(&f);
     assert_eq!(p["finding"], "throttling");
@@ -314,7 +310,7 @@ fn the_default_throttle_lab_proves_its_next_command() {
 #[test]
 fn a_hot_key_is_a_key_limit() {
     let env = Env::new();
-    let r = env.run_until(&["lab://hotkey", "-d", "2s"], "key_limit");
+    let r = env.run_finding(&["lab://hotkey", "-d", "2s"], "key_limit");
     let f = finding(&r, "key_limit").unwrap();
     assert!(f["remedy"]["path"].is_null(), "{f:#}");
     let text = f["remedy"]["text"].as_str().unwrap();
@@ -331,22 +327,10 @@ fn a_hot_key_is_a_key_limit() {
         (20.0..=60.0).contains(&rps),
         "fitted {rps}/s per key, the lab allows 40"
     );
-    let o = Command::new(env!("CARGO_BIN_EXE_oprobe"))
-        .env("OPROBE_DATA_DIR", env.path("data"))
-        .env("OPROBE_CONFIG", env.path("config.toml"))
-        .args(["prove", id, "key_limit", "-o", "json"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        o.status.code(),
-        Some(2),
-        "{}",
-        String::from_utf8_lossy(&o.stdout)
-    );
-    let e: Value = serde_json::from_slice(&o.stdout).unwrap();
-    let msg = e["error"]["message"].as_str().unwrap();
+    let e = refused(&env, id, "key_limit");
+    let msg = e["message"].as_str().unwrap();
     assert!(msg.contains("no operator remedy to prove"), "{e:#}");
-    let hint = e["error"]["hint"].as_str().unwrap();
+    let hint = e["hint"].as_str().unwrap();
     assert!(
         hint.contains(&format!("oprobe show {id} --detail")),
         "{hint}"
@@ -358,7 +342,7 @@ fn a_hot_key_is_a_key_limit() {
 #[test]
 fn stragglers_are_cut() {
     let env = Env::new();
-    let r = env.run_until(&["lab://stragglers", "-d", "2s"], "tail_stragglers");
+    let r = env.run_finding(&["lab://stragglers", "-d", "2s"], "tail_stragglers");
     check_finding(&r, "tail_stragglers", Some("layers.tail_cut"));
     let p = env.prove(r["run"]["id"].as_str().unwrap(), "tail_stragglers", &[]);
     assert!(
@@ -379,7 +363,7 @@ fn stragglers_are_cut() {
 #[test]
 fn a_shared_bandwidth_cap_on_reads_is_not_a_layer() {
     let env = Env::new();
-    let r = env.run_until(&["lab://bandwidth", "-d", "2s"], "bandwidth_cap");
+    let r = env.run_finding(&["lab://bandwidth", "-d", "2s"], "bandwidth_cap");
     let f = finding(&r, "bandwidth_cap").unwrap();
     assert!(f["remedy"]["path"].is_null(), "{f:#}");
     let text = f["remedy"]["text"].as_str().unwrap();
@@ -407,7 +391,7 @@ fn a_shared_bandwidth_cap_on_reads_is_not_a_layer() {
 fn retried_transient_failures_prove_a_shorter_backoff() {
     let env = Env::new();
     for scenario in ["lab://flaky", "lab://noisy"] {
-        let r = env.run_until(&[scenario, "-d", "2s"], "errors");
+        let r = env.run_finding(&[scenario, "-d", "2s"], "errors");
         let f = check_finding(&r, "errors", Some("layers.retry.min_delay"));
         assert_eq!(f["remedy"]["with"][0], "layers.retry.jitter", "{f:#}");
         // The errors finding by name: on a slow machine the random 503s can also rank a
@@ -435,7 +419,7 @@ fn retried_transient_failures_prove_a_shorter_backoff() {
 #[test]
 fn serial_reads_on_a_lossy_link_are_split() {
     let env = Env::new();
-    let r = env.run_until(
+    let r = env.run_finding(
         &[
             "lab://lossy",
             "--preset",
@@ -469,16 +453,16 @@ fn serial_reads_on_a_lossy_link_are_split() {
 /// Parquet-like scans (a HEAD, a footer, four column ranges): on OpenDAL's defaults the
 /// ranges are fetched one after another, so `read.concurrent` is the remedy.
 ///
-/// Six workers: with four ranges in flight each they reach the lab's limit of 24 requests in
-/// flight and never cross it, so this proof is about the ranges alone. The lab's default of
-/// eight can cross it (8 × 4 = 32) whenever the workers scan in step: on macOS CI every
-/// candidate trial then began with eight 503s and a second of backoff each, and the proof
-/// was, rightly, inconclusive over `--max-throttle`. The limit has its own test below.
+/// The lab's default of six workers: with four ranges in flight each they reach the lab's limit
+/// of 24 requests in flight and never cross it, so this proof is about the ranges alone. 9.2's
+/// default of eight could cross it (8 × 4 = 32) whenever the workers scanned in step: on macOS
+/// CI every candidate trial then began with eight 503s and a second of backoff each, and the
+/// proof was, rightly, inconclusive over `--max-throttle`. The limit has its own test below.
 #[test]
 fn parquet_ranges_are_fetched_concurrently() {
     let env = Env::new();
-    let r = env.run_until(
-        &["lab://parquet", "-c", "6", "-d", "2s", "--warmup", "300ms"],
+    let r = env.run_finding(
+        &["lab://parquet", "-d", "2s", "--warmup", "300ms"],
         "small_ranges",
     );
     check_finding(&r, "small_ranges", Some("read.concurrent"));
@@ -489,11 +473,12 @@ fn parquet_ranges_are_fetched_concurrently() {
 }
 
 /// The same scans with four ranges in flight per scan cross the lab's limit of 24 requests
-/// in flight: the cap is sized at that limit.
+/// in flight: the cap is sized at that limit. Twelve workers hold up to 48, twice the limit:
+/// they cross it however their scans line up.
 #[test]
 fn parquet_scans_over_the_inflight_limit_are_capped() {
     let env = Env::new();
-    let r = env.run_until(
+    let r = env.run_finding(
         &[
             "lab://parquet",
             "-d",
@@ -521,66 +506,183 @@ fn parquet_scans_over_the_inflight_limit_are_capped() {
     improved(&p);
 }
 
-/// No fault: no limit is invented, and the verdict says one run cannot size a change (N2).
+/// No fault: no limit is invented, and the headline points at no command that would refuse
+/// the run (K2-5: it said "prove sizes a change", and `prove` has nothing to prove here).
 #[test]
 fn a_clean_lab_gets_no_invented_limit() {
     let env = Env::new();
-    for scenario in ["lab://clean", "lab://queueing"] {
-        let v = env.json(&["run", scenario, "-d", "2s"]);
-        let r = &v["runs"][0]["report"];
-        for f in r["findings"].as_array().unwrap() {
-            let code = f["code"].as_str().unwrap();
-            assert!(
-                !["throttling", "rate_limit", "key_limit", "bandwidth_cap"].contains(&code),
-                "{scenario}: invented `{code}`: {f:#}"
-            );
-        }
-        let h = r["verdict"]["headline"].as_str().unwrap();
+    let v = env.json(&["run", "lab://clean", "-d", "2s"]);
+    let r = &v["runs"][0]["report"];
+    for f in r["findings"].as_array().unwrap() {
+        let code = f["code"].as_str().unwrap();
         assert!(
-            !h.contains("concurrency") && !h.contains("run at"),
-            "{scenario}: {h}"
+            !["throttling", "rate_limit", "key_limit", "bandwidth_cap"].contains(&code),
+            "invented `{code}`: {f:#}"
         );
-        // Nothing was throttled, and no confidence is claimed for a limit model.
-        assert_eq!(
-            r["resilience"]["throttled_responses_count"], 0,
-            "{scenario}"
-        );
-        for h in r["capacity"]["hypotheses"].as_array().unwrap() {
-            if scenario == "lab://clean"
-                && h["selected"] == true
-                && h["kind"] != "none"
-                && h["kind"] != "client_bound"
-            {
-                assert_ne!(h["confidence"], "high", "{scenario}: {h}");
-            }
+    }
+    let h = r["verdict"]["headline"].as_str().unwrap();
+    assert!(
+        !h.contains("concurrency") && !h.contains("run at") && !h.contains("prove"),
+        "{h}"
+    );
+    // Nothing was throttled, and no confidence is claimed for a limit model.
+    assert_eq!(r["resilience"]["throttled_responses_count"], 0);
+    for h in r["capacity"]["hypotheses"].as_array().unwrap() {
+        if h["selected"] == true && h["kind"] != "none" && h["kind"] != "client_bound" {
+            assert_ne!(h["confidence"], "high", "{h}");
         }
+    }
+}
+
+/// `oprobe prove ID CODE`, refused: the error.
+fn refused(env: &Env, id: &str, code: &str) -> Value {
+    let o = Command::new(env!("CARGO_BIN_EXE_oprobe"))
+        .env("OPROBE_DATA_DIR", env.path("data"))
+        .env("OPROBE_CONFIG", env.path("config.toml"))
+        .args(["prove", id, code, "-o", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    serde_json::from_slice::<Value>(&o.stdout).unwrap()["error"].clone()
+}
+
+/// `lab://queueing` serves four requests at once and queues the rest, rejecting none: that
+/// is a finding (T5: 9.2's test asserted that there was none). It shows when the load
+/// varies: here an open loop that alternates between 40 and 380 arrivals a second, a tenth
+/// and nineteen twentieths of the 400 the lab serves, so the requests in flight go from one
+/// to many times the four served. Its remedy is advice (K3-8): `next` shows the evidence and
+/// `prove` refuses it.
+///
+/// The finding reads the requests' timing alone, so it is not made of a run whose client
+/// was itself saturated (a machine too loaded to schedule within 5 ms): such a run says
+/// `client_bound`, and this test accepts exactly that.
+#[test]
+fn a_service_that_queues_is_found_when_the_load_varies() {
+    let env = Env::new();
+    let v = env.json(&[
+        "run",
+        "lab://queueing",
+        "-d",
+        "4s",
+        "--set",
+        "shape=step:40,380/1s",
+    ]);
+    let r = &v["runs"][0]["report"];
+    let id = r["run"]["id"].as_str().unwrap();
+    assert_eq!(r["resilience"]["throttled_responses_count"], 0);
+    for code in ["rate_limit", "key_limit", "bandwidth_cap", "errors"] {
+        assert!(finding(r, code).is_none(), "invented `{code}`");
+    }
+    if r["self"]["client_saturated"] == true {
+        assert_eq!(
+            r["findings"][0]["code"], "client_bound",
+            "{:#}",
+            r["findings"]
+        );
+        assert!(finding(r, "throttling").is_none(), "{:#}", r["findings"]);
+        return;
+    }
+    let f = finding(r, "throttling").unwrap_or_else(|| {
+        panic!(
+            "no queueing finding: {:#}\n{:#}\n{:#}",
+            r["findings"], r["capacity"]["hypotheses"], r["self"]
+        )
+    });
+    assert!(finding(r, "client_bound").is_none(), "{:#}", r["findings"]);
+    assert!(
+        f["cause"].as_str().unwrap().contains("queues the rest"),
+        "{f:#}"
+    );
+    let servers = f["evidence"]["values"]["fitted_inflight_count"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (2.0..=8.0).contains(&servers),
+        "{servers}, the lab serves 4 at once"
+    );
+    // Advice: no path, a `next` that shows the evidence, and a prove that says why not.
+    assert!(f["remedy"]["path"].is_null(), "{f:#}");
+    assert_eq!(
+        f["remedy"]["next"].as_str().unwrap(),
+        format!("oprobe show {id} --detail")
+    );
+    let e = refused(&env, id, "throttling");
+    let msg = e["message"].as_str().unwrap();
+    assert!(msg.contains("no operator remedy to prove"), "{e:#}");
+    assert!(
+        e["hint"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("oprobe show {id} --detail")),
+        "{e:#}"
+    );
+}
+
+/// The same lab under a steady closed loop varies no load: no limit is asserted, and the
+/// headline says how to vary it instead of pointing at `prove` (K2-5).
+#[test]
+fn a_steady_run_of_a_queueing_service_says_how_to_vary_the_load() {
+    let env = Env::new();
+    let v = env.json(&["run", "lab://queueing", "-d", "2s"]);
+    let r = &v["runs"][0]["report"];
+    for code in ["throttling", "rate_limit", "key_limit", "bandwidth_cap"] {
+        assert!(
+            finding(r, code).is_none(),
+            "invented `{code}`: {:#}",
+            r["findings"]
+        );
+    }
+    let h = r["verdict"]["headline"].as_str().unwrap();
+    assert!(!h.contains("prove") && !h.contains("Inconclusive"), "{h}");
+    if r["findings"].as_array().unwrap().is_empty() {
+        assert!(h.contains("The load was not varied"), "{h}");
+        assert!(h.contains("--set shape=ramp:"), "{h}");
     }
 }
 
 /// The first impression (6.3): `oprobe demo`, then `oprobe prove last` with every default — the
 /// top finding's remedy, the default objective (goodput) and no budget flag — proves
 /// `improved`, within `--max-throttle` (7.0: the lab's in-flight limit leaves room for the
-/// stragglers' re-issues).
+/// stragglers' re-issues, on any machine: `lab::DEMO_CONCURRENCY`).
+///
+/// One request in 40 of the lab is a straggler, by count: every run has them, and they are
+/// the top finding unless the machine running the test is itself saturated — the run then
+/// leads with `client_bound`, says so, and the stragglers (250 ms against a lag of a few) are
+/// kept below it and proved by name.
 #[test]
 fn the_demo_proves_its_top_finding() {
     let env = Env::new();
-    let mut r = Value::Null;
-    for _ in 0..3 {
-        r = env.json(&["demo"])["runs"][0]["report"].clone();
-        if r["findings"][0]["code"] == "tail_stragglers" {
-            break;
-        }
-    }
+    let r = env.json(&["demo"])["runs"][0]["report"].clone();
+    assert!(
+        finding(&r, "tail_stragglers").is_some(),
+        "{:#}",
+        r["findings"]
+    );
+    let saturated = r["self"]["client_saturated"] == true;
     let top = &r["findings"][0];
-    assert_eq!(top["code"], "tail_stragglers", "{:#}", r["findings"]);
-    if let Some(t) = finding(&r, "throttling") {
-        assert_ne!(
-            t["severity"], "critical",
-            "throttling that costs no goodput: {t:#}"
-        );
-    }
+    assert_eq!(
+        top["code"],
+        if saturated {
+            "client_bound"
+        } else {
+            "tail_stragglers"
+        },
+        "{:#}",
+        r["findings"]
+    );
+    // Sixteen workers never reach the lab's limit of 40 in flight.
+    assert!(finding(&r, "throttling").is_none(), "{:#}", r["findings"]);
     let started = std::time::Instant::now();
-    let p = env.json(&["prove", "last"]);
+    let p = if saturated {
+        env.json(&["prove", "last", "tail_stragglers"])
+    } else {
+        env.json(&["prove", "last"])
+    };
     assert_eq!(p["finding"], "tail_stragglers", "{p:#}");
     assert_eq!(p["objective"], "goodput");
     // Proven, and within --max-throttle (design 7 A2): the lab leaves room for the re-issues.

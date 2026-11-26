@@ -407,6 +407,14 @@ impl ReqRow {
     pub fn connect_us(&self) -> u64 {
         self.dns_us + self.tcp_us + self.proxy_us + self.tls_us
     }
+    /// Whether the request was answered on a connection nobody observed: it went through a
+    /// transport the layer only wraps (`Config::keep_http_transport`), so a response arrived
+    /// and there is no connection id. `reused` says nothing then, there are no dial phases
+    /// and no `send_us`: connecting and sending the body are part of `ttfb_us` (a slow upload
+    /// is a long time to first byte, not a server that hangs).
+    pub fn connection_unobserved(&self) -> bool {
+        self.conn_id == 0 && self.status != 0 && self.protocol != WireProtocol::Inproc
+    }
     pub fn is_throttle(&self) -> bool {
         FailureCode::is_throttle_response(
             self.status,

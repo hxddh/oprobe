@@ -19,7 +19,8 @@
 //! No descriptor is ever duplicated, so no connection is kept open by oprobe.
 //!
 //! Cost: three syscalls per sample (≈1–3 µs), once per request (retransmits are attributed
-//! per request). The descriptor of a connection inside reqwest is found by scanning the
+//! per request), and once more at the response headers of an upload whose connection was
+//! known while it sent. The descriptor of a connection inside reqwest is found by scanning the
 //! process's descriptor table: [`SockFinder`] does that on the runtime's blocking pool, never
 //! on a worker thread, and one scan answers every connection dialed meanwhile.
 
@@ -46,18 +47,41 @@ impl SockId {
 
 /// Who a connection's retransmits are charged to. The kernel counts retransmitted segments
 /// per connection, and an HTTP/2 connection carries many requests at once, so the count is
-/// read when a request ends and what it grew by since the previous reading is split evenly
-/// among the requests in flight on the connection at that moment (the indivisible rest goes to
-/// the one ending). Every retransmit is charged exactly once: the charges of a connection's
-/// requests add up to the growth of its counter. On HTTP/1.1 one request is in flight at a
-/// time and is charged everything since the previous request ended.
+/// read at the events of its requests and what it grew by since the previous reading is
+/// charged to the requests in flight at that moment:
+///
+/// - to the ones **sending a request body**, when there are any: what a client retransmits is
+///   what it sends, and next to an upload a request that only waits for its response sends
+///   nothing. A request counts as sending from the moment the transport knows which
+///   connection carries its body ([`Self::open_sending`]) until its response headers arrive
+///   ([`Self::sent`]);
+/// - else evenly to all of them.
+///
+/// The indivisible rest goes to the request the reading belongs to (to the first one charged
+/// when that one is not among them). Every retransmit is charged exactly once: the charges of
+/// a connection's requests add up to the growth of its counter. On HTTP/1.1 one request is in
+/// flight at a time and is charged everything since the previous request ended.
+///
+/// What remains: an upload whose connection the transport cannot tell while it sends (several
+/// uploads at once, or several connections with none holding unsent bytes) joins at its
+/// response headers. On HTTP/2 a request that ends on the same connection before that is
+/// charged the upload's retransmits so far.
 #[derive(Debug, Default)]
 pub struct RetransLedger {
     /// The connection's counter at the previous reading (`None`: never read).
     seen: Option<u64>,
-    /// The requests in flight: (stream, retransmits charged to it so far).
-    open: Vec<(u64, u64)>,
+    /// The requests in flight.
+    open: Vec<LedgerStream>,
     next_stream: u64,
+}
+
+#[derive(Debug)]
+struct LedgerStream {
+    id: u64,
+    /// Retransmits charged to it so far.
+    charged: u64,
+    /// Its request body is on its way.
+    sending: bool,
 }
 
 impl RetransLedger {
@@ -70,31 +94,87 @@ impl RetransLedger {
         }
     }
 
-    /// A request starts using the connection: its stream.
+    /// A request starts using the connection (its response headers arrived): its stream.
     pub fn open(&mut self) -> u64 {
+        self.join(false)
+    }
+
+    /// A request starts sending its body on the connection: its stream.
+    pub fn open_sending(&mut self) -> u64 {
+        self.join(true)
+    }
+
+    fn join(&mut self, sending: bool) -> u64 {
         self.next_stream += 1;
-        self.open.push((self.next_stream, 0));
+        self.open.push(LedgerStream {
+            id: self.next_stream,
+            charged: 0,
+            sending,
+        });
         self.next_stream
+    }
+
+    fn position(&self, stream: u64) -> Option<usize> {
+        self.open.iter().position(|s| s.id == stream)
+    }
+
+    /// The counter reads `total` at an event of the stream at `at`: charge what it grew by.
+    /// Readings may arrive out of order (two requests ending at once): the counter never
+    /// goes back, so a stale reading settles nothing.
+    fn settle(&mut self, at: usize, total: u64) {
+        let grown = self.seen.map_or(0, |seen| total.saturating_sub(seen));
+        self.seen = Some(self.seen.map_or(total, |seen| seen.max(total)));
+        if grown == 0 {
+            return;
+        }
+        let uploading = self.open.iter().any(|s| s.sending);
+        let charged = |s: &LedgerStream| s.sending || !uploading;
+        let n = self.open.iter().filter(|s| charged(s)).count() as u64;
+        for s in self.open.iter_mut().filter(|s| charged(s)) {
+            s.charged += grown / n;
+        }
+        let rest = if charged(&self.open[at]) {
+            at
+        } else {
+            self.open.iter().position(charged).unwrap_or(at)
+        };
+        self.open[rest].charged += grown % n;
+    }
+
+    /// The response headers of `stream` arrived while the counter reads `total` (`None`:
+    /// unreadable now): its body is sent, and what the counter grew by while it was sending
+    /// is settled.
+    pub fn sent(&mut self, stream: u64, total: Option<u64>) {
+        let Some(at) = self.position(stream) else {
+            return;
+        };
+        if let Some(total) = total {
+            self.settle(at, total);
+        }
+        self.open[at].sending = false;
     }
 
     /// `stream` ends while the connection's counter reads `total` (`None`: unreadable now):
     /// settle the growth among the streams in flight and return what `stream` was charged.
-    /// Readings may arrive out of order (two requests ending at once): the counter never
-    /// goes back, so a stale reading settles nothing.
     pub fn close(&mut self, stream: u64, total: Option<u64>) -> u64 {
-        let Some(at) = self.open.iter().position(|(id, _)| *id == stream) else {
+        let Some(at) = self.position(stream) else {
             return 0;
         };
         if let Some(total) = total {
-            let grown = self.seen.map_or(0, |seen| total.saturating_sub(seen));
-            self.seen = Some(self.seen.map_or(total, |seen| seen.max(total)));
-            let n = self.open.len() as u64;
-            for (_, charged) in &mut self.open {
-                *charged += grown / n;
-            }
-            self.open[at].1 += grown % n;
+            self.settle(at, total);
         }
-        self.open.swap_remove(at).1
+        self.open.swap_remove(at).charged
+    }
+
+    /// `stream` was not on this connection after all (the transport's guess at send was
+    /// wrong): what it was charged is owed again, to whoever is in flight at the next
+    /// reading.
+    pub fn abandon(&mut self, stream: u64) {
+        let Some(at) = self.position(stream) else {
+            return;
+        };
+        let charged = self.open.swap_remove(at).charged;
+        self.seen = self.seen.map(|seen| seen.saturating_sub(charged));
     }
 }
 
@@ -137,6 +217,24 @@ impl TcpProbe {
         self.ledger().open()
     }
 
+    /// A request starts sending its body on the connection: the stream to hand to
+    /// [`Self::stream_sent`] when its response headers arrive, or back to
+    /// [`Self::abandon_stream`] when they arrive on another connection.
+    pub fn open_sending_stream(&self) -> u64 {
+        self.ledger().open_sending()
+    }
+
+    /// The response headers of the sending `stream` arrived (one reading of the connection).
+    pub fn stream_sent(&self, stream: u64) {
+        let total = self.id.query().map(|r| r.retrans);
+        self.ledger().sent(stream, total);
+    }
+
+    /// `stream` was not on this connection.
+    pub fn abandon_stream(&self, stream: u64) {
+        self.ledger().abandon(stream);
+    }
+
     /// The request of `stream` ended: the connection's statistics now (`None` when it is
     /// already closed) and the retransmitted segments charged to the request (every request
     /// is sampled: the charges need every reading, design v5 §3 M9).
@@ -167,6 +265,11 @@ impl TcpProbe {
     /// Raw statistics without touching the retransmit baseline (upload-acknowledgement polls).
     pub fn peek(&self) -> Option<TcpRow> {
         self.id.query()
+    }
+
+    /// Whether this is the probe of connection `addr`.
+    pub fn is_of(&self, addr: ConnAddr) -> bool {
+        (self.id.local, self.id.remote) == addr
     }
 }
 
@@ -218,28 +321,56 @@ impl SockFinder {
             return None;
         }
         let runtime = tokio::runtime::Handle::try_current().ok()?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let start = {
-            let mut q = self.queue.lock().ok()?;
-            q.pending.push((addr, tx));
-            !std::mem::replace(&mut q.scanning, true)
-        };
-        if start {
-            let finder = self.clone();
-            runtime.spawn_blocking(move || finder.drain());
+        // A scan that its runtime dropped answers nobody. The lookup may have waited for the
+        // scan of another runtime (the finder is its operator's): it asks once more, and its
+        // own runtime scans.
+        for _ in 0..2 {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let start = {
+                let mut q = self.queue();
+                q.pending.push((addr, tx));
+                !std::mem::replace(&mut q.scanning, true)
+            };
+            if start {
+                let mut scan = Scan {
+                    finder: self.clone(),
+                    done: false,
+                };
+                runtime.spawn_blocking(move || scan.drain());
+            }
+            if let Ok(found) = rx.await {
+                return found;
+            }
         }
-        rx.await.ok().flatten()
+        None
     }
 
+    fn queue(&self) -> std::sync::MutexGuard<'_, FinderQueue> {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The blocking task that answers a finder's queue. The runtime may drop it without running
+/// it (a runtime shut down while the task waits for a thread of its blocking pool), and the
+/// finder outlives the runtime when its operator does: dropped before it finished, it gives
+/// the queue back, so the lookups waiting for it wake (and ask again, once) and the next
+/// lookup starts a scan on its own runtime. 9.2 left `scanning` set, and every later lookup
+/// waited for ever.
+struct Scan {
+    finder: Arc<SockFinder>,
+    done: bool,
+}
+
+impl Scan {
     /// Answer every queued lookup, one scan per batch, until the queue is empty.
-    fn drain(&self) {
+    fn drain(&mut self) {
         loop {
             let batch = {
-                let Ok(mut q) = self.queue.lock() else {
-                    return;
-                };
+                let mut q = self.finder.queue();
                 if q.pending.is_empty() {
+                    // Under the lock: a lookup queued from now on starts its own scan.
                     q.scanning = false;
+                    self.done = true;
                     return;
                 }
                 std::mem::take(&mut q.pending)
@@ -250,6 +381,21 @@ impl SockFinder {
                 let _ = tx.send(found);
             }
         }
+    }
+}
+
+impl Drop for Scan {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let waiting = {
+            let mut q = self.finder.queue();
+            q.scanning = false;
+            std::mem::take(&mut q.pending)
+        };
+        // Dropping a sender wakes its lookup.
+        drop(waiting);
     }
 }
 
@@ -813,45 +959,137 @@ mod tests {
         assert_eq!(SCANS.with(|n| n.get()), before);
     }
 
-    /// Whatever the order in which the requests of a shared connection start and end, and
-    /// however the readings of its counter interleave, the retransmits charged to them add up
-    /// to what the counter grew by: nothing is charged twice, nothing is lost.
+    /// A runtime that is shutting down drops the scan without running it, and the finder
+    /// outlives the runtime with its operator: a lookup on the runtime that is gone is
+    /// answered (nothing found), one that waited for that scan from another runtime is
+    /// answered by a scan of its own, and so is every later one (9.2 left the finder
+    /// scanning: none of them ever returned).
+    #[test]
+    fn a_scan_dropped_by_its_runtime_gives_the_queue_back() {
+        if !SUPPORTED {
+            return;
+        }
+        let runtime = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let finder = Arc::new(SockFinder::default());
+        // What is spawned on the blocking pool of a runtime that shut down is dropped.
+        let gone = runtime();
+        let handle = gone.handle().clone();
+        drop(gone);
+        let nowhere: ConnAddr = (
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+        );
+        let lost = {
+            let _in_its_context = handle.enter();
+            futures::FutureExt::now_or_never(finder.find(nowhere))
+        };
+        assert_eq!(lost, Some(None), "answered when its scan was dropped");
+
+        let alive = runtime();
+        alive.block_on(async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (client, _server) =
+                tokio::join!(tokio::net::TcpStream::connect(l.local_addr().unwrap()), l.accept());
+            let client = client.unwrap();
+            let id = sock_id_of(&client).unwrap();
+            let bound = std::time::Duration::from_secs(120);
+            let never_stuck = |lookup| tokio::time::timeout(bound, lookup);
+
+            // A lookup that waits for a scan queued on the runtime that is gone: when that
+            // scan is dropped, it asks again and this runtime scans.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            {
+                let mut q = finder.queue();
+                q.pending.push((nowhere, tx));
+                q.scanning = true;
+            }
+            let mut waiting = Box::pin(finder.find((id.local, id.remote)));
+            assert!(futures::poll!(&mut waiting).is_pending());
+            drop(Scan {
+                finder: finder.clone(),
+                done: false,
+            });
+            assert!(rx.await.is_err(), "the lookup of the lost runtime wakes too");
+            let found = never_stuck(waiting).await.expect("the finder is not stuck");
+            assert_eq!(found, Some(id));
+            // And the finder is idle again: the next lookup starts its own scan.
+            let found = never_stuck(Box::pin(finder.find((id.local, id.remote)))).await;
+            assert_eq!(found.expect("the finder is not stuck"), Some(id));
+        });
+    }
+
+    /// Whatever the order in which the requests of a shared connection start, send and end,
+    /// and however the readings of its counter interleave, the retransmits charged to them
+    /// add up to what the counter grew by: nothing is charged twice, nothing is lost.
     #[test]
     fn retransmits_of_a_shared_connection_are_charged_exactly_once() {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(0x0b5e_55ed);
-        for _ in 0..200 {
+        for _ in 0..400 {
             let seed = rng.gen_range(0..50u64);
             let mut ledger = RetransLedger::seeded(Some(seed));
             let mut kernel = seed;
             let mut open: Vec<u64> = Vec::new();
             let mut charged = 0u64;
-            let mut read = seed;
             for _ in 0..rng.gen_range(1..80) {
                 kernel += rng.gen_range(0..4u64);
-                if open.is_empty() || rng.gen_bool(0.5) {
-                    open.push(ledger.open());
-                } else {
-                    let stream = open.swap_remove(rng.gen_range(0..open.len()));
-                    // Two requests ending at once may hand in their readings out of order.
-                    let reading = if rng.gen_bool(0.2) {
-                        rng.gen_range(seed..=kernel)
-                    } else {
-                        kernel
-                    };
-                    // And a connection that just closed cannot be read at all.
-                    let reading = rng.gen_bool(0.9).then_some(reading);
-                    charged += ledger.close(stream, reading);
-                    read = read.max(reading.unwrap_or(seed));
+                // Two requests ending at once may hand in their readings out of order, and
+                // a connection that just closed cannot be read at all.
+                let stale = rng.gen_bool(0.2).then(|| rng.gen_range(seed..=kernel));
+                let reading = rng.gen_bool(0.9).then_some(stale.unwrap_or(kernel));
+                let pick = rng.gen_range(0..open.len().max(1));
+                match rng.gen_range(0..10) {
+                    _ if open.is_empty() => open.push(ledger.open()),
+                    0..=2 => open.push(ledger.open()),
+                    // An upload whose connection is known while it sends.
+                    3..=4 => open.push(ledger.open_sending()),
+                    // Response headers (an upload's, or again: nothing is settled twice).
+                    5 => ledger.sent(open[pick], reading),
+                    // The connection was guessed wrong: what it was charged is owed again.
+                    6 => ledger.abandon(open.swap_remove(pick)),
+                    _ => charged += ledger.close(open.swap_remove(pick), reading),
                 }
+                // At every step: what is charged, to the requests that ended and to the
+                // ones in flight, is what the readings showed.
+                let in_flight: u64 = ledger.open.iter().map(|s| s.charged).sum();
+                assert_eq!(charged + in_flight, ledger.seen.unwrap() - seed);
             }
+            // One last request reads the counter as it is: everything is charged.
+            open.push(ledger.open());
             for stream in open {
                 charged += ledger.close(stream, Some(kernel));
-                read = kernel;
             }
-            // Everything the readings showed, and nothing else.
-            assert_eq!(charged, read - seed);
+            assert_eq!(charged, kernel - seed);
         }
+
+        // An upload retransmits while a small GET on its HTTP/2 connection ends: the
+        // retransmits are the upload's, not the GET's (9.2 opened a stream at its response
+        // headers, so the GET, alone past its headers, was charged all five).
+        let mut h2 = RetransLedger::seeded(Some(0));
+        let get = h2.open();
+        let put = h2.open_sending();
+        assert_eq!(h2.close(get, Some(5)), 0);
+        // Two more until the upload's response headers; past them it shares like any other.
+        h2.sent(put, Some(7));
+        let other = h2.open();
+        assert_eq!(h2.close(other, Some(10)), 2);
+        assert_eq!(h2.close(put, Some(10)), 5 + 2 + 1);
+        // Two uploads share what is retransmitted while both send.
+        let mut h2 = RetransLedger::seeded(Some(0));
+        let (get, a, b) = (h2.open(), h2.open_sending(), h2.open_sending());
+        assert_eq!(h2.close(get, Some(5)), 0);
+        assert_eq!((h2.close(a, Some(5)), h2.close(b, Some(5))), (3, 2));
+        // A stream opened on the wrong connection gives back what it was charged.
+        let mut h1 = RetransLedger::seeded(Some(0));
+        let (get, guess) = (h1.open(), h1.open_sending());
+        h1.sent(guess, Some(4));
+        h1.abandon(guess);
+        assert_eq!(h1.close(get, Some(4)), 4);
 
         // One request at a time (HTTP/1.1): each is charged what happened since the last.
         let mut h1 = RetransLedger::seeded(Some(10));

@@ -694,28 +694,17 @@ impl TimelineView {
             let width = interval_width(r, p, i + 1 == n);
             // The last interval ends with the window (the charts end where the tiles do).
             let len = if i + 1 == n { width } else { interval_len(p) };
-            // Reports before 6.3 carry no exact counts: derive them from the rates.
-            let ops = if p.ops_count > 0 {
-                p.ops_count
-            } else {
-                (p.ops_per_s * width).round().max(0.0) as u64
-            };
             v.t_s.push(p.t_s);
             v.len_s.push(len);
             v.ops_per_s.push(p.ops_per_s);
-            v.goodput_ops_per_s.push(if p.ops_count > 0 {
-                p.goodput_ops_per_s
-            } else {
-                // Before 6.3 failures counted by operation start, like the operations.
-                (p.ops_per_s - p.errors as f64 / width).max(0.0)
-            });
+            v.goodput_ops_per_s.push(p.goodput_ops_per_s);
             v.mib_per_s.push(p.mib_per_s);
             v.p50_ms.push(p.p50_ms);
             v.p90_ms.push(p.p90_ms);
             v.p99_ms.push(p.p99_ms);
             v.p999_ms.push(p.p999_ms);
             v.max_ms.push(p.max_ms);
-            v.ops_count.push(ops);
+            v.ops_count.push(p.ops_count);
             v.throttled_count.push(p.throttled);
             v.errors_count.push(p.errors);
             v.requests_per_s.push(p.requests_per_s);
@@ -984,12 +973,6 @@ fn window_points(r: &Report) -> std::borrow::Cow<'_, [crate::trace::TimelinePoin
     let last_i = pts.len() - 1;
     let width = interval_width(r, &pts[last_i], true);
     let p = &mut pts[last_i];
-    // Requests as a count (reports before 6.3 carry only the rate).
-    let mut requests = if p.requests_count > 0 {
-        p.requests_count as f64
-    } else {
-        p.requests_per_s * width
-    };
     for s in &r.timeline[inside..] {
         p.errors += s.errors;
         p.throttled += s.throttled;
@@ -999,11 +982,6 @@ fn window_points(r: &Report) -> std::borrow::Cow<'_, [crate::trace::TimelinePoin
         p.new_connections += s.new_connections;
         p.inflight_peak = p.inflight_peak.max(s.inflight_peak);
         p.requests_count += s.requests_count;
-        requests += if s.requests_count > 0 {
-            s.requests_count as f64
-        } else {
-            s.requests_per_s * interval_len(s)
-        };
         for v in &s.verbs {
             if let Some(x) = p.verbs.iter_mut().find(|x| x.verb == v.verb) {
                 x.errors_count += v.errors_count;
@@ -1018,7 +996,7 @@ fn window_points(r: &Report) -> std::borrow::Cow<'_, [crate::trace::TimelinePoin
             }
         }
     }
-    p.requests_per_s = requests / width.max(1e-9);
+    p.requests_per_s = p.requests_count as f64 / width.max(1e-9);
     std::borrow::Cow::Owned(pts)
 }
 
@@ -1091,8 +1069,10 @@ pub struct TcpView {
 }
 
 impl TcpView {
-    /// `rtt p50/p99 1.2ms/3.4ms · 2 of 16 connections retransmitted · rwnd-limited 3.0% ·
-    /// sndbuf-limited 0.0% · delivery p50 812 Mbit/s`.
+    /// `rtt p50/p99 1.2ms/3.4ms · 2 of 16 connections in use retransmitted · rwnd-limited
+    /// 3.0% · sndbuf-limited 0.0% · delivery p50 812 Mbit/s`. The connections are the ones
+    /// that carried the window's requests: a connection dialed and left idle (a pool keeps
+    /// one more than it uses at a time) is among the dialed, not among these.
     pub fn line(&self) -> String {
         use crate::util::fmt_ms;
         let min = self
@@ -1106,7 +1086,7 @@ impl TcpView {
             })
             .unwrap_or_default();
         let mut s = format!(
-            "{min}smoothed rtt p50/p99 {}/{} · {} of {} connections retransmitted · rwnd-limited {:.1}% · sndbuf-limited {:.1}%",
+            "{min}smoothed rtt p50/p99 {}/{} · {} of {} connections in use retransmitted · rwnd-limited {:.1}% · sndbuf-limited {:.1}%",
             fmt_ms(self.rtt_p50_us as f64 / 1000.0),
             fmt_ms(self.rtt_p99_us as f64 / 1000.0),
             self.retransmitting_connections_count,
@@ -1226,7 +1206,14 @@ impl ColdStartView {
 /// handshakes and the cold start. The one model of the Connections section of every front end.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectionView {
-    /// `http/1.1 · plain`, `h2 · TLSv1.3 · …`.
+    /// Whether the connections were observed (`ConnStats::observed`). They were not when the
+    /// profiled operator kept its own HTTP client (oprobe-trace's
+    /// `Config::keep_http_transport`): the dials, the reuse and the dial phases are then
+    /// unknown, which every front end says instead of "0 dialed" and "0 % warm", and each
+    /// request's time to first byte includes connecting and sending its body.
+    pub observed: bool,
+    /// `http/1.1 · plain`, `h2 · TLSv1.3 · …`; the protocols of the responses alone when the
+    /// connections were not observed.
     pub protocol: String,
     /// `TLSv1.3 · h2` (empty for plain connections).
     pub tls: String,
@@ -1258,8 +1245,20 @@ impl ConnectionView {
     pub fn of(r: &Report, run: Option<&Run>) -> Self {
         let c = &r.connections;
         let n = &r.network;
+        let observed = c.observed();
         Self {
-            protocol: super::connection_protocol(c),
+            observed,
+            protocol: if observed {
+                super::connection_protocol(c)
+            } else {
+                // Whether they were encrypted is the client's to know.
+                [("http/1.1", c.http1_requests), ("h2", c.http2_requests)]
+                    .iter()
+                    .filter(|(_, requests)| *requests > 0)
+                    .map(|(protocol, _)| *protocol)
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            },
             tls: [c.tls_version.as_str(), c.alpn.as_str()]
                 .iter()
                 .filter(|s| !s.is_empty())
@@ -1345,9 +1344,34 @@ impl ConnectionView {
         }
     }
 
+    /// What every front end says where a count of connections would stand, when they were
+    /// not observed.
+    pub const NOT_OBSERVED: &'static str = "not observed";
+
+    /// `99.6% of requests warm`; `reuse not observed` when the connections were not.
+    pub fn reuse_line(&self) -> String {
+        if self.observed {
+            format!("{:.1}% of requests warm", self.reuse_ratio * 100.0)
+        } else {
+            format!("reuse {}", Self::NOT_OBSERVED)
+        }
+    }
+
+    /// Why the connections were not observed and what that does to the stages, for a
+    /// profile where they were not.
+    pub fn unobserved_note(&self) -> Option<&'static str> {
+        (!self.observed).then_some(
+            "the requests went through the operator's own HTTP client: connecting and sending are part of ttfb",
+        )
+    }
+
     /// The connections dialed, each count with its window: `28 dialed during warm-up · 1 in
-    /// the window` (the window alone when nothing was dialed during a warm-up).
+    /// the window` (the window alone when nothing was dialed during a warm-up); `dials not
+    /// observed` when the connections were not.
     pub fn dials_line(&self) -> String {
+        if !self.observed {
+            return format!("dials {}", Self::NOT_OBSERVED);
+        }
         if self.warmup_dialed_count > 0 {
             format!(
                 "{} dialed during warm-up · {} in the window",
@@ -2061,15 +2085,14 @@ fn compare_apis(reports: &[&Report]) -> Vec<CompareApi> {
 ///    sampled away and no censored open-loop arrival the rows cannot show;
 /// 2. the run's latency histogram (`report.latency_histogram`: every operation, 20 bins per
 ///    decade, each point at its bin's upper bound) — never biased by row sampling, which
-///    keeps the slowest and failed operations always and so over-weighs the tail;
-/// 3. the heatmap's 20 coarse rows (reports before 6.3).
+///    keeps the slowest and failed operations always and so over-weighs the tail.
 ///
 /// At most [`LatencyCdf::MAX_POINTS`] points.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LatencyCdf {
     /// `(latency ms, share 0–1)`, latency ascending, the share reaching 1.
     pub pts: Vec<(f64, f64)>,
-    /// From the exact trace rows (otherwise from the histogram or the heatmap's rows).
+    /// From the exact trace rows (otherwise from the histogram).
     pub exact: bool,
 }
 
@@ -2138,35 +2161,7 @@ impl LatencyCdf {
             }
             return Self { pts, exact: false };
         }
-        let h = &r.heatmap;
-        let rows = h.latency_buckets_ms.len();
-        let mut per_row = vec![0u64; rows];
-        for col in &h.counts {
-            for (i, c) in col.iter().enumerate().take(rows) {
-                per_row[i] += c;
-            }
-        }
-        let total: u64 = per_row.iter().sum();
-        if total == 0 {
-            return Self::default();
-        }
-        let mut acc = 0u64;
-        let mut pts = Vec::new();
-        for (i, c) in per_row.iter().enumerate() {
-            if *c == 0 {
-                continue;
-            }
-            acc += c;
-            // A bucket's operations are at or below its upper bound (the open last bucket: twice
-            // its lower bound).
-            let upper = h
-                .latency_buckets_ms
-                .get(i + 1)
-                .copied()
-                .unwrap_or(h.latency_buckets_ms[i] * 2.0);
-            pts.push((upper, acc as f64 / total as f64));
-        }
-        Self { pts, exact: false }
+        Self::default()
     }
 
     /// The tail of the distribution: `(latency ms, share of operations at or slower than
@@ -2589,7 +2584,8 @@ pub struct TrustView {
     /// Objects read back and verified, and those that came back corrupted.
     pub verified_count: u64,
     pub corrupted_count: u64,
-    /// The run's checks that failed (a corrupted object, too many failed operations).
+    /// The run's checks that failed (a corrupted object, too many failed operations, an open
+    /// loop that stalled).
     pub breaches: Vec<String>,
 }
 
@@ -3284,7 +3280,7 @@ mod tests {
     }
 
     #[test]
-    fn the_latency_cdf_rises_to_one_from_rows_or_buckets() {
+    fn the_latency_cdf_rises_to_one_from_rows() {
         let run = crate::report::fixture::run();
         let exact = LatencyCdf::of(&run.report, Some(&run));
         assert!(exact.exact);
@@ -3295,19 +3291,8 @@ mod tests {
                 .windows(2)
                 .all(|w| w[0].0 <= w[1].0 && w[0].1 <= w[1].1)
         );
-        let mut r = run.report.clone();
-        r.heatmap.latency_buckets_ms = vec![0.0, 1.0, 10.0];
-        r.heatmap.counts = vec![vec![0, 3, 1], vec![0, 0, 4]];
-        let b = LatencyCdf::of(&r, None);
-        assert!(!b.exact);
-        // Sampled rows over-weigh the tail: the buckets, which count every operation, are used.
-        let mut sampled = run.clone();
-        sampled.report = r.clone();
-        sampled.report.sampling.kept_ratio = 0.5;
-        sampled.report.sampling.seen_ops_count = 100;
-        assert_eq!(LatencyCdf::of(&sampled.report, Some(&sampled)), b);
-        assert_eq!(b.pts, vec![(10.0, 3.0 / 8.0), (20.0, 1.0)]);
-        assert_eq!(b.quantile(0.5), Some(20.0));
+        // No rows and no histogram: no distribution.
+        assert_eq!(LatencyCdf::of(&run.report, None), LatencyCdf::default());
     }
 
     /// A log-normal-ish known distribution: 1 000 operations, 1 % at 100 ms.
@@ -3404,17 +3389,6 @@ mod tests {
         assert_eq!(read.errors_count, vec![0, 50, 0]);
         assert_eq!(read.p99_ms, vec![20.0, 20.0, 20.0]);
         assert!(TimelineView::for_verb(&r, "stat").is_none());
-        // Reports before 6.3: goodput from the rate less the failures (both by start).
-        let mut old = r.clone();
-        old.timeline = vec![crate::trace::TimelinePoint {
-            len_s: 1.0,
-            ops_per_s: 10.0,
-            errors: 4,
-            ..Default::default()
-        }];
-        let v = TimelineView::of(&old);
-        assert_eq!(v.ops_count, vec![10]);
-        assert_eq!(v.goodput_ops_per_s, vec![6.0]);
     }
 
     #[test]
@@ -3607,7 +3581,7 @@ mod tests {
         let tcp = v.tcp.as_ref().unwrap();
         assert_eq!(
             tcp.line(),
-            "smoothed rtt p50/p99 1.20ms/3.40ms · 2 of 16 connections retransmitted · rwnd-limited 3.0% · sndbuf-limited 0.0% · delivery p50 812 Mbit/s"
+            "smoothed rtt p50/p99 1.20ms/3.40ms · 2 of 16 connections in use retransmitted · rwnd-limited 3.0% · sndbuf-limited 0.0% · delivery p50 812 Mbit/s"
         );
         // One count of dials, each with its window (K18): 16 in the warm-up's cold start.
         assert_eq!(v.warmup_dialed_count, 16);
@@ -3642,6 +3616,35 @@ mod tests {
         );
         assert!(!quiet.networked());
         assert_eq!(quiet.dials_line(), "0 dialed in the window");
+    }
+
+    /// A profile whose operator kept its own HTTP client (oprobe-trace's
+    /// `keep_http_transport`): its connections were not observed, and the view says so
+    /// instead of counting (9.2: "0 dialed in the window · 100.0% of requests warm" on
+    /// "http/1.1 · plain", whatever the client did).
+    #[test]
+    fn unobserved_connections_are_not_reported_as_none_dialed_and_all_warm() {
+        let mut r = crate::report::fixture::report();
+        let c = &mut r.connections;
+        c.requests = 100;
+        c.http2_requests = 100;
+        c.peak_inflight_requests = 8;
+        let v = ConnectionView::of(&r, None);
+        assert!(v.networked() && !v.observed);
+        assert_eq!(v.dials_line(), "dials not observed");
+        assert_eq!(v.reuse_line(), "reuse not observed");
+        assert_eq!(v.protocol, "h2");
+        assert!(v.unobserved_note().is_some_and(|n| n.contains("ttfb")));
+
+        // The instrumented client's connections: numbers.
+        let c = &mut r.connections;
+        (c.reused_requests, c.reuse_pct, c.dialed) = (99, 99.0, 1);
+        let v = ConnectionView::of(&r, None);
+        assert!(v.observed);
+        assert_eq!(v.dials_line(), "1 dialed in the window");
+        assert_eq!(v.reuse_line(), "99.0% of requests warm");
+        assert_eq!(v.protocol, "http/1.1 · plain");
+        assert_eq!(v.unobserved_note(), None);
     }
 
     #[test]

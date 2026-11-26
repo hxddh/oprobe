@@ -48,6 +48,16 @@ impl HypothesisKind {
     }
 }
 
+/// The direction of the bodies a [`HypothesisKind::BandwidthCap`] was fitted on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    /// Response bodies (`bytes_down` over the body stage).
+    Download,
+    /// Request bodies (`bytes_up` over the send stage): an uplink at its capacity.
+    Upload,
+}
+
 /// The parameters of a limit model (the ones its kind uses are set).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct HypothesisParams {
@@ -69,6 +79,9 @@ pub struct HypothesisParams {
     pub servers_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_per_s: Option<f64>,
+    /// Which bodies share `bytes_per_s` (a bandwidth cap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<Direction>,
     /// Seconds into the window where a [`HypothesisKind::TimeVarying`] limit changed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub change_points_s: Vec<f64>,

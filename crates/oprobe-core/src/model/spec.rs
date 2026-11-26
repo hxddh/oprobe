@@ -4,8 +4,9 @@
 //! operator as the user named it (a URL, an `op.toml` path or a configured name), the seed, the
 //! `--existing` prefix and the label. Every report carries one (`report.spec`), so any run can
 //! be replayed exactly — `prove` replays a run's spec — or with a change: [`RunSpec::with`]
-//! applies [`Overrides`] (the `--set PATH=VALUE` vocabulary) and [`RunSpec::command`] prints an
-//! equivalent `oprobe run …` command line.
+//! applies [`Overrides`] (the `--set PATH=VALUE` vocabulary), [`RunSpec::command`] prints an
+//! equivalent `oprobe run …` command line and [`crate::app::App::replaying`] gives the request
+//! that runs it again.
 //!
 //! [`RunSpec::hash`] identifies the measured configuration (workload + operator + target
 //! identity); [`RunSpec::workload_hash`] the workload alone.
@@ -179,38 +180,35 @@ impl RunSpec {
         command_line(&self.args())
     }
 
-    /// The arguments of [`Self::command`] after `oprobe`.
+    /// The arguments of [`Self::command`] after `oprobe`: those of the request that runs
+    /// this spec again ([`crate::app::RunRequest::args`]).
     pub fn args(&self) -> Vec<String> {
-        let (w, sets) = self.replay();
-        let mut a: Vec<String> = vec!["run".into(), self.operator_ref.clone()];
-        let flags = [
-            ("--preset", w.preset),
-            ("-c", w.concurrency.map(|c| c.to_string())),
-            ("-d", w.duration),
-            ("--rate", w.rate.map(|r| r.to_string())),
-            ("--existing", w.existing),
-            ("--objects", w.objects.map(|n| n.to_string())),
-            ("--object-size", w.object_size),
-            ("--seed", w.seed.map(|s| s.to_string())),
-        ];
-        for (flag, value) in flags {
-            if let Some(v) = value {
-                a.extend([flag.to_owned(), v]);
-            }
+        let (workload, set) = self.replay();
+        crate::app::RunRequest {
+            operators: vec![self.operator_ref.clone()],
+            workload,
+            set,
+            ..Default::default()
         }
-        for set in sets {
-            a.extend(["--set".to_owned(), set]);
-        }
-        a
+        .args()
     }
 
-    /// What runs this spec again: the workload flags (preset, concurrency and duration
-    /// always; the rate, the existing prefix, the dataset and the seed where they differ from
-    /// the preset's defaults) and the `PATH=VALUE` pairs of every workload setting without a
-    /// flag and every operator value that differs from the default operator of its URL.
-    /// Redacted secrets are left out. [`Self::args`] is these as a command line, and
-    /// [`crate::app::RunRequest::replaying`] as a request.
+    /// What runs this spec again, the operator taken as the default operator of its URL
+    /// (what a URL names): see [`Self::replay_on`]. [`Self::args`] is these as a command
+    /// line.
     pub fn replay(&self) -> (crate::app::WorkloadInput, Vec<String>) {
+        self.replay_on(&OperatorSpec::from_url(self.profile.operator.url.clone()))
+    }
+
+    /// What runs this spec again on top of `given`, the operator its reference names (the
+    /// operator file's, the configured one, or the default operator of a URL): the workload
+    /// flags (preset, concurrency and duration always; the rate, the existing prefix, the
+    /// dataset and the seed where they differ from the preset's defaults) and the
+    /// `PATH=VALUE` pairs of every workload setting without a flag and of every operator
+    /// value that differs from `given`'s. What the file or the config file says is not
+    /// repeated: it is read again when the run is. Redacted secrets are left out.
+    /// [`crate::app::App::replaying`] is these as a request.
+    pub fn replay_on(&self, given: &OperatorSpec) -> (crate::app::WorkloadInput, Vec<String>) {
         let p = self.resolved_profile();
         let def = crate::config::defaults();
         let w = &p.workload;
@@ -266,8 +264,9 @@ impl RunSpec {
                 serde_json::to_string(&mix).unwrap_or_default(),
             ));
         }
-        // The operator: what differs from the default operator of its URL.
-        let base = OperatorSpec::from_url(p.operator.url.clone());
+        // The operator: what differs from the one its reference names (as a spec stores
+        // one: secrets redacted).
+        let base = redact_operator(given);
         for c in crate::operator::diff::diff(&base, &p.operator).changes {
             // A layer the default operator lacks is one change (`on`), which says the layer
             // with its defaults: a layer with other values is named value by value.
@@ -555,7 +554,7 @@ pub const SET_KEYS: &[SetKey] = &[
         "p99_ms",
         Section::Sla,
         &[],
-        "SLA: max p99 per operation in ms (none: unchecked)",
+        "removed: a p99 limit (a stalled open loop is judged without one)",
     ),
     key("sla", Section::Sla, &[], "enforce or none"),
     key("label", Section::Run, &[], "label stored with the run"),
@@ -595,6 +594,14 @@ fn alias_paths(name: &str, v: &str) -> Option<Vec<(&'static str, String)>> {
         "region" => vec![("options.region", v.to_owned())],
         _ => return None,
     })
+}
+
+/// Whether the `--set` pair `pair` changes the operator (an operator path or one of its short
+/// names) and not the workload.
+pub fn is_operator_set(pair: &str) -> bool {
+    let key = pair.split_once('=').map_or(pair, |(k, _)| k);
+    let key = key.trim().to_ascii_lowercase().replace('-', "_");
+    is_operator_path(&key) || alias_paths(&key, "").is_some()
 }
 
 /// Whether `name` is an operator path (`url`, `options.KEY`, `layers.…`, `read.…`, …).
@@ -733,13 +740,9 @@ fn apply_one(
                 Some(input::share(&what, v)?)
             }
         }
-        "p99_ms" => {
-            p.sla.p99_ms = if none_word(v) {
-                None
-            } else {
-                Some(input::positive(&what, v)?)
-            }
-        }
+        // The p99 limit is gone (9.3): no run stores the key (`--set` refuses it), and a
+        // stalled open loop is judged without one.
+        "p99_ms" => {}
         "sla" => {
             p.sla.enforce = input::choice("SLA mode", v, &[("enforce", true), ("none", false)])?
         }
@@ -1105,7 +1108,6 @@ mod tests {
         }
         let mut p = Profile::from_url("memory://");
         p.sla.enforce = false;
-        p.sla.p99_ms = Some(50.0);
         let cmd = RunSpec::new(&p, "memory://").command();
         assert!(!cmd.contains("sla") && !cmd.contains("p99_ms"), "{cmd}");
     }

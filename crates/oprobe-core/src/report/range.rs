@@ -7,6 +7,11 @@
 //! **What counts.** An operation counts in the range it started in (as the timeline's
 //! goodput and the heatmap); a request in the range it was sent in.
 //!
+//! **Open loop.** An arrival that never started has no row: the timeline counts it in the
+//! interval it was due in. A range counts those of its intervals (`missed_arrivals_count`) in
+//! its percentiles as the whole run does, each at the least it can have taken, and says so
+//! (`latency_at_least`): a range of an overloaded run does not read faster than the run.
+//!
 //! **Sampled rows.** When the run kept only a share of its rows, each kept row stands for
 //! [`Run::op_weights`] operations (failed, throttled and the slowest rows stand for
 //! themselves): counts are weighted estimates and the quantiles weighted, so the always-kept
@@ -52,7 +57,16 @@ pub struct RangeView {
     pub p90_ms: f64,
     pub p99_ms: f64,
     pub p999_ms: f64,
+    /// The slowest operation that started in the range.
     pub max_ms: f64,
+    /// Open-loop arrivals due in the range that never started (the timeline's count of each
+    /// interval, by the share of it the range covers).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub missed_arrivals_count: u64,
+    /// The percentiles are lower bounds ("at least"): they count the arrivals that never
+    /// started, each at the least it can have taken.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub latency_at_least: bool,
     /// Requests sent in the range, retries included.
     pub requests_count: u64,
     pub throttled_requests_count: u64,
@@ -70,6 +84,38 @@ pub struct RangeView {
     #[serde(skip)]
     #[schemars(skip)]
     pub cdf: LatencyCdf,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// The least an open-loop arrival that never started can have waited, when it was dropped:
+/// the engine drops an arrival once it is more than the operator's timeout, and never less
+/// than a second, behind its schedule (`engine::runner`).
+const DROPPED_AFTER_US: f64 = 1e6;
+
+/// The open-loop arrivals due in `[lo, hi)` that never started, as `(lower bound µs, count)`
+/// per timeline interval. The timeline counts them in the interval they were due in; an
+/// interval the range covers in part gives that share of its count. Each was either dropped
+/// behind its schedule (it had waited more than [`DROPPED_AFTER_US`]) or still waiting when
+/// the window ended (it had waited at least from its interval's end to the window's): its
+/// latency is at least the smaller of the two.
+fn missed_arrivals(run: &Run, lo: f64, hi: f64) -> Vec<(u64, f64)> {
+    let window = run.report.run.window_s;
+    run.report
+        .timeline
+        .iter()
+        .filter(|p| p.missed_arrivals > 0)
+        .filter_map(|p| {
+            let len = if p.len_s > 0.0 { p.len_s } else { 1.0 };
+            let end = p.t_s + len;
+            let covered = (hi.min(end) - lo.max(p.t_s)).max(0.0) / len;
+            let count = p.missed_arrivals as f64 * covered;
+            let waited_us = ((window - end).max(0.0) * 1e6).min(DROPPED_AFTER_US);
+            (count > 0.0).then_some((waited_us.max(1.0) as u64, count))
+        })
+        .collect()
 }
 
 /// Durations (µs) with the weight each stands for, sorted once: every quantile and the
@@ -180,9 +226,15 @@ impl RangeView {
         // failures, the goodput and the verbs describe the same operations.
         let failed_w: f64 = ops.iter().filter(|o| !o.ok).map(|o| weight(o.op_id)).sum();
         let bytes_w: f64 = ops.iter().map(|o| o.bytes as f64 * weight(o.op_id)).sum();
+        // The arrivals that never started count in the percentiles at their lower bound, as
+        // in the whole run's (no coordinated omission).
+        let missed = missed_arrivals(run, lo, hi);
+        let missed_w: f64 = missed.iter().map(|m| m.1).sum();
+        let missed_count = missed_w.round() as u64;
         let lat = Weighted::new(
             ops.iter()
                 .map(|o| (o.latency_us, weight(o.op_id)))
+                .chain(missed.into_iter().filter(|_| missed_count > 0))
                 .collect(),
         );
         let req_w = |q: &ReqRow| weight(q.op_id);
@@ -218,6 +270,8 @@ impl RangeView {
             p99_ms: lat.quantile_ms(0.99),
             p999_ms: lat.quantile_ms(0.999),
             max_ms: ops.iter().map(|o| o.latency_us).max().unwrap_or(0) as f64 / 1000.0,
+            missed_arrivals_count: missed_count,
+            latency_at_least: missed_count > 0,
             requests_count: requests_w.round() as u64,
             throttled_requests_count: throttled_w.round() as u64,
             throttled_request_ratio: ratio(throttled_w, requests_w),
@@ -231,7 +285,7 @@ impl RangeView {
             .iter()
             .map(|o| o.op_id)
             .collect(),
-            cdf: lat.cdf(!sampled),
+            cdf: lat.cdf(!sampled && missed_count == 0),
         }
     }
 
@@ -567,6 +621,73 @@ mod tests {
         assert!(RangeView::of(&run, 20.0, 30.0).is_empty());
     }
 
+    /// K2-11. A range of an open-loop run read its percentiles from the operations that
+    /// started, and said nothing of the arrivals that never did: a second in which the
+    /// service fell behind read as fast as the rest. The range counts the missed arrivals
+    /// of its intervals, in its percentiles too (each at the least it waited), and marks
+    /// them "at least", as the whole run's are.
+    #[test]
+    fn a_range_of_an_open_loop_run_counts_its_missed_arrivals() {
+        let mut run = run();
+        // One timeline interval a second; in seconds 6 and 7 ten arrivals each never started.
+        run.report.timeline = (0..10)
+            .map(|t| crate::trace::TimelinePoint {
+                t_s: t as f64,
+                len_s: 1.0,
+                ops_count: 10,
+                missed_arrivals: if t == 6 || t == 7 { 10 } else { 0 },
+                ..Default::default()
+            })
+            .collect();
+        // A range without them is as before: exact, nothing "at least".
+        let calm = RangeView::of(&run, 0.0, 5.0);
+        assert_eq!(calm.missed_arrivals_count, 0);
+        assert!(!calm.latency_at_least && calm.cdf.exact);
+        let json = serde_json::to_value(&calm).unwrap();
+        assert!(
+            json.get("missed_arrivals_count").is_none() && json.get("latency_at_least").is_none()
+        );
+        // [5 s, 8 s): thirty operations started (ten of them 101..110 ms), twenty arrivals
+        // never did. Of the fifty scheduled, the p50 is the 25th: a started one; the p90 is
+        // the 45th: past the thirty that started, a missed arrival at its lower bound (they
+        // were dropped after waiting at least a second).
+        let v = RangeView::of(&run, 5.0, 8.0);
+        assert_eq!((v.ops_count, v.missed_arrivals_count), (30, 20));
+        assert!(v.latency_at_least && !v.cdf.exact);
+        assert_eq!(v.p50_ms, 105.0);
+        assert_eq!(v.p90_ms, 1000.0);
+        assert_eq!(v.p99_ms, 1000.0);
+        // 9.2's numbers, from the rows alone: a p90 of 107 ms beside twenty lost arrivals.
+        let rows_only = {
+            let mut r = run.clone();
+            r.report
+                .timeline
+                .iter_mut()
+                .for_each(|p| p.missed_arrivals = 0);
+            RangeView::of(&r, 5.0, 8.0)
+        };
+        assert_eq!((rows_only.p50_ms, rows_only.p90_ms), (8.0, 107.0));
+        // The slowest operation is of those that started.
+        assert_eq!(v.max_ms, 110.0);
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["missed_arrivals_count"], 20);
+        assert_eq!(json["latency_at_least"], true);
+        // A range that covers part of an interval counts that share of its arrivals.
+        assert_eq!(RangeView::of(&run, 6.5, 7.0).missed_arrivals_count, 5);
+        // An arrival still waiting when the window ended had waited at least from its
+        // interval's end: the last interval's bound is no second.
+        run.report.timeline[9].missed_arrivals = 40;
+        let end = RangeView::of(&run, 9.0, 10.0);
+        assert_eq!((end.ops_count, end.missed_arrivals_count), (10, 40));
+        assert!(end.latency_at_least && end.p50_ms < 1.0, "{}", end.p50_ms);
+        // The text says so.
+        let text = crate::report::terminal::range_section(&run, &v);
+        assert!(text.contains("p50 ≥ 105"), "{text}");
+        assert!(text.contains("20 open-loop arrivals"), "{text}");
+        let text = crate::report::terminal::range_section(&run, &calm);
+        assert!(!text.contains('≥') && !text.contains("arrivals"), "{text}");
+    }
+
     #[test]
     fn a_range_counts_failures_by_when_they_started_as_its_goodput_does() {
         let mut run = run();
@@ -714,27 +835,17 @@ mod tests {
         run
     }
 
-    /// The numbers of a range as 9.1.0 computed them: one sort of the rows per quantile
-    /// ([`weighted_quantile_us_ms`] sorts what it is given), one more for the distribution and
-    /// a full sort for the slowest.
+    /// A range sorts its rows once per order it reads, however many quantiles are read from
+    /// each, and its numbers are those of the fixed synthetic trace.
     #[test]
-    fn a_range_sorts_once_and_reads_what_the_repeated_sorts_gave() {
-        use crate::analysis::stats::weighted_quantile_us_ms as old_q;
+    fn a_range_sorts_once_and_reads_the_expected_numbers() {
         let run = synthetic(20_000);
-        let weights = run.op_weights();
-        let w = |id: u64| weights.get(&id).copied().unwrap_or(1.0);
-        for (a, b) in [(0.0, 100.0), (12.5, 60.0), (99.0, 100.0), (40.0, 40.2)] {
-            let (lo, hi) = ((a * 1e6) as i64, (b * 1e6) as i64);
-            let ops: Vec<&OpRow> = run
-                .ops
-                .iter()
-                .filter(|o| o.t_us >= lo && o.t_us < hi)
-                .collect();
-            let reqs: Vec<&ReqRow> = run
-                .reqs
-                .iter()
-                .filter(|q| q.t_us >= lo && q.t_us < hi)
-                .collect();
+        for (a, b, rows, quantiles) in [
+            (0.0, 100.0, 20_000, [51.5, 90.75, 99.25, 100.25]),
+            (12.5, 60.0, 9_500, [51.75, 90.75, 99.5, 100.25]),
+            (99.0, 100.0, 200, [51.5, 95.25, 99.5, 99.75]),
+            (40.0, 40.2, 40, [64.75, 89.5, 98.0, 98.0]),
+        ] {
             SORTS.with(|n| n.set(0));
             let v = RangeView::of(&run, a, b);
             let sorts = SORTS.with(|n| n.get());
@@ -742,114 +853,69 @@ mod tests {
             // many rows and however many quantiles are read from each.
             assert_eq!(sorts, 1 + v.verbs.len() + 2 * v.apis.len(), "[{a}, {b})");
             assert_eq!((v.verbs.len(), v.apis.len()), (4, 3));
-            assert_eq!(v.rows_count, ops.len() as u64);
-
-            let lat = |ops: &[&OpRow]| -> Vec<(u64, f64)> {
-                ops.iter().map(|o| (o.latency_us, w(o.op_id))).collect()
-            };
-            let mut l = lat(&ops);
+            assert_eq!(v.rows_count, rows, "[{a}, {b})");
             assert_eq!(
                 [v.p50_ms, v.p90_ms, v.p99_ms, v.p999_ms],
-                [0.5, 0.9, 0.99, 0.999].map(|q| old_q(&mut l, q)),
+                quantiles,
                 "[{a}, {b})"
             );
-            // The distribution, as the old `cdf` built it from the order the quantiles left.
-            let total: f64 = l.iter().map(|x| x.1).sum();
-            let step = l.len().div_ceil(LatencyCdf::MAX_POINTS).max(1);
-            let mut acc = 0.0;
-            let mut pts = Vec::new();
-            for (i, (us, wt)) in l.iter().enumerate() {
-                acc += wt;
-                if (i + 1) % step == 0 || i + 1 == l.len() {
-                    pts.push((*us as f64 / 1000.0, (acc / total).min(1.0)));
-                }
-            }
-            pts.last_mut().unwrap().1 = 1.0;
-            assert_eq!(v.cdf.pts, pts, "[{a}, {b})");
-            // The slowest: a stable sort of every row, slowest first.
-            let mut slow = ops.clone();
-            slow.sort_by_key(|o| std::cmp::Reverse(o.latency_us));
-            let slow: Vec<u64> = slow
-                .iter()
-                .take(RangeView::SLOWEST)
-                .map(|o| o.op_id)
-                .collect();
-            assert_eq!(v.slowest_op_ids, slow, "[{a}, {b})");
-            for verb in &v.verbs {
-                let os: Vec<&OpRow> = ops
-                    .iter()
-                    .copied()
-                    .filter(|o| o.verb == verb.verb)
-                    .collect();
-                let mut l = lat(&os);
-                assert_eq!(
-                    [verb.p50_ms, verb.p99_ms],
-                    [old_q(&mut l, 0.5), old_q(&mut l, 0.99)],
-                    "{}",
-                    verb.verb
-                );
-            }
-            for api in &v.apis {
-                let qs: Vec<&ReqRow> = reqs
-                    .iter()
-                    .copied()
-                    .filter(|q| q.api.label() == api.api)
-                    .collect();
-                let mut ttfb: Vec<(u64, f64)> =
-                    qs.iter().map(|q| (q.ttfb_us, w(q.op_id))).collect();
-                let mut total: Vec<(u64, f64)> =
-                    qs.iter().map(|q| (q.total_us, w(q.op_id))).collect();
-                assert_eq!(
-                    [
-                        api.ttfb_p50_ms,
-                        api.ttfb_p99_ms,
-                        api.total_p50_ms,
-                        api.total_p99_ms
-                    ],
-                    [
-                        old_q(&mut ttfb, 0.5),
-                        old_q(&mut ttfb, 0.99),
-                        old_q(&mut total, 0.5),
-                        old_q(&mut total, 0.99)
-                    ],
-                    "{}",
-                    api.api
-                );
-            }
         }
+        let v = RangeView::of(&run, 0.0, 100.0);
+        // The distribution: from the fastest to the slowest, the share reaching 1.
+        let n = v.cdf.pts.len();
+        assert_eq!(n, 239);
+        assert_eq!((v.cdf.pts[0].0, v.cdf.pts[n / 2].0), (0.75, 51.25));
+        assert_eq!(v.cdf.pts[n - 1], (100.25, 1.0));
+        // The slowest first, the earlier of equals first.
+        assert_eq!(v.slowest_op_ids, [220, 1057, 1082, 1104, 1658]);
+        let verbs: Vec<(&str, f64, f64)> = v
+            .verbs
+            .iter()
+            .map(|x| (x.verb.as_str(), x.p50_ms, x.p99_ms))
+            .collect();
+        assert_eq!(
+            verbs,
+            [
+                ("read.full", 51.5, 99.5),
+                ("read.range", 52.0, 99.5),
+                ("stat", 51.75, 99.5),
+                ("write", 50.75, 99.25)
+            ]
+        );
+        let apis: Vec<(&str, [f64; 4])> = v
+            .apis
+            .iter()
+            .map(|x| {
+                (
+                    x.api.as_str(),
+                    [x.ttfb_p50_ms, x.ttfb_p99_ms, x.total_p50_ms, x.total_p99_ms],
+                )
+            })
+            .collect();
+        assert_eq!(
+            apis,
+            [
+                ("HeadObject", [7.6, 14.95, 12.6, 23.35]),
+                ("GetObject", [7.75, 14.95, 12.6, 23.1]),
+                ("PutObject", [7.3, 14.9, 12.45, 23.35])
+            ]
+        );
         // A verb's distribution over a range: one sort.
         SORTS.with(|n| n.set(0));
         let cdf = LatencyCdf::of_range_verb(&run, 0.0, 100.0, "stat").unwrap();
         assert_eq!(SORTS.with(|n| n.get()), 1);
         assert_eq!(cdf.pts.last().unwrap().1, 1.0);
-        // The drill-downs select too: what a stable sort of every row listed first.
-        let mut slow: Vec<&OpRow> = run.ops.iter().collect();
-        slow.sort_by_key(|o| std::cmp::Reverse(o.latency_us));
+        // The drill-downs select too: the slowest first, the earlier of equals first.
         let cell: Vec<u64> = ops_in(&run, 0.0, 100.0, 0.0, 1e9, 8)
             .iter()
             .map(|o| o.op_id)
             .collect();
-        assert_eq!(
-            cell,
-            slow.iter().take(8).map(|o| o.op_id).collect::<Vec<_>>()
-        );
-        let mut slow: Vec<&ReqRow> = run
-            .reqs
+        assert_eq!(cell, [220, 1057, 1082, 1104, 1658, 2365, 2388, 2879]);
+        let listed: Vec<u64> = slowest_requests(&run, "GetObject", None, 8)
             .iter()
-            .filter(|q| q.api == crate::trace::Api::GetObject)
+            .map(|q| q.op_id)
             .collect();
-        slow.sort_by_key(|q| std::cmp::Reverse(q.total_us));
-        let listed: Vec<(u64, i64)> = slowest_requests(&run, "GetObject", None, 8)
-            .iter()
-            .map(|q| (q.op_id, q.t_us))
-            .collect();
-        assert_eq!(
-            listed,
-            slow.iter()
-                .take(8)
-                .map(|q| (q.op_id, q.t_us))
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(listed, [7510, 7789, 6688, 9307, 5977, 12589, 13762, 7003]);
         // Few rows, and none.
         assert_eq!(first_n(Vec::<u64>::new(), 5, |x| *x), Vec::<u64>::new());
         assert_eq!(first_n(vec![3, 1, 2], 5, |x| *x), [1, 2, 3]);

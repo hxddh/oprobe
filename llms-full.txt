@@ -60,7 +60,7 @@ each with its remedy as an `op.toml` path, and the next command:
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.2.0/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.0/docs/concepts.md#glossary
 ```
 
 `prove last` runs trials of the current operator (A) and of the remedy (B), interleaved, and ends
@@ -118,6 +118,7 @@ operators renders as Rust and as TOML. [The reference →](docs/operator.md)
 | Finding | Cause | Remedy (`op.toml` path) |
 |---|---|---|
 | `throttling` | 429/503 above an in-flight level | `layers.concurrent_limit.http`, plus `layers.retry.jitter` |
+| `throttling` | a service that queues beyond what it serves at once, with no 429/503 | a cap on the requests in flight, as advice: it moves the wait, there is nothing to prove |
 | `rate_limit` | a request-rate ceiling | `layers.concurrent_limit.http` |
 | `key_limit` | a hot prefix or key | the key layout (advice, not a layer) |
 | `bandwidth_cap` | a bytes-per-second ceiling | `layers.throttle.bandwidth` on writes; on reads not a layer |
@@ -129,7 +130,8 @@ operators renders as Rust and as TOML. [The reference →](docs/operator.md)
 | `cold_connections` | handshakes on the critical path, HTTP version | `http.keep_alive` / `http.version` |
 | `client_bound` | your process is the bottleneck | none in storage; reported as such |
 | `errors` | 5xx or lost connections that retries recovered | `layers.retry.min_delay`, plus `layers.retry.jitter` |
-| `errors` | failures that reached the application | none: fix their cause (`show RUN --by api`) |
+| `errors` | writes larger than `layers.throttle.burst`, refused by `ThrottleLayer` | raise `layers.throttle.burst` |
+| `errors` | other failures that reached the application | none: fix their cause (`show RUN --by api`) |
 
 `run` names the remedy; only `prove` puts a number on it.
 
@@ -218,7 +220,7 @@ oprobe demo
 `demo` is `oprobe run lab://demo`. The lab is an S3-compatible server inside oprobe on 127.0.0.1:
 every 40th request is a straggler that waits 250 ms for its first byte, and it throttles
 (503 SlowDown) above 40 requests in flight. The default workload writes, reads and stats small objects
-with 28 workers for 8 seconds:
+with 16 workers for 8 seconds:
 
 ```text
 [Attention] 2.4% of HeadObject, 2.4% of PutObject and 2.6% of GetObject requests wait far longer for
@@ -335,7 +337,7 @@ oprobe run op.toml --preset range-reads
 
 The four presets are `small-files`, `large-objects`, `range-reads` and `list-stat`
 ([concepts](concepts.md#workload)). Several operators run one after another on the same workload
-and form one comparison: `oprobe run op.toml r2://bucket/x`.
+and form one comparison: `oprobe run op.toml 'r2://bucket/x?account_id=ACCOUNT_ID'` (R2 needs the Cloudflare account id, or an endpoint).
 
 ## 6. Production
 
@@ -408,18 +410,35 @@ command sends to the target and every body byte, as they are sent and received:
 - a request the budget has no room for is never sent, and a download stops at the chunk that
   crosses the byte budget, so a budget is overshot by at most the response chunks in flight,
   never by a whole operation;
-- cleanup is never counted and never refused: deleting the run prefix and aborting multipart
-  uploads always run.
+- once a budget is spent, nothing more is sent: a request without a body is refused too, since
+  its answer would only be cut. A body that does not fit in what is left of `--max-bytes` is
+  refused and the error says so ("the next request (8.0 MiB) does not fit the byte budget: 1 B
+  of 4.0 MiB used");
+- cleanup is never counted and never refused: deleting the run prefix, deleting the preflight's
+  probe object and aborting multipart uploads always run.
 
 In-process services (`memory://`, `fs://`) send no HTTP request: their calls are counted as they
 complete.
 
 **A stopped run leaves no multipart upload.** When a budget, `--max-duration`, Ctrl-C (or
-SIGTERM, SIGHUP) or Stop ends a run, the requests in flight are cut and the operations they
-belong to end at once; they are neither completed nor failed operations, and are not in the
-profile. Every multipart upload a failed, timed-out or stopped write or dataset upload had
-started is aborted (`AbortMultipartUpload`), so no part stays on the target to be billed where no
-object listing shows it. An upload whose abort fails is named in the cleanup error.
+SIGTERM, SIGHUP), a closed terminal or Stop ends a run, the requests in flight are cut and the
+operations they belong to end at once; they are neither completed nor failed operations, and are
+not in the profile (an open-loop run counts them in neither its arrivals nor its achieved rate).
+Every multipart upload a failed, timed-out or stopped write or dataset upload had started is
+aborted (`AbortMultipartUpload`), so no part stays on the target to be billed where no object
+listing shows it.
+
+Stopping is bounded. An upload that was being created when the run stopped has 10 s to answer
+(its answer carries the id it is aborted with), each abort 30 s, and the run waits at most 45 s
+for all of them before it deletes its test data. An upload whose abort failed, whose creation
+never answered or that was still in flight after that wait is named in the cleanup error: check
+the target for it (`aws s3api list-multipart-uploads`, or a lifecycle rule that aborts
+incomplete uploads).
+
+**A closed stderr stops the run like a signal.** Progress goes to stderr. When its reader is
+gone (the terminal or SSH session closed, `oprobe run … 2>&1 | head`), the first line that cannot
+be written stops the command as Ctrl-C does: it cleans up, saves the partial run and exits 130.
+With `-q` nothing is written while the run measures, so it runs to its end.
 
 ## Profile
 
@@ -436,7 +455,8 @@ A profile is what one operator did on one workload, saved as one `.oprobe` file:
 
 Each operation's wall time splits exactly into queue + backend + retry + client, so "network,
 server or my code?" has a measured answer. Long runs keep every aggregate exact and sample whole
-operations (failed, throttled and slowest ones are always kept), so memory stays bounded.
+operations (failed, throttled and slowest ones first: a run that fails for hours thins those
+too), so memory and the run file stay bounded.
 
 `.oprobe` files come from `oprobe run` and from [`oprobe-trace`](embedding.md) in production;
 `oprobe show FILE` and the app open both. A production trace has the same shape: every OpenDAL
@@ -454,17 +474,27 @@ hung I/O, cold connections, small ranges, slow multipart, repeated reads, a busy
 
 Every finding has a confidence: **high** only when the model explains most of the effect and
 agrees across repeats. Throttling that made operations fail is reported as throttling, never as
-an invalid run. The codes and their remedies are in the [README](../README.md#findings-and-their-remedy);
-besides those, `errors` reports failures that are not throttling (when retries recovered every
-operation, its remedy is a shorter first retry backoff with jitter, `layers.retry.min_delay`) and
-`invalid_run` a run whose numbers cannot be trusted (too short, nothing measured).
+an invalid run, and a handful of 429/503 that no limit model explains is still `throttling`, at
+low confidence, never `errors`. The codes and their remedies are in the
+[README](../README.md#findings-and-their-remedy); besides those, `errors` reports failures that
+are not throttling and `invalid_run` a run whose numbers cannot be trusted (too short, nothing
+measured). The remedy of `errors` follows what failed:
+
+- transient failures the retries recovered (5xx, lost connections), a few operations that ran
+  out of retries included: a shorter first retry backoff with jitter (`layers.retry.min_delay`);
+- writes that OpenDAL's `ThrottleLayer` refused because they are larger than
+  `layers.throttle.burst` (they fail as rate-limited with no 429/503 from the service): raise
+  the burst to at least the largest write;
+- anything else (credentials, permissions, the endpoint): not a layer.
 
 ## Remedy
 
 Each finding names exactly **one** remedy, as an `op.toml` path: `layers.concurrent_limit.http`,
 `layers.tail_cut`, `read.gap`, `http.keep_alive`, … A remedy that is not a layer (spreading keys
-over prefixes for `key_limit`) is reported as advice, and `client_bound` has no storage remedy:
-their `next` says where to look (`oprobe show RUN --detail`), and `prove` refuses them.
+over prefixes for `key_limit`), or that no A/B test can measure (capping the requests in flight
+in front of a service that queues without rejecting: the cap moves the wait, it shortens
+nothing), is reported as advice, and `client_bound` has no storage remedy: their `next` says
+where to look (`oprobe show RUN --detail`), and `prove` refuses them.
 
 `run` gives the remedy and **no number**. A single run varies no load, so it cannot say how
 large a limit should be or how much it would help; claiming so would be a guess.
@@ -475,7 +505,10 @@ large a limit should be or how much it would help; claiming so would be a guess.
 
 1. **Choose the change**: the finding's remedy (the top finding by default), or `--with PATH=VALUE`.
 2. **Size it**: when the remedy has a size (a limit, a chunk), short trials over that one value
-   find the knee of the objective, within `--max-throttle`.
+   find the knee of the objective, within `--max-throttle`. For a `rate_limit` finding the
+   value must also stay under the rate the finding fitted: a cap whose own trial sends more
+   requests per second than that is not chosen, even when its two seconds saw no throttle (a
+   token bucket's burst hides the limit from a short trial).
 3. **A/B test**: trials of A and B run in pairs. The order is balanced: the pairs come in blocks
    of two, one `AB` and one `BA`, and which comes first in a block is drawn from the run's seed.
    A sequential test on the objective, against a noise floor learned from each side's
@@ -496,9 +529,29 @@ large a limit should be or how much it would help; claiming so would be a guess.
      are calibrated by simulation for the planned number of pairs, `--pairs`). Whenever the
      proof stops — a decision, the pair limit, the budget — the chance that it calls a change
      that is none stays under 5 %. An order effect widens the interval; it never moves it.
+   - The proof also stops early when more pairs would not help (**futility**): the pairs so
+     far rule out the smallest change the planned pairs could show at the noise measured. A
+     note names that smallest change. A proof is never given up for a change it could have
+     shown.
+   - **After an early stop, read the interval, not the estimate.** A proof that stops early
+     on a decision stopped because its estimate was large, so the estimate overstates the
+     change on average. The interval does not: its coverage holds whenever the proof stops.
    - Shares (throttled requests, errors) are compared with Newcombe's interval. Secondary
-     metrics are shown and never decide (their intervals are plain, not sequential).
+     metrics are shown and never decide; each has a plain interval (not sequential) on its
+     own trial-to-trial spread, not the objective's.
    - Deciding takes at least 3 pairs of trials; with fewer, the verdict is `inconclusive`.
+   - **Two gates come before the objective.** A changed operator that throttles more than
+     `--max-throttle` allows, or fails more operations than the run allows (1 %), and more
+     than the current operator beyond chance, is `inconclusive` with a note: operations that
+     fail fast lower a p99, and that is no improvement. A pair in which a trial has no
+     objective at all (no successful operation, nothing measured) is not judged, and ends
+     the proof.
+   - **A p99 needs enough operations.** The p99 of a trial is one order statistic: its
+     resolution is the spread of the latencies at the ranks 0.99·n ± 2·√(0.0099·n) of the
+     trial's n operations, and the noise floor is never below it. When those latencies
+     differ by more than 2× the p99 sits on a cliff (the edge of the throttled or retried
+     operations, say), which side a trial lands on is chance, and a note says "p99 sits on a
+     cliff: lengthen the trial" (`--trial`).
 5. **Save**: every trial is saved as a run, a child of the prove, hidden from `show --list`.
 
 The result is a **proven layer diff**: the objective's change with its interval, the evidence,
@@ -629,6 +682,11 @@ pasted code stacks the layers exactly as they were measured.
   `tail_cut` would cut and re-issue into the same queue.
 - **A throttled write waits before it takes a permit.** `throttle` is outside the limiter and the
   timers, so its wait is neither a held permit nor a slow call.
+- **A write larger than `throttle.burst` fails; it does not wait.** `ThrottleLayer` refuses a
+  single write above the burst with `rate_limited` ("burst size is smaller than the request
+  size"). Keep `burst` at least as large as the largest single write: `write.chunk` when it is
+  set (oprobe refuses a `burst` below it), otherwise the largest buffer the application writes
+  at once, which for a workload without `write.chunk` can be a whole object.
 - **Every attempt starts over.** `retry` is outside all of them: a retried call is throttled,
   limited and timed again, and a `stat` or a read gives its permit back during the backoff.
 - **A cache hit touches nothing else.**
@@ -651,8 +709,34 @@ shard, weighs each entry by its object's size and admits any object no larger th
 requests and is never fetched or buffered whole. (Foyer's default of 8 shards splits the budget
 by key hash: an object above an eighth of it could not be cached, and a budget that covers the
 objects read still evicted whenever one shard filled first.) The generated Rust builds the
-same cache: `.with_shards(1)`, the weighter, and `.with_size_limit(..=memory)`. `prove` sizes
-`memory` from the distinct objects the run read, and never below its largest object.
+same cache: `.with_shards(1)`, the weighter, and `.with_size_limit(..=memory)`.
+
+What `FoyerLayer` costs, as OpenDAL 0.59 implements it:
+
+- **A ranged read caches the whole object.** The first read of an object, of any range, fetches
+  the object whole and keeps it; later reads are slices of it. A cache therefore pays off for
+  objects that are read again, and costs more than it saves for a few small ranges of large
+  objects.
+- **A `HEAD` before every read that misses.** The layer asks for the object's size first. An
+  object larger than `memory` is then read through, and the next read of it asks again: one
+  extra `HEAD` per read of an oversize object.
+- **A write is buffered until it is closed.** A write through the layer is also kept in memory,
+  up to `memory`, and enters the cache when the writer closes. A writer of a larger object
+  stops buffering once it passes `memory`.
+- **Nothing expires.** An entry stays until the budget evicts it. An object that another client
+  changes or deletes is served from the cache as it was.
+
+`prove` sizes `memory` from the distinct objects the run read, with a quarter of headroom, up to
+1 GiB. It sizes no cache at all, and says why, when the largest object read is above 1 GiB, or
+when the reads are ranges of objects that hold more bytes than the run read of them: the layer
+would fetch more than it could save. `--with layers.cache.memory=SIZE` still tests any cache.
+
+**Known issue (OpenDAL 0.59, versioned buckets): a stale read after a write.** The layer keys a
+written object by the version the service returns for the write, and an ordinary read by no
+version. On a bucket with versioning on, an object that was read, then overwritten through the
+same operator, is still served as it was before the write, until the old entry is evicted. On a
+bucket without versioning the write replaces the entry. Do not put `cache` on an operator that
+overwrites objects it also reads in a versioned bucket.
 
 ## `[read]` and `[write]`
 
@@ -663,7 +747,7 @@ The options of `read_with` / `reader_with` and `writer_with`; unset means OpenDA
 | `read.chunk` | read in chunks of this size |
 | `read.concurrent` | chunks fetched at once |
 | `read.gap` | merge ranges closer than this into one request |
-| `write.chunk` | multipart part size (OpenDAL clamps it to the service's limits; the profile shows the effective value) |
+| `write.chunk` | multipart part size (OpenDAL clamps it to the service's limits; the profile shows the effective value). Unset, OpenDAL fixes no part size: it buffers up to the service's minimum and sends each write as it comes, so the parts are as large as the caller's writes, and the profile shows the parts that were uploaded |
 | `write.concurrent` | parts uploaded at once |
 
 ## `[http]`
@@ -691,8 +775,10 @@ takes the same paths. The paths: `url`, `options.KEY`, `layers.NAME` (`on`/`off`
 `--set` also takes the workload's keys, the ones without a flag of their own included:
 `concurrency`, `preset`, `duration`, `warmup` (e.g. `--set warmup=2s`), `max_ops`, `rate`,
 `arrivals`, `shape`, `access`, `objects`, `object_size`, `partitions`, `existing`, `persist`,
-`verify`, `cleanup`, `seed` and `mix`; the SLA's `max_error_rate`, `max_throttle_rate`, `p99_ms`
-and `sla`; and the run's `label`.
+`verify`, `cleanup`, `seed` and `mix`; and the run's `label`. There are no limits to set: the
+findings judge a run, an open loop that stalled fails its checks by itself (see
+[reading the profile](reading-the-profile.md#how-it-is-measured)), and `prove --max-throttle`
+bounds the throttling a sized change may cause.
 
 ```bash
 oprobe run op.toml --set layers.concurrent_limit.http=32 --set read.gap=1MiB
@@ -830,7 +916,7 @@ config file sets defaults. Ctrl-C, SIGTERM and SIGHUP stop a run the same way (e
 ```bash
 oprobe run s3://bucket/oprobe
 oprobe run op.toml --preset range-reads -c 16 -d 1m
-oprobe run s3://a/x r2://b/x --set layers.concurrent_limit.http=32
+oprobe run s3://a/x 'r2://b/x?account_id=ACCOUNT_ID' --set layers.concurrent_limit.http=32
 oprobe run prod --existing data/2026/ --max-requests 50000
 ```
 
@@ -838,7 +924,7 @@ oprobe run prod --existing data/2026/ --max-requests 50000
 
 `oprobe run lab://demo`, with the same workload and safety flags as `run`. Every 40th request
 of the lab is a straggler that waits 250 ms, and it throttles above 40 requests in flight. Its default
-workload is small files (64 × 64 KiB) with 28 workers for 8 s; `oprobe prove last` then proves
+workload is small files (64 × 64 KiB) with 16 workers for 8 s; `oprobe prove last` then proves
 the top finding's remedy in about a minute.
 
 ## `oprobe prove RUN [FINDING]`
@@ -859,8 +945,27 @@ block is drawn from the run's seed (`notes` says so). When the
 budget allows fewer, the verdict is `inconclusive` (exit 0) with a note. When no pair ran at all,
 the text says `not measured` and prints no diff; `-o json` still prints a valid result
 (`verdict: "inconclusive"`, `pairs_count: 0`, a note). When the changed operator's trials
-throttle more than `--max-throttle` allows, and more than the current operator's, the verdict is
-`inconclusive` too, with a note: the service's limit, not the change, set what was measured.
+throttle more than `--max-throttle` allows, and more than the current operator's by more than
+that allowance (beyond chance), the verdict is `inconclusive` too, with a note: the service's
+limit, not the change, set what was measured. Throttling the change did not cause passes: a
+service that answers 503 whatever the operator does (`lab://noisy`) throttles both alike.
+
+Sizing follows the same bound. A remedy for throttling (`throttling`, `rate_limit`) is sized
+among the values whose trials stay within `--max-throttle`; any other remedy among the values
+that add no more than `--max-throttle` to what the run already had. When no value qualifies,
+the least throttled one is tested and a note says so ("no value met --max-throttle"); the rule
+above still decides the verdict.
+
+The same holds for failures, on either objective: a changed operator whose operations fail more
+than the run allows (1 %), and more than the current operator's, is `inconclusive` with a note
+(a timeout that fails the slow operations lowers the p99 and improves nothing). A pair in which
+a trial has no objective to compare (no successful operation, or nothing measured) is not
+judged: the proof stops there and a note says so.
+
+When the proof stops early because more pairs would not help, a note names the smallest change
+its planned pairs could have shown at the noise it measured. On `--objective p99`, when the
+latencies around a trial's p99 differ by more than 2×, a note says `p99 sits on a cliff: lengthen
+the trial`: pass a longer `--trial`, so that each trial has enough operations to place its p99.
 
 `prove` refuses a run that cannot be judged on performance (its first finding is `invalid_run`:
 it failed, or it is partial and too short); profile the operator again first.
@@ -881,7 +986,15 @@ paired log ratios of the objective (B over A, pair by pair):
   that plan.
 
 Shares, such as throttled requests, are compared with Newcombe's interval; the secondary
-metrics' intervals are plain 95 % intervals, shown and never decisive.
+metrics' intervals are plain 95 % intervals on each metric's own trial-to-trial spread, shown
+and never decisive. After an early stop the estimate overstates the change on average (the
+proof stopped because it was large); the interval's coverage holds.
+
+The ETA printed first is learned from the run being proved: what it took around its warm-up and
+window, how long its last operations kept retrying after the window, and a cool-down per
+throttled trial. The first pair corrects it when it was off. Under `--max-duration` the line
+says how many trials the budget is estimated to fit; the proof runs every trial that really
+fits.
 
 A trial that ends throttled (429/503) is followed by a cool-down before the next trial starts:
 the longest `Retry-After` it saw, at least twice the trial warm-up (250 ms to 2 s), at most 5 s.
@@ -889,7 +1002,8 @@ The cool-down counts in the budget, Ctrl-C interrupts it, and `notes` says how o
 happened.
 
 `--max-duration` is the one wall-time budget of the whole proof: no trial starts that would not
-end within it. When a budget (`--max-duration`, `--max-requests`, `--max-bytes`) stops the prove
+end within it, and no cool-down is waited past it (a pair whose second trial no longer fits
+after the first one's cool-down is left incomplete and out of the result). When a budget (`--max-duration`, `--max-requests`, `--max-bytes`) stops the prove
 part-way, it still prints and saves the partial result (`budget_exceeded: true`, usually
 `inconclusive`) and exits 4; its trials stay attached, so `oprobe show --rm PROVE` removes them.
 
@@ -908,6 +1022,8 @@ the service at its limit). The objective's change prints with its 95 % interval
 | `--with PATH=VALUE` | the change to prove instead of the finding's remedy, repeatable |
 | `--objective goodput\|p99` | what the change is judged on: successful operations (or bytes) per second (default), or the worst per-operation p99 latency |
 | `--max-throttle RATIO` | share of throttled requests a change may cause, e.g. `0.1%` or `0.001` |
+| `--trial DURATION` | measurement window of one trial (default `2s`, at most the run's own window) |
+| `--pairs N` | A/B pairs at most, 3 to 12 (default 6); a value outside that range is a usage error (exit 2) |
 | `--max-duration DURATION` | wall-time budget of the whole proof, e.g. `5m` |
 | `--save FILE\|OPERATOR` | when the verdict is `improved`, write the proven change to an `op.toml` file or to `[operators.OPERATOR]` in the config file. A new file gets the operator with its `${ENV}` references and without secret values; the run's own `op.toml` (or another of the same service) is patched in place; the config file's path saves to the run's `[operators.NAME]`. Any other existing file is refused before a trial runs. The proof is saved first: a save that fails is a note |
 | `--dry-run` | print the number of trials and the ETA of the whole proof, and exit (`-o json`: `schemas/prove-plan.json`) |
@@ -944,12 +1060,12 @@ multipart and repeated reads (not bandwidth cap or client bound). `prove` refuse
 
 | Flag | Meaning |
 |---|---|
-| `--list` | list the stored runs (prove trials hidden) |
+| `--list` | list the stored runs (prove trials hidden) and the proves; a long change is cut in the list (`show PROVE` prints it whole) |
 | `--all` | with `--list`: include the prove trials |
-| `--rm RUN…` | delete stored runs |
+| `--rm RUN…` | delete stored runs (a run named twice is deleted once) |
 | `--detail` | every section of the profile: the timeline (one row per interval of 1 s, or 10 s after ten minutes; long runs merge rows), the spread of the requests over keys, sizes, prefixes and remotes, the operator and the five slowest operations |
 | `--by stage\|api\|conn` | group the requests by stage, storage API or connection |
-| `--since DURATION` | only the time range from this far into the window: its goodput, latency quantiles, failures, requests, retries and throttling, where the time went, the verbs, the requests by API and the slowest operations, recomputed from the trace rows (`-o json`: the `range` object). With `--by`, only the range's requests are grouped |
+| `--since DURATION` | only the time range from this far into the window: its goodput, latency quantiles, failures, requests, retries and throttling, where the time went, the verbs, the requests by API and the slowest operations, recomputed from the trace rows (`-o json`: the `range` object). With `--by`, only the range's requests are grouped. In an open-loop run (`--rate`), the arrivals due in the range that never started are counted (`missed_arrivals_count`) and count in its percentiles, each at the least it waited, as in the whole run: the percentiles are then "at least" values, printed with `≥` (`latency_at_least`) |
 | `--until DURATION` | only the time range up to this far into the window (default: its end) |
 
 An operation counts in the range it started in, a request in the range it was sent in. When the
@@ -1040,7 +1156,7 @@ The app's Profile view shows the same sections with charts ([app](app.md)).
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.2.0/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.0/docs/concepts.md#glossary
 ```
 
 (`oprobe demo`; your numbers differ from run to run.)
@@ -1082,7 +1198,10 @@ ranges; a column no row has, such as a hot key's errors, is left out). The timel
 the measured window: what draining operations did after it counts in its last interval.
 
 `--by stage` sums the requests' time per stage, `--by api` per storage API, `--by conn` per
-connection (cold and warm, per remote address). `--by stage` also gives each stage's p50/p99
+connection (cold and warm, per remote address). A request belongs to the stage it spent most of
+its time in, and the stages have one name everywhere (the groups of `--by stage`, the tail
+split, the waterfalls, the report's fields): `queue`, `connect`, `send`, `ttfb`, `body`,
+`stall`. Up to 9.2 `--by stage` and the waterfalls called the `body` stage `transfer`. `--by stage` also gives each stage's p50/p99
 per API and, when the requests recorded them, the request signals below.
 
 ### Request signals
@@ -1118,8 +1237,8 @@ Each operation's wall time is split exactly; an instant counts once even when re
 | queue | requests wait for a connection or an in-flight permit | a concurrency limit or a small pool; see `cold_connections` and `throttling` |
 | connect | DNS, TCP, proxy and TLS of a new connection | connections are not reused, or the proxy or TLS is slow (`http.keep_alive`, `http.version`) |
 | send | the request body goes out | upload bandwidth; `write.chunk`, `write.concurrent`. Uploads that share one saturated uplink are a `bandwidth_cap` (`layers.throttle.bandwidth`), not hung requests |
-| TTFB | waiting for the first byte (the server's work plus one round trip) | the store or the distance to it; stragglers show as a long tail (`layers.tail_cut`). A TTFB that grows with the requests in flight, in a run that varied them at least twofold, is the service's queue: `throttling` without a 429/503 (`layers.concurrent_limit.http`) |
-| body | the response body arrives | download bandwidth per stream × streams; `read.chunk`, `read.concurrent` |
+| TTFB | waiting for the first byte (the server's work plus one round trip) | the store or the distance to it; stragglers show as a long tail (`layers.tail_cut`). A TTFB that grows with the requests in flight, in a run that varied them at least twofold, is the service's queue: `throttling` without a 429/503 (below) |
+| body | the response body arrives | download bandwidth per stream × streams; `read.chunk`, `read.concurrent`. Downloads that share one capped link are a `bandwidth_cap`, not hung requests; a body that stalls (far slower than the other bodies) is a hung request |
 | stall | the body waits for your code to read it (client time: its own segment in a waterfall, never part of body) | the consumer, not storage |
 | retry | the retry layer sleeps before the next attempt | throttling or errors; see the findings (`errors` on retried 5xx or lost connections: `layers.retry.min_delay`) |
 | client | everything else: OpenDAL, signing, checksums | CPU (`client_bound`), tiny objects |
@@ -1139,10 +1258,31 @@ Each operation's wall time is split exactly; an instant counts once even when re
   started count in every percentile as censored values, so a slow server cannot hide behind fewer
   requests. A censored value is a lower bound (the arrival had waited that long when the window
   ended; nothing says how much longer it would have taken), so those percentiles are "at least"
-  values. A p99 limit (`p99_ms`) is therefore checked against the worst the censored arrivals
-  allow: it is breached when more than 1 % of the scheduled arrivals never completed (the p99
-  then has no upper bound), and otherwise when the p99 with each of them counted as slower than
-  every completed operation exceeds it.
+  values. When more than 1 % of the scheduled arrivals never completed, the p99 has no upper
+  bound at all (its rank falls among the censored arrivals): the open loop **stalled**. No limit
+  is needed to judge that. The headline leads with it ("1808 of 3000 scheduled arrivals never
+  completed (60.3%): the p99 is at least 1.80s and has no upper bound"), the profile's `checks`
+  line and `verdict.sla.breaches` carry the same sentence, and the verdict is Critical. The
+  bound is the run's own p99. The finding beside it says who fell behind: the service, when it
+  queues (`throttling`), or the client (`client_bound`).
+- **A service that queues** (`throttling` with no 429/503) is read from timing alone, so it is
+  held to more than a rejection is. The time to first byte is fitted against the requests in
+  flight with one service time per storage API (a HEAD is quicker than a ranged GET at any
+  load); the run must have varied its requests in flight at least twofold; the wait the model
+  puts at the busiest level must be more than twice the client's own scheduling lag (`self`),
+  which also grows with the requests in flight; and a run whose client was saturated has no
+  such finding. Its remedy is advice: a cap on the requests in flight
+  (`layers.concurrent_limit.http`) moves the wait from the service's queue to the client's. It
+  shortens no operation and adds no throughput, so there is nothing for `prove` to measure, and
+  `prove` refuses it. A run at a steady load shows no queue: its headline says the load was
+  not varied. Vary it with `--set shape=ramp:FROM..TO/D` (arrivals per second, over `D`).
+- **An open loop that fell behind** with CPU to spare kept every worker busy, so a steady one
+  shows a single level of requests in flight: nothing in it tells a service at its capacity
+  from too few workers, and `client_bound` says exactly that ("this run cannot tell") instead
+  of advising more workers. A run that varied its load can tell: when the time to first byte
+  grew with the requests in flight, the service queues (`throttling`, as above, and no
+  `client_bound`); when it stayed put from half the requests in flight to all of them, the
+  service had room and the workers are the bound (`client_bound`: raise `-c`).
 - **Percentiles** are exact when every operation was kept, otherwise from histograms with three
   significant digits. Counts always agree with the totals. The report keeps the run's whole
   latency distribution (`latency_histogram`, 20 bins per decade), and the latency distribution
@@ -1175,6 +1315,12 @@ zstd stream of the header with the operator spec and workload, columnar segments
 request rows, the per-second timeline, and the report). `oprobe-trace` writes `oprobe.trace/9`
 files (one JSON document: the aggregates, service posture and sampled rows). `oprobe show FILE`
 and the app open both, as well as standalone `.prove.json` (`oprobe.prove/9`) files.
+
+A run file keeps every row up to `max_requests` rows (`[defaults]`, 1 000 000). Past that the
+rows are thinned, each kept row carrying the operations it stands for; failed and throttled
+operations are kept in full for twice as long, then thinned the same way. However long the run
+and whatever it met, the file stays within what `show` and the app read (4 GiB of rows): a run
+that reaches that keeps its aggregates exact and stops keeping rows.
 
 
 <!-- source: docs/embedding.md -->
@@ -1283,6 +1429,16 @@ wherever the layer sits. The layer then sees each request from outside:
 `format!("{trace:?}")` says which one a layer does (`http_transport: "replaced by the
 instrumented client"` or `"the installed transport, observed"`).
 
+What was not observed is not reported as a number. With `keep_http_transport(true)`:
+- `Snapshot::connections` counts the requests by protocol, and nothing else:
+  `connections.observed()` is false, and `dialed`, `reused_requests` and `reuse_pct` say nothing
+  (until 9.2 every answered request counted as reused: "100 %"). `oprobe show FILE` prints
+  `dials not observed · reuse not observed`.
+- The file's `service` says `"http_transport": "installed"` and leaves out `http_version` and
+  `keep_alive`, which describe the instrumented client (the client is yours).
+- A request row has `conn_id` 0, and its time to first byte includes connecting and sending the
+  body: a slow upload shows as a long `ttfb`, not as a slow server.
+
 ## What you get
 
 Every OpenDAL call is one **operation**, linked to the backend requests it issued, as in a run
@@ -1330,7 +1486,10 @@ let cfg = oprobe_trace::Config::default().exporter(std::sync::Arc::new(Slow));
     (they add up to the request's duration); it also carries `oprobe.api`,
     `http.request.method`, `http.response.status_code` and OpenDAL's own metric labels
     (`scheme`, `namespace`, `root`, `operation`), so its series join
-    `opendal-layer-otelmetrics`'.
+    `opendal-layer-otelmetrics`'. `scheme`, `namespace` and `root` are those of the operator
+    that issued the request: a layer cloned onto several operators labels each one's requests
+    with its own (until 9.2, with the first operator's). Your own `Exporter` reads the same
+    from `RequestRecord::service`.
 
   Backend calls of `memory` and `fs` are not HTTP requests and are in neither. Operation
   durations and cache metrics are not repeated: use OpenDAL's own metrics layers for them.
@@ -1372,11 +1531,32 @@ A connection's dial belongs to the request that started it: that request is the 
 cold one, whichever request is answered first on a shared HTTP/2 connection; a request that
 waited for another's dial shows the wait as queue time (`detail.dial_wait_us`). A dial whose
 request went elsewhere is a connection nobody waited for: counted, charged to no request.
-Kernel TCP statistics are read at the end of each request; the retransmits of a connection
-shared by concurrent HTTP/2 streams are split among the requests in flight when they are read,
-so `detail.retrans_count` adds up to the connection's count and no retransmit is charged twice.
+Kernel TCP statistics are read at the end of each request, and the connection's retransmits
+since the previous reading are charged to the requests in flight on it, so
+`detail.retrans_count` adds up to the connection's count and no retransmit is charged twice:
+- to the requests that are **sending a body**, when there are any (what a client retransmits
+  is what it sends): an upload is charged its own retransmits, not the small GET that ends
+  beside it on a shared HTTP/2 connection;
+- else evenly to all of them (on HTTP/1.1 that is the one request).
+
+A request counts as sending from the moment the transport can tell which connection carries
+its body: with one upload in flight, the only connection alive, or, once the body is handed
+to the kernel, the only one with unsent bytes in its send queue. With several uploads in
+flight it cannot, and an upload joins at its response headers; a request that ends on the
+same HTTP/2 connection before that is charged the upload's retransmits so far. An upload that
+fails or is cancelled before any response carries the retransmits of its connection when that
+connection was known.
+
 The socket of a new connection is looked up on the runtime's blocking pool (one scan of the
-descriptor table answers every connection dialed meanwhile), never on a worker thread.
+descriptor table answers every connection dialed meanwhile), never on a worker thread, and no
+request waits for it: a request reads the answer when its response headers arrive and again
+when it ends. A request that ends before the lookup answered (the first request of a
+connection, when the blocking pool is busy) has no kernel statistics; what its connection sent
+and retransmitted counts with the connection's next request. Connection ids (`conn_id`) number
+the client's connections in the order they were dialed, from 1.
+
+A response OpenDAL cannot use (a `Content-Encoding` or `Content-Length` that does not parse)
+fails the operation and is recorded as a failed request, not to be retried.
 
 Above the transport, the layer wraps the service: each call runs in an operation scope that the
 transport (and OpenDAL's background tasks, through a scope-propagating executor) reports its
@@ -1423,8 +1603,9 @@ is lost in the noise.
 
 ## Stability
 
-Within 9.x the API documented on docs.rs, the `oprobe.trace/9` file format and the meaning of
-every field are stable: changes are additive. Public structs and enums are `#[non_exhaustive]`,
+Within 9.x the API documented on docs.rs is stable: changes are additive. A trace file is read
+by the oprobe of the version that wrote it; reading the files of another version is not
+promised. Public structs and enums are `#[non_exhaustive]`,
 so read fields freely but build `Config` with its methods. The `__internal` feature exists for the
 oprobe binary and has no semver promise; do not enable it.
 
@@ -1433,7 +1614,7 @@ oprobe binary and has no semver promise; do not enable it.
 `oprobe.trace/9` is one JSON document, readable without oprobe:
 
 ```text
-{ "format": "oprobe.trace/9", "oprobe_trace_version": "9.2.0", "created_at": "…",
+{ "format": "oprobe.trace/9", "oprobe_trace_version": "9.3.0", "created_at": "…",
   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/", "http_version": "auto", "keep_alive": true },
   "snapshot": { … }, "rows": { "ops": [ … ], "reqs": [ … ], "info": { … }, "sampling": { … } } }
 ```
@@ -1530,12 +1711,16 @@ The window works like other professional tools on your platform (design:
   does the button become **Run**. Changing the form drops the plan.
 - **Run Again** (mod+R) repeats the selected run as it ran: its operator, its whole workload
   (the open-loop rate, the dataset, the seed, the key popularity, …) and every operator value
-  that is not the default of its URL. A `lab://` run starts at once. A real target opens New
-  Run on its plan: the fields show the run's operator, workload, duration, concurrency and
-  existing prefix, and **Runs again as** shows the command whose other settings it keeps.
-  Change a field and only that changes; choose another operator or workload and it is a new
-  run, with nothing carried over. Secrets are never stored in a run: they come from the
-  operator's file, the config file or the environment, as for any run.
+  the run set on top of its operator (the `op.toml` file or the configured operator is read
+  again; for a URL, what is not the default of the URL). A `lab://` run starts at once. A real
+  target opens New Run on its plan: the fields show the run's operator, workload, duration,
+  concurrency and existing prefix, and **Runs again as** shows the command of the run the form
+  will start, as it stands now. Change the duration, the concurrency or the prefix and only
+  that changes. Choose another workload and the operator's values stay (its endpoint, its
+  layers: the run still goes where it went), while the rate, the dataset and the seed of the
+  old workload go. Choose another operator and it is a new run, with nothing carried over.
+  Secrets are never stored in a run: they come from the operator's file, the config file or
+  the environment, as for any run.
 - **Opening a file** (`.oprobe`, a trace, a report): a file is read as untrusted input. A run
   file may hold blocks of at most 256 MiB, decompress to at most 4 GiB and its rows may take
   at most 4 GiB of memory (about nine times the default cap of a million rows); a file beyond
@@ -1549,8 +1734,14 @@ The window works like other professional tools on your platform (design:
   the notice goes, the folder goes on to the system's trash where there is one; oprobe's trash
   is emptied after a week. `oprobe show --rm` in the CLI still deletes for good.
 - **Quitting** (⌘Q, Ctrl+Q, Exit, or the window's close button) while a run or a prove goes on
-  asks first: **Stop and Quit** stops it, removes its test data and quits; Cancel keeps it
-  running.
+  asks first: **Stop and Quit** stops it, or Cancel keeps it running. The app then waits for
+  the job to remove its test data, showing what it is doing and for how long, and quits by
+  itself when that is done. It waits 60 s at most (an abort of a multipart upload may take
+  30 s to give up on a service that does not answer, and the cleanup gets as long again).
+  Past that it says which job was left and that objects under its `oprobe-run-…/` prefix may
+  remain on the target (the next run against the same target removes them), and offers
+  **Quit Anyway**; the same line goes to the log file. In a terminal, Ctrl+C waits the same
+  way and prints what was left; a second Ctrl+C leaves at once.
 - **Run files**: open a `.oprobe`, `.prove.json`, report `.json` or `op.toml` file with File ▸ Open Run File… (the
   system's open dialog, filtered to those types), drop it on the window (the window is outlined
   while a file is dragged over it), or double-click a `.oprobe` / `.json` file: `oprobe.app` (macOS), the `.msi`
@@ -1938,6 +2129,8 @@ a `hint:` line. `--dry-run` shows the plan without sending a request.
 |---|---|
 | leftover `oprobe-run-*` prefixes | a run was killed hard (a second Ctrl-C, OOM, power loss): the next run against the same target deletes them (it says so), except under `--read-only`; or delete the prefix with your usual tools |
 | `client_bound` on a remote store | the profiling process is the bottleneck (CPU, tiny objects); the profile's `self` section says why. Larger objects or fewer workers |
+| `client_bound`: "cannot tell too few workers from a service at its capacity" | an open loop (`--rate`) fell behind with every worker busy: a steady overload shows one level of requests in flight. Vary the load (`--set shape=ramp:FROM..TO/D`): a service that queues is then `throttling`, one with room leaves the workers as the bound |
+| "N of M scheduled arrivals never completed" and a Critical verdict | the open loop stalled: more than 1 % of its arrivals never completed, so its p99 has no upper bound. Lower `--rate`, or see the finding beside it for who fell behind |
 | `oprobe` asks nothing in a script | it never prompts: pass an operator, and use `--non-interactive` to rule out redraws |
 | `cannot open a window` | no display (SSH, a server): the app opens in the terminal; Linux packages built with `--features gui` need GTK 4 |
 | `oprobe show FILE` fails on a file from `oprobe-trace` | the file is from a newer major version, or was cut short; write it again with `Handle::save` |
@@ -1952,8 +2145,9 @@ runtime, `3` the proven change is worse, `4` budget, `5` safety refusal, `130` i
 ### `usage.invalid_argument` (exit 2)
 
 A flag or argument is malformed: an unknown flag, a value that does not parse
-(`--max-bytes lots`), an unknown `--set` path. With `-o json` argument errors are JSON too. Fix
-the argument; `--help` lists what the command accepts.
+(`--max-bytes lots`), an unknown `--set` path, or an address `oprobe lab --bind` cannot listen
+on (the port is taken: `--bind 127.0.0.1:0` takes a free one). With `-o json` argument errors
+are JSON too. Fix the argument; `--help` lists what the command accepts.
 
 <a id="usage-unknown_target"></a>
 ### `usage.unknown_target` (exit 2)
@@ -2003,8 +2197,10 @@ The service refused the credentials or the operation (`AccessDenied`, `Signature
 ### `net.unreachable` (exit 1, retryable)
 
 Nothing answered (`connection refused`, reset, no route). Check the endpoint and port; is MinIO or
-`oprobe lab` running? Behind an egress proxy check `HTTPS_PROXY` / `NO_PROXY`, or set
-`http.proxy = "none"`.
+`oprobe lab` running? When the requests go through a proxy (`http.proxy`, or `HTTPS_PROXY` /
+`HTTP_PROXY` / `ALL_PROXY` unless `NO_PROXY` exempts the endpoint), the proxy is what the client
+connects to, and the message names it ("connection refused by the proxy 127.0.0.1:3128"): check
+that it is running, or connect directly with `--set http.proxy=none`.
 
 <a id="net-dns"></a>
 ### `net.dns` (exit 1, retryable)
@@ -2065,8 +2261,11 @@ command. Budgets cover the whole command: every operator of `run`, every trial o
 every HTTP request sent to the target before cleanup (the preflight, the dataset upload and
 retries included). The request the budget had no room for was not sent, the operations in flight
 were cut, their multipart uploads aborted, the partial run saved and the test data cleaned up.
-When the budget runs out during the preflight or the dataset upload there is no run to save.
-Raise the budget or shorten the run; `--dry-run` shows the estimates.
+When the budget runs out during the preflight or the dataset upload there is no run to save (and
+nothing is left on the target: the preflight's probe object is deleted outside the budget).
+"the next request (8.0 MiB) does not fit the byte budget: 1 B of 4.0 MiB used" means
+`--max-bytes` is smaller than one request body (a multipart part, an object): raise it above
+that size. Raise the budget or shorten the run; `--dry-run` shows the estimates.
 
 <a id="safety-read_only"></a>
 ### `safety.read_only` (exit 5)
@@ -2095,9 +2294,17 @@ The change made things worse on the objective: `prove`'s verdict is `worse`. Rea
 <a id="run-interrupted"></a>
 ### `run.interrupted` (exit 130, retryable)
 
-Ctrl-C, SIGTERM, SIGHUP or Stop ended the command. The requests in flight were cut, the multipart
-uploads they belonged to aborted, and the test data cleaned up, unless a second signal ended the
-cleanup too. Run it again.
+Ctrl-C, SIGTERM, SIGHUP, a closed stderr (the terminal or SSH session went away, or
+`2>&1 | head` read enough) or Stop ended the command, at any point: while it opened the target,
+uploaded its dataset or measured. The requests in flight were cut, the multipart uploads they
+belonged to aborted, and the test data cleaned up, unless a second signal ended the cleanup too.
+A run that was measuring is saved as a partial run. Run it again.
+
+"N multipart uploads could not be aborted and may still hold parts (…)" in the message or in the
+cleanup error names uploads the stop could not remove: an abort the service refused or did not
+answer within 30 s, an upload whose creation did not answer within 10 s of the stop, or one
+still in flight 45 s after it. Their parts are billed until the upload is aborted: list and abort
+them with the service's tools (`aws s3api list-multipart-uploads` / `abort-multipart-upload`).
 
 <a id="internal"></a>
 ### `internal` (exit 1)
@@ -2132,13 +2339,9 @@ you run them.
   the workload and one row per operation and request. Object keys, request IDs and remote IP
   addresses are part of a run. Secrets are not: credential options (`secret_access_key`,
   `account_key`, `sas_token`, `password`, `*_key`, …) are redacted before anything is printed or
-  saved. URLs lose their credentials wherever they appear, in an operator, an option, a proxy
-  setting or the text of an error: `user:password@`, and the query parameters that carry a
-  signature or a token (`X-Amz-Signature`, `X-Amz-Credential`, `X-Amz-Security-Token`,
-  `Signature`, `AWSAccessKeyId`, an Azure SAS's `sig`, `X-Goog-Signature`, `x-oss-signature`,
-  `q-signature`, `access_token`, `token`, …, whatever their case). What only describes a
-  request stays readable (`X-Amz-Expires`, an SAS's `se` and `sp`). Errors, warnings and log
-  events are printed the same way.
+  saved. Every text loses the credentials it carries, in an operator, an option, a proxy
+  setting or the text of an error ([what is removed](#what-is-removed-from-a-text)). Errors,
+  warnings and log events are printed the same way.
 - **The host** is recorded as OS, architecture, CPU count and a hash of the host name, never the
   name itself.
 - **Pending-cleanup markers** in `<data dir>/oprobe/pending/`: while a run that writes is going,
@@ -2148,6 +2351,38 @@ you run them.
 
 Delete runs with `oprobe show --rm RUN…`, or remove the data directory.
 
+## What is removed from a text
+
+One function redacts every text before it is recorded, stored or printed
+(`oprobe_trace::util::strip_url_credentials`). It removes:
+
+- **`user:password@`** of every URL, also when the password holds a `/`, `?` or `#` (an AWS
+  secret key typed into a URL unescaped).
+- **Secret parameters**, by name and whatever their case: `*signature*` (`X-Amz-Signature`,
+  `X-Goog-Signature`, `x-oss-signature`, `q-signature`), `sig` and `*_sig` (an Azure SAS, a
+  Swift `temp_url_sig`), `*token*`, `*credential*`, access key ids (`AWSAccessKeyId`, …),
+  `upload_id` (the session of a GCS resumable upload is a bearer credential), `*secret*`,
+  `*password*`, `*session*`, `*authorization*`, `*jwt*`, `*hmac*`, `key`, `*_key`, `apikey`.
+  They are removed from a URL's query, from its fragment (`#access_token=…`), from a query
+  with no URL around it (`GET /b/k?X-Amz-Signature=…`), from a bare parameter list (an SAS
+  token `sv=…&sig=…`) and from a percent-encoded URL passed as a value
+  (`?next=https%3A%2F%2F…%3Fsig%3D…`). The other parameters stay, in order.
+- **The value of a lone `name=value`** with such a name (the `Signature=…` and `Credential=…`
+  of a quoted `Authorization` header, `password=…`): it reads `name=<redacted>`.
+- **The value of an `Authorization` header** quoted in a text (`Authorization: Bearer …`).
+
+What only describes a request stays readable: `X-Amz-Expires`, `X-Amz-Date`, an SAS's `se` and
+`sp`; the cursors and key ranges of a listing (`continuation-token`, `pageToken`, `start_key`,
+`end_key`, `partition-key`, `marker`), which name a position and grant nothing; S3's `uploadId`;
+switches such as `skip_signature=true`; an environment reference (`${AWS_SECRET_ACCESS_KEY}`);
+and a bare `key=…` outside a parameter list, which names an object. A name that only looks
+like a secret's is redacted.
+
+What it cannot know: a credential in none of these forms (a bare token in a path or a
+sentence, a JSON field), and a password before whose first `/` stands only a port number
+(`user:8080/…@host` reads as `host:port/path`). Percent-encode a password you put in a URL, or
+better, give credentials as options or through the environment.
+
 ## `.oprobe` files from `oprobe-trace`
 
 `Handle::save` writes what the layer saw in your process: the aggregates and a sample of
@@ -2155,9 +2390,11 @@ operations and their requests, with their API, method, status, timing, bytes, co
 request ID. Object keys are never stored: an operation's key is its first path segment (at most
 32 bytes) and a hash of the whole key (`logs/#3f2a…`), so a top-level directory name can be in
 the file, but not a key. Request IDs and remote addresses are. Credentials never are: the
-text of a failed request or operation loses the credentials of every URL in it (the signature
-and token of a presigned or SAS URL included) when it is recorded, so neither an `Exporter`,
-a `Snapshot` nor a file ever holds them. Review a file before you attach it to an issue.
+text of a failed request or operation loses the credentials it carries
+([what is removed](#what-is-removed-from-a-text): the signature and token of a presigned or SAS
+URL included, with or without a URL around them) when it is recorded, so neither an
+`Exporter`, a `Snapshot` nor a file ever holds them. Review a file before you attach it to an
+issue.
 
 ## Test data in your bucket
 

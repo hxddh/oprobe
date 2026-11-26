@@ -53,7 +53,7 @@ each with its remedy as an `op.toml` path, and the next command:
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.2.0/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.0/docs/concepts.md#glossary
 ```
 
 `prove last` runs trials of the current operator (A) and of the remedy (B), interleaved, and ends
@@ -111,6 +111,7 @@ operators renders as Rust and as TOML. [The reference →](docs/operator.md)
 | Finding | Cause | Remedy (`op.toml` path) |
 |---|---|---|
 | `throttling` | 429/503 above an in-flight level | `layers.concurrent_limit.http`, plus `layers.retry.jitter` |
+| `throttling` | a service that queues beyond what it serves at once, with no 429/503 | a cap on the requests in flight, as advice: it moves the wait, there is nothing to prove |
 | `rate_limit` | a request-rate ceiling | `layers.concurrent_limit.http` |
 | `key_limit` | a hot prefix or key | the key layout (advice, not a layer) |
 | `bandwidth_cap` | a bytes-per-second ceiling | `layers.throttle.bandwidth` on writes; on reads not a layer |
@@ -122,7 +123,8 @@ operators renders as Rust and as TOML. [The reference →](docs/operator.md)
 | `cold_connections` | handshakes on the critical path, HTTP version | `http.keep_alive` / `http.version` |
 | `client_bound` | your process is the bottleneck | none in storage; reported as such |
 | `errors` | 5xx or lost connections that retries recovered | `layers.retry.min_delay`, plus `layers.retry.jitter` |
-| `errors` | failures that reached the application | none: fix their cause (`show RUN --by api`) |
+| `errors` | writes larger than `layers.throttle.burst`, refused by `ThrottleLayer` | raise `layers.throttle.burst` |
+| `errors` | other failures that reached the application | none: fix their cause (`show RUN --by api`) |
 
 `run` names the remedy; only `prove` puts a number on it.
 

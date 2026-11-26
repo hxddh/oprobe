@@ -4,7 +4,8 @@
 //! into the sidebar and opening in Profile, a layer toggled and proved in Operator, Compare
 //! and Delete (to the trash, with Undo) from a run's context menu, the menu shortcuts, the
 //! language set in Settings and remembered, the sidebar as a keyboard listbox, New Run planning
-//! a real target first, quitting during a run, and the platform branches run as macOS and as
+//! a real target first, quitting during a run (the wait for its cleanup, and what is said when
+//! that wait gives up), and the platform branches run as macOS and as
 //! Windows (menus, shortcuts, Settings, alerts, button order). Each test has its own data
 //! directory; tests run one at a time (the launch options are process-wide). Waits are bounded
 //! only to fail instead of hanging; nothing asserts on wall-clock time.
@@ -49,7 +50,18 @@ impl Ctx {
         oprobe::ui::set_launch(oprobe::ui::Launch {
             paths: Some(self.paths()),
             open,
+            stop_grace: None,
         });
+    }
+
+    /// Start the app so that quitting gives up on the jobs it stops at once.
+    fn start_giving_up_at_once(&self) -> Headless {
+        oprobe::ui::set_launch(oprobe::ui::Launch {
+            paths: Some(self.paths()),
+            open: None,
+            stop_grace: Some(Duration::ZERO),
+        });
+        self.start()
     }
 
     /// Profile a short lab workload with the service layer directly; the run's id.
@@ -82,33 +94,17 @@ impl Ctx {
     fn start_without_sidebar(&self) -> Headless {
         let mut app = Headless::start(self.config(Os::Linux, Locale::EN_US)).unwrap();
         app.wait_for("id:sidebar-show").unwrap();
-        self.opened(&mut app);
         app
     }
 
+    /// The app, as soon as its window shows. The run it opens at start still loads off the
+    /// app's thread: nothing waits for it here, and a menu shortcut may be pressed at once
+    /// (the menu bar is no longer rebuilt when the run has loaded; 9.2's tests waited for
+    /// that rebuild, which lost a shortcut pressed across it).
     fn start_on(&self, os: Os, locale: Locale) -> Headless {
         let mut app = Headless::start(self.config(os, locale)).unwrap();
         app.wait_for("id:sidebar").unwrap();
-        self.opened(&mut app);
         app
-    }
-
-    /// Wait until the run the app opens at start has loaded. It loads off the app's thread,
-    /// and the menu bar is rebuilt when it has (`menus::install`): the items get new ids, so a
-    /// menu shortcut pressed across that rebuild names an item that is gone and does nothing.
-    /// A test that pressed one right after the sidebar showed (Ctrl+, in `choose`) then waited
-    /// its whole timeout for a dialog that never opened, on a loaded machine.
-    fn opened(&self, app: &mut Headless) {
-        if App::new(self.paths())
-            .list()
-            .is_ok_and(|l| l.runs.is_empty())
-        {
-            return;
-        }
-        app.wait_until("the run opened at start loading", LONG, |s| {
-            s.matches("id:profile") == Ok(true) || s.matches("id:operator") == Ok(true)
-        })
-        .unwrap();
     }
 
     fn config(&self, os: Os, locale: Locale) -> EngineConfig {
@@ -670,6 +666,41 @@ fn the_sidebar_is_a_keyboard_listbox() {
     wait_long(&mut app, "id:sidebar-show");
 }
 
+/// T6. The menu bar is rebuilt only when something it shows changes. 9.2 rebuilt it whenever
+/// the selection changed, and nsh gives the items of a rebuilt bar new ids: a shortcut typed
+/// right after an arrow key in the sidebar named an item that was gone and did nothing.
+#[test]
+fn a_shortcut_typed_ahead_of_a_selection_change_is_not_lost() {
+    let cx = Ctx::new();
+    let a = cx.seed("lab://demo");
+    let b = cx.seed("lab://demo");
+    let mut app = cx.start();
+    let selected = |app: &Headless, id: &str| {
+        app.screen()
+            .accessibility_state(&format!("id:run-{id}"))
+            .unwrap()
+            .selected
+    };
+    // Newest first: b, a. A press puts the focus on the list.
+    app.press(&format!("id:run-{b}")).unwrap();
+    // ↓ and Ctrl+2 typed ahead: the app has not handled the arrow (the selection moving to
+    // `a`, which then loads) when the shortcut comes.
+    app.press_keys(&["down", "ctrl+2"]).unwrap();
+    wait_long(&mut app, "id:operator");
+    assert!(selected(&app, &a) && !selected(&app, &b));
+    // And back, across the load of the other run.
+    app.press_keys(&["up", "ctrl+1"]).unwrap();
+    wait_long(&mut app, "id:profile");
+    assert!(selected(&app, &b) && !selected(&app, &a));
+    // A change of what the bar shows still rebuilds it (nsh 0.7 has no stable item ids): one
+    // run selected becoming several enables Compare, so only a shortcut typed after the app
+    // has handled that arrow is sure to arrive.
+    app.press_key("shift+down").unwrap();
+    wait_long(&mut app, "text:2 runs compared");
+    app.press_keys(&["ctrl+shift+s"]).unwrap();
+    app.wait_for_gone("id:sidebar", LONG).unwrap();
+}
+
 #[test]
 fn new_run_plans_a_real_target_first() {
     let cx = Ctx::new();
@@ -727,6 +758,78 @@ fn quitting_during_a_run_asks_first() {
     assert!(has(&app, "id:stop"));
     app.press("id:stop").unwrap();
     app.wait_for_gone("id:stop", LONG).unwrap();
+}
+
+/// Start a run of `lab://demo` long enough to quit during it, and ask to quit: the alert.
+fn quit_during_a_run(app: &mut Headless) {
+    choose(app, "English");
+    app.press("id:new-run").unwrap();
+    wait_long(app, "id:new-run-dialog");
+    app.clear("id:run-operator").unwrap();
+    app.type_text("id:run-operator", "lab://demo").unwrap();
+    app.type_text("id:run-duration", "60s").unwrap();
+    app.press("id:run-start").unwrap();
+    wait_long(app, "id:stop");
+    app.answer_dialogs_myself();
+    app.press_key("ctrl+q").unwrap();
+    assert!(app.pending_dialog().is_some(), "Quit asks first");
+}
+
+/// K1-10. "Stop and Quit" stops the run and quits once it has removed its test data: the
+/// Quitting dialog shows the wait, and the app quits by itself. (9.2 quit at once and then
+/// blocked the app's thread, the window frozen, for up to 30 s.)
+#[test]
+fn stop_and_quit_waits_for_the_cleanup_and_then_quits() {
+    let cx = Ctx::new();
+    let mut app = cx.start();
+    quit_during_a_run(&mut app);
+    app.answer_dialog(DialogAnswer::Press("Stop and Quit".into()))
+        .unwrap();
+    // Not gone yet, or gone already: never quit with the job still running.
+    let waiting = !app.quit();
+    if waiting {
+        assert!(has(&app, "id:quit-dialog"), "the wait is shown");
+        assert!(!has(&app, "id:quit-anyway"), "it has not given up");
+        // The wait is not cancelled: its job is stopped already.
+        app.press_key("Escape").unwrap();
+        assert!(app.quit() || has(&app, "id:quit-dialog"));
+    }
+    let deadline = std::time::Instant::now() + LONG;
+    while !app.quit() {
+        assert!(std::time::Instant::now() < deadline, "the app did not quit");
+        app.wait(Duration::from_millis(50)).unwrap();
+    }
+    // Its job is over (a run stopped before it measured anything saves nothing; one stopped
+    // later is saved as a partial run).
+    assert!(!oprobe::ui::jobs::busy());
+    let runs = App::new(cx.paths()).list().unwrap().runs;
+    assert!(runs.iter().all(|r| r.partial.is_some()), "{runs:?}");
+}
+
+/// K1-10. When the wait gives up (here at once: `Launch::stop_grace`), the dialog says what
+/// was left and where, and quits only when asked. (9.2 printed one line to a stderr a
+/// desktop app does not have, and quit.)
+#[test]
+fn quitting_says_what_was_left_when_it_gives_up() {
+    let cx = Ctx::new();
+    let mut app = cx.start_giving_up_at_once();
+    quit_during_a_run(&mut app);
+    app.answer_dialog(DialogAnswer::Press("Stop and Quit".into()))
+        .unwrap();
+    wait_long(&mut app, "id:quit-anyway");
+    assert!(app.shows("The cleanup did not finish"));
+    wait_long(
+        &mut app,
+        "text:/^The run of lab:\\/\\/demo (had not stopped|was still removing its test data)\\.$/",
+    );
+    wait_long(
+        &mut app,
+        "text:/oprobe-run-…\\/ prefix may be left on the target/",
+    );
+    app.press("id:quit-anyway").unwrap();
+    assert!(app.quit());
+    // Given up on: quitting no longer waits for it.
+    assert!(!oprobe::ui::jobs::busy());
 }
 
 /// A run long enough to brush: three seconds of a lab scenario (several verbs).
@@ -1214,6 +1317,11 @@ fn wait_for_runs(cx: &Ctx, app: &mut Headless, n: usize) {
 
 /// The stored runs' specs, oldest first.
 fn specs(cx: &Ctx) -> Vec<oprobe::model::RunSpec> {
+    svc_specs(cx)
+}
+
+/// The specs of the stored runs, oldest first.
+fn svc_specs(cx: &Ctx) -> Vec<oprobe::model::RunSpec> {
     let svc = App::new(cx.paths());
     let mut runs = svc.list().unwrap().runs;
     runs.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1319,4 +1427,55 @@ fn run_again_on_a_real_target_keeps_what_the_form_has_no_field_for() {
     app.clear("id:run-operator").unwrap();
     app.type_text("id:run-operator", "lab://clean").unwrap();
     app.wait_for_gone("id:run-again-command", LONG).unwrap();
+    app.press_key("Escape").unwrap();
+    app.wait_for_gone("id:dialog", LONG).unwrap();
+    // K1-3. Another preset is another workload on the same operator: the operator's values
+    // stay (9.2 dropped them with the rest, so a run on a local endpoint went to the real
+    // service), the old workload's rate, dataset and seed go, and the row shows the command
+    // the form sends now.
+    app.press("id:run-again").unwrap();
+    wait_long(&mut app, "id:run-again-command");
+    app.press("id:run-preset").unwrap();
+    wait_long(&mut app, "text:list-stat");
+    app.press("text:list-stat").unwrap();
+    wait_long(
+        &mut app,
+        "text:/^oprobe run memory:\\/\\/ --preset list-stat -c 3 -d 700ms --set /",
+    );
+    let command = app
+        .screen()
+        .texts()
+        .into_iter()
+        .find(|t| t.starts_with("oprobe run memory://"))
+        .unwrap()
+        .to_owned();
+    for kept in [
+        "http.version=h1",
+        "http.keep_alive=false",
+        "layers.retry.max_times=5",
+        "layers.concurrent_limit.http=12",
+        "read.gap=64KiB",
+    ] {
+        assert!(command.contains(&format!("--set {kept}")), "{command}");
+    }
+    for gone in [
+        "--rate",
+        "--objects",
+        "--object-size",
+        "--seed",
+        "access=",
+        "warmup=",
+    ] {
+        assert!(!command.contains(gone), "{command}");
+    }
+    // The form changed: its plan is reviewed again, then it runs.
+    wait_long(&mut app, "text:Review Plan");
+    app.press("id:run-start").unwrap();
+    wait_long(&mut app, "id:run-plan-ready");
+    app.press("id:run-start").unwrap();
+    wait_for_runs(&cx, &mut app, 3);
+    let third = &svc_specs(&cx)[2];
+    assert_eq!(third.profile.operator, specs[0].profile.operator);
+    assert_eq!(third.profile.workload.preset.slug(), "list-stat");
+    assert_eq!(third.profile.workload.rate, None);
 }

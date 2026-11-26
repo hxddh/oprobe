@@ -68,7 +68,7 @@ config file sets defaults. Ctrl-C, SIGTERM and SIGHUP stop a run the same way (e
 ```bash
 oprobe run s3://bucket/oprobe
 oprobe run op.toml --preset range-reads -c 16 -d 1m
-oprobe run s3://a/x r2://b/x --set layers.concurrent_limit.http=32
+oprobe run s3://a/x 'r2://b/x?account_id=ACCOUNT_ID' --set layers.concurrent_limit.http=32
 oprobe run prod --existing data/2026/ --max-requests 50000
 ```
 
@@ -76,7 +76,7 @@ oprobe run prod --existing data/2026/ --max-requests 50000
 
 `oprobe run lab://demo`, with the same workload and safety flags as `run`. Every 40th request
 of the lab is a straggler that waits 250 ms, and it throttles above 40 requests in flight. Its default
-workload is small files (64 × 64 KiB) with 28 workers for 8 s; `oprobe prove last` then proves
+workload is small files (64 × 64 KiB) with 16 workers for 8 s; `oprobe prove last` then proves
 the top finding's remedy in about a minute.
 
 ## `oprobe prove RUN [FINDING]`
@@ -97,8 +97,27 @@ block is drawn from the run's seed (`notes` says so). When the
 budget allows fewer, the verdict is `inconclusive` (exit 0) with a note. When no pair ran at all,
 the text says `not measured` and prints no diff; `-o json` still prints a valid result
 (`verdict: "inconclusive"`, `pairs_count: 0`, a note). When the changed operator's trials
-throttle more than `--max-throttle` allows, and more than the current operator's, the verdict is
-`inconclusive` too, with a note: the service's limit, not the change, set what was measured.
+throttle more than `--max-throttle` allows, and more than the current operator's by more than
+that allowance (beyond chance), the verdict is `inconclusive` too, with a note: the service's
+limit, not the change, set what was measured. Throttling the change did not cause passes: a
+service that answers 503 whatever the operator does (`lab://noisy`) throttles both alike.
+
+Sizing follows the same bound. A remedy for throttling (`throttling`, `rate_limit`) is sized
+among the values whose trials stay within `--max-throttle`; any other remedy among the values
+that add no more than `--max-throttle` to what the run already had. When no value qualifies,
+the least throttled one is tested and a note says so ("no value met --max-throttle"); the rule
+above still decides the verdict.
+
+The same holds for failures, on either objective: a changed operator whose operations fail more
+than the run allows (1 %), and more than the current operator's, is `inconclusive` with a note
+(a timeout that fails the slow operations lowers the p99 and improves nothing). A pair in which
+a trial has no objective to compare (no successful operation, or nothing measured) is not
+judged: the proof stops there and a note says so.
+
+When the proof stops early because more pairs would not help, a note names the smallest change
+its planned pairs could have shown at the noise it measured. On `--objective p99`, when the
+latencies around a trial's p99 differ by more than 2×, a note says `p99 sits on a cliff: lengthen
+the trial`: pass a longer `--trial`, so that each trial has enough operations to place its p99.
 
 `prove` refuses a run that cannot be judged on performance (its first finding is `invalid_run`:
 it failed, or it is partial and too short); profile the operator again first.
@@ -119,7 +138,15 @@ paired log ratios of the objective (B over A, pair by pair):
   that plan.
 
 Shares, such as throttled requests, are compared with Newcombe's interval; the secondary
-metrics' intervals are plain 95 % intervals, shown and never decisive.
+metrics' intervals are plain 95 % intervals on each metric's own trial-to-trial spread, shown
+and never decisive. After an early stop the estimate overstates the change on average (the
+proof stopped because it was large); the interval's coverage holds.
+
+The ETA printed first is learned from the run being proved: what it took around its warm-up and
+window, how long its last operations kept retrying after the window, and a cool-down per
+throttled trial. The first pair corrects it when it was off. Under `--max-duration` the line
+says how many trials the budget is estimated to fit; the proof runs every trial that really
+fits.
 
 A trial that ends throttled (429/503) is followed by a cool-down before the next trial starts:
 the longest `Retry-After` it saw, at least twice the trial warm-up (250 ms to 2 s), at most 5 s.
@@ -127,7 +154,8 @@ The cool-down counts in the budget, Ctrl-C interrupts it, and `notes` says how o
 happened.
 
 `--max-duration` is the one wall-time budget of the whole proof: no trial starts that would not
-end within it. When a budget (`--max-duration`, `--max-requests`, `--max-bytes`) stops the prove
+end within it, and no cool-down is waited past it (a pair whose second trial no longer fits
+after the first one's cool-down is left incomplete and out of the result). When a budget (`--max-duration`, `--max-requests`, `--max-bytes`) stops the prove
 part-way, it still prints and saves the partial result (`budget_exceeded: true`, usually
 `inconclusive`) and exits 4; its trials stay attached, so `oprobe show --rm PROVE` removes them.
 
@@ -146,6 +174,8 @@ the service at its limit). The objective's change prints with its 95 % interval
 | `--with PATH=VALUE` | the change to prove instead of the finding's remedy, repeatable |
 | `--objective goodput\|p99` | what the change is judged on: successful operations (or bytes) per second (default), or the worst per-operation p99 latency |
 | `--max-throttle RATIO` | share of throttled requests a change may cause, e.g. `0.1%` or `0.001` |
+| `--trial DURATION` | measurement window of one trial (default `2s`, at most the run's own window) |
+| `--pairs N` | A/B pairs at most, 3 to 12 (default 6); a value outside that range is a usage error (exit 2) |
 | `--max-duration DURATION` | wall-time budget of the whole proof, e.g. `5m` |
 | `--save FILE\|OPERATOR` | when the verdict is `improved`, write the proven change to an `op.toml` file or to `[operators.OPERATOR]` in the config file. A new file gets the operator with its `${ENV}` references and without secret values; the run's own `op.toml` (or another of the same service) is patched in place; the config file's path saves to the run's `[operators.NAME]`. Any other existing file is refused before a trial runs. The proof is saved first: a save that fails is a note |
 | `--dry-run` | print the number of trials and the ETA of the whole proof, and exit (`-o json`: `schemas/prove-plan.json`) |
@@ -182,12 +212,12 @@ multipart and repeated reads (not bandwidth cap or client bound). `prove` refuse
 
 | Flag | Meaning |
 |---|---|
-| `--list` | list the stored runs (prove trials hidden) |
+| `--list` | list the stored runs (prove trials hidden) and the proves; a long change is cut in the list (`show PROVE` prints it whole) |
 | `--all` | with `--list`: include the prove trials |
-| `--rm RUN…` | delete stored runs |
+| `--rm RUN…` | delete stored runs (a run named twice is deleted once) |
 | `--detail` | every section of the profile: the timeline (one row per interval of 1 s, or 10 s after ten minutes; long runs merge rows), the spread of the requests over keys, sizes, prefixes and remotes, the operator and the five slowest operations |
 | `--by stage\|api\|conn` | group the requests by stage, storage API or connection |
-| `--since DURATION` | only the time range from this far into the window: its goodput, latency quantiles, failures, requests, retries and throttling, where the time went, the verbs, the requests by API and the slowest operations, recomputed from the trace rows (`-o json`: the `range` object). With `--by`, only the range's requests are grouped |
+| `--since DURATION` | only the time range from this far into the window: its goodput, latency quantiles, failures, requests, retries and throttling, where the time went, the verbs, the requests by API and the slowest operations, recomputed from the trace rows (`-o json`: the `range` object). With `--by`, only the range's requests are grouped. In an open-loop run (`--rate`), the arrivals due in the range that never started are counted (`missed_arrivals_count`) and count in its percentiles, each at the least it waited, as in the whole run: the percentiles are then "at least" values, printed with `≥` (`latency_at_least`) |
 | `--until DURATION` | only the time range up to this far into the window (default: its end) |
 
 An operation counts in the range it started in, a request in the range it was sent in. When the

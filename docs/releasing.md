@@ -30,9 +30,9 @@
 
 | Crate | Published | Promise |
 |---|---|---|
-| `oprobe-trace` | yes | semver: the documented API and the `oprobe.trace/9` format are stable across 9.x |
+| `oprobe-trace` | yes | semver for the documented API; an `oprobe.trace/9` file is read by the version that wrote it, with no promise across versions |
 | `oprobe-core` | yes, so that `cargo install oprobe` works | none: internal, documented as such; `oprobe` pins it with `=` |
-| `oprobe` | yes | the CLI, the JSON output and the `.oprobe` / `.prove.json` files are stable across 9.x |
+| `oprobe` | yes | the CLI and the JSON output are stable across 9.x; `.oprobe` / `.prove.json` files are read by the version that wrote them, with no promise across versions |
 
 The crates-io job publishes them in that order (`oprobe-trace`, `oprobe-core`, `oprobe`); a crate
 already on crates.io at this version is skipped, so a re-run is safe. CI runs

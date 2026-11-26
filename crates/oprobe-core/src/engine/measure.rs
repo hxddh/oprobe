@@ -69,16 +69,11 @@ impl Rails {
     pub fn plan(&self, profile: &Profile) -> Plan {
         crate::guard::plan(profile, &self.run_prefix, self.read_only, &self.budgets)
     }
-
-    /// A live guard for these budgets (none when no budget is set).
-    pub fn guard(&self, profile: &Profile) -> Option<Arc<Guard>> {
-        guard_for(&self.budgets, profile)
-    }
 }
 
 /// A live guard enforcing `budgets` (none when empty). Share it between measurements for one
 /// aggregate budget.
-pub fn guard_for(budgets: &Budgets, _profile: &Profile) -> Option<Arc<Guard>> {
+pub fn guard_for(budgets: &Budgets) -> Option<Arc<Guard>> {
     (!budgets.is_empty()).then(|| Guard::new(budgets.clone()))
 }
 
@@ -197,6 +192,9 @@ pub fn spec_of(profile: &Profile, target_name: Option<&str>) -> RunSpec {
         .unwrap_or_else(|| profile.operator.url.clone());
     RunSpec::new(profile, operator_ref)
 }
+
+/// The error of a run whose file cannot be written.
+const CANNOT_SAVE: &str = "cannot save the run (set OPROBE_DATA_DIR or pass --no-save)";
 
 /// A finished measurement.
 pub struct Measured {
@@ -351,11 +349,35 @@ pub async fn measure(req: Request) -> Result<Measured> {
     // The run file is written while the run is in progress (design v5 §2).
     if let Some(s) = &store {
         let header = crate::store::runfile::RunHeader::new(rails.run_id.to_string(), spec.clone());
-        let st = crate::store::runfile::RunFileStream::create(
+        let created = crate::store::runfile::RunFileStream::create(
             &s.run_path(&rails.run_id.to_string()),
             &header,
             trace_max_requests,
-        )?;
+        );
+        let st = match created {
+            Ok(st) => st,
+            // The session is open: its dataset is on the target. The run cannot be saved, so
+            // it is not measured, but what it wrote is removed all the same (9.2 returned
+            // here and left the dataset).
+            Err(e) => {
+                stage(Stage::Measured);
+                stage(Stage::CleaningUp);
+                let cleanup = session.close().await;
+                if let Some(p) = pending
+                    && (cleanup.verified || !cleanup.enabled)
+                {
+                    p.finish();
+                }
+                let e = e.context(CANNOT_SAVE);
+                return Err(match cleanup.error {
+                    Some(left) => e.context(format!(
+                        "the test data under {} could not be removed: {left}",
+                        cleanup.prefix
+                    )),
+                    None => e,
+                });
+            }
+        };
         session.stream_rows(st.clone());
         stream = Some(st);
     }
@@ -425,9 +447,7 @@ pub async fn measure(req: Request) -> Result<Measured> {
         (None, _) => None,
     };
     let path = match saved {
-        Some(r) => Some(r.map_err(|e| {
-            e.context("cannot save the run (set OPROBE_DATA_DIR or pass --no-save)")
-        })?),
+        Some(r) => Some(r.map_err(|e| e.context(CANNOT_SAVE))?),
         None => None,
     };
     Ok(Measured {
@@ -464,7 +484,7 @@ mod tests {
             max_requests_count: Some(1_000_000_000),
             ..Default::default()
         };
-        let guard = guard_for(&budgets, &p);
+        let guard = guard_for(&budgets);
         let rails = Rails::new(&p, false, None, budgets.clone()).unwrap();
         let mut req = Request::new(p.clone(), rails, Cancel::new(), silent());
         req.store = Some(store.clone());
@@ -480,7 +500,7 @@ mod tests {
             max_requests_count: Some(used),
             ..Default::default()
         };
-        let g2 = guard_for(&tight, &p).unwrap();
+        let g2 = guard_for(&tight).unwrap();
         g2.add(used + 1, 0);
         let rails = Rails::new(&p, false, None, tight).unwrap();
         let mut req = Request::new(p, rails, Cancel::new(), silent());
@@ -501,7 +521,7 @@ mod tests {
         };
         let rails = Rails::new(&p, false, None, budgets.clone()).unwrap();
         let mut req = Request::new(p.clone(), rails, Cancel::new(), silent());
-        req.guard = guard_for(&budgets, &p);
+        req.guard = guard_for(&budgets);
         let m = measure(req).await.unwrap();
         assert_eq!(m.breach.unwrap().budget, "requests");
         assert!(m.run.report.is_partial());
@@ -524,7 +544,7 @@ mod tests {
                     max_requests_count: Some(max),
                     ..Default::default()
                 };
-                let guard = guard_for(&budgets, &p).unwrap();
+                let guard = guard_for(&budgets).unwrap();
                 let rails = Rails::new(&p, false, None, budgets).unwrap();
                 let mut req = Request::new(p, rails, Cancel::new(), silent());
                 req.guard = Some(guard.clone());
@@ -554,6 +574,50 @@ mod tests {
         assert_eq!(m.breach.as_ref().unwrap().budget, "requests");
         assert!(m.run.report.is_partial());
         assert_eq!(m.run.report.verdict.exit_code, exit::BUDGET);
+    }
+
+    /// K1-8: a run whose file cannot be created is not measured, but the dataset it had
+    /// already uploaded is removed (9.2 returned the error and left it on the target).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_file_that_cannot_be_created_still_cleans_up() {
+        let lab = crate::lab::LabServer::spawn("127.0.0.1:0", Default::default())
+            .await
+            .unwrap();
+        let lab = Arc::new(lab);
+        let mut p = lab.profile("bkt");
+        p.workload = quick("memory://").workload;
+        let dir = tempfile::tempdir().unwrap();
+        // The store's directory cannot be made: a file is in its way.
+        let blocked = dir.path().join("data");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let pending = dir.path().join("pending");
+        let rails = Rails::new(&p, false, None, Budgets::default()).unwrap();
+        let prefix = rails.run_prefix.clone();
+        let own = rails.run_id.to_string();
+        let uploaded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (seen, target) = (uploaded.clone(), lab.clone());
+        // The dataset is on the target when the run file is created: the upload reports it.
+        let progress: ProgressFn = Arc::new(move |p| {
+            if matches!(&p, crate::engine::Progress::Message(m) if m.starts_with("dataset ready")) {
+                seen.store(
+                    target.stored_object_count(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+        });
+        let mut req = Request::new(p, rails, Cancel::new(), progress);
+        req.store = Some(RunStore::new(blocked.join("runs")));
+        req.pending_dir = Some(pending.clone());
+        let e = measure(req).await.err().expect("the run cannot be saved");
+        assert!(format!("{e:#}").contains("cannot save the run"), "{e:#}");
+        assert!(
+            uploaded.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the dataset was uploaded before the run file failed"
+        );
+        assert_eq!(lab.stored_object_count(), 0, "left under {prefix}");
+        assert_eq!(lab.open_uploads(), 0);
+        // Nothing is left: no marker for the next run to sweep either.
+        assert!(!pending.join(&own).exists());
     }
 
     /// A run killed hard leaves its marker; the next run against the same target deletes its

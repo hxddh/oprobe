@@ -364,8 +364,14 @@ pub fn trace_run(mut file: TraceFile, path: &Path) -> Result<Run, crate::errors:
     profile.name = None;
     let snapshot = std::mem::take(&mut file.snapshot);
     if let Some(svc) = file.service.as_ref() {
-        profile.operator.http.version = svc.http_version;
-        profile.operator.http.keep_alive = svc.keep_alive;
+        // Absent when the operator's own transport carried the requests (the instrumented
+        // client was not in use) and in a file that does not say: the defaults stay.
+        if let Some(version) = svc.http_version {
+            profile.operator.http.version = version;
+        }
+        if let Some(keep_alive) = svc.keep_alive {
+            profile.operator.http.keep_alive = keep_alive;
+        }
         if let Some(limit) = svc.max_inflight_count {
             profile.operator.layers.concurrent_limit = Some(crate::operator::ConcurrentLimit {
                 http: Some(limit),
@@ -497,9 +503,7 @@ mod tests {
             scheme: scheme.into(),
             name: name.into(),
             root: root.into(),
-            http_version: crate::trace::HttpVersion::Auto,
-            keep_alive: true,
-            max_inflight_count: None,
+            ..Default::default()
         };
         assert_eq!(operator_url(None), "unknown://");
         assert_eq!(operator_url(Some(&s("s3", "bkt", "/"))), "s3://bkt");

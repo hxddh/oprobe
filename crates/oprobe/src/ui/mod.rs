@@ -79,7 +79,7 @@ pub fn run_gui() -> std::process::ExitCode {
     )
     .into();
     // The window is gone: a job still running is stopped and its test data removed.
-    store::finish_jobs();
+    store::finish_jobs(crate::app::STOP_GRACE);
     if code != std::process::ExitCode::SUCCESS {
         log_fatal("the window ended with an error");
     }
@@ -139,7 +139,7 @@ pub fn log_fatal(msg: &str) {
 pub fn App() -> impl IntoElement {
     match nsh_base::tokens_of(Some(include_str!("theme.json"))) {
         Ok(tokens) => set_tokens(tokens),
-        Err(e) => eprintln!("oprobe: theme.json: {e}"),
+        Err(e) => oprobe_core::output::stderr_line(format_args!("oprobe: theme.json: {e}")),
     }
     if !kit::in_terminal() {
         let mut look = nsh_base::ScrollbarLook::default();
@@ -155,7 +155,7 @@ pub fn App() -> impl IntoElement {
     i18n::set_global(s.lang.get_untracked());
     views::shell::install_app_effects(s);
     nsh_core::element::desktop::on_app_quit(move || {
-        store::finish_jobs();
+        store::finish_jobs(crate::app::STOP_GRACE);
         async {}
     });
     // Only the detail column paints the window's background: the sidebar lets the platform's

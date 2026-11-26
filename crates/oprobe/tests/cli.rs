@@ -677,6 +677,10 @@ fn prove_judges_a_change_and_hides_its_trials() {
     assert_eq!(v["run_id"], run_id.as_str());
     assert_eq!(v["change"][0], "read.gap=1MiB");
     assert!(v["diff"]["toml"].as_str().unwrap().contains("gap"), "{v}");
+    // K4-2: the whole changed operator as Rust that pastes, beside the diff lines.
+    let rust = v["diff"]["operator_rust"].as_str().unwrap();
+    assert!(rust.contains("fn build_operator()"), "{rust}");
+    assert!(rust.contains(".gap(") && !rust.starts_with('+'), "{rust}");
     assert_eq!(v["pairs_count"], 3);
     let d = &v["objective_delta"];
     assert!(d["low"].as_f64().unwrap() > -1.0, "never below -100 %: {d}");
@@ -799,35 +803,51 @@ fn prove_needs_three_pairs_to_decide() {
     let env = Env::new();
     let o = env.run(&run_args(&["lab://clean"], &["-q", "-o", "json"]));
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    // Whatever one pair measures, it cannot decide.
+    // Whatever one or two pairs measure, they cannot decide. A trial is 500 ms of window and
+    // 100 ms of warm-up: three pairs take at least 3.6 s and never fit in 3 s, and one pair
+    // fits while a trial takes up to 1.5 s (9.2's `--trial 300ms --max-duration 1s` left a
+    // slow machine 100 ms a trial; 9.3 no longer starts the second half of a pair past the
+    // budget, so that margin showed).
     let o = env.run(&[
         "prove",
         "last",
         "--with",
         "layers.retry.min_delay=10ms",
         "--trial",
-        "300ms",
+        "500ms",
         "--max-duration",
-        "1s",
+        "3s",
         "-o",
         "json",
     ]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let v = json(&o);
     validate("prove", &v);
-    assert_eq!(v["pairs_count"], 1, "{v}");
+    let pairs = v["pairs_count"].as_u64().unwrap();
+    assert!((1..=2).contains(&pairs), "{v}");
     assert_eq!(v["verdict"], "inconclusive", "{v}");
     assert!(
-        v["notes"]
-            .as_array()
+        v["notes"].as_array().unwrap().iter().any(|n| n
+            .as_str()
             .unwrap()
-            .iter()
-            .any(|n| n.as_str().unwrap().contains("allowed only 1 pair")),
+            .contains(&format!("allowed only {pairs} pair"))),
         "{v}"
     );
     // `--pairs` below three is refused.
     let o = env.run(&["prove", "last", "--with", "read.gap=1MiB", "--pairs", "2"]);
     assert_eq!(code(&o), 2, "{}", stderr(&o));
+    // And above twelve, the most the sequential test is calibrated for (9.2 ran `--pairs 13`
+    // as 12 without a word).
+    let o = env.run(&["prove", "last", "--with", "read.gap=1MiB", "--pairs", "13"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("at most 12"), "{}", stderr(&o));
+    // The flag the docs cite is in the help, with its range.
+    let help = stdout(&env.run(&["prove", "--help"]));
+    assert!(
+        help.contains("--pairs <N>") && help.contains("3 to 12"),
+        "{help}"
+    );
+    assert!(help.contains("--trial <DURATION>"), "{help}");
 }
 
 /// `--with` (and `--set`) pairs apply as one change, in any order: a layer switched on with its
@@ -990,8 +1010,8 @@ fn prove_never_prints_or_stores_secrets() {
     }
 }
 
-/// One prove budget (6.3): `--max-duration` bounds the whole proof, `--budget` is a hidden
-/// alias, and the dry run estimates the whole proof.
+/// One prove budget: `--max-duration` bounds the whole proof, and the dry run estimates the
+/// whole proof.
 #[test]
 fn prove_has_one_budget_and_estimates_the_whole_proof() {
     let env = Env::new();
@@ -1000,39 +1020,37 @@ fn prove_has_one_budget_and_estimates_the_whole_proof() {
     assert!(!h.contains("--budget"), "{h}");
     let o = env.run(&run_args(&["lab://clean"], &["-q", "-o", "json"]));
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    for flag in ["--max-duration", "--budget"] {
-        let o = env.run(&[
-            "prove",
-            "last",
-            "--with",
-            "read.gap=1MiB",
-            flag,
-            "90s",
-            "--dry-run",
-            "-o",
-            "json",
-        ]);
-        assert_eq!(code(&o), 0, "{flag}: {}", stderr(&o));
-        validate("prove-plan", &json(&o));
-        let p = &json(&o)["proof"];
-        assert_eq!(p["budget_s"], 90.0, "{flag}: {p}");
-        assert_eq!(p["pairs_min_count"], 3, "{p}");
-        assert_eq!(p["trials_max_count"], 12, "{p}");
-        let (lo, hi) = (
-            p["eta_min_s"].as_f64().unwrap(),
-            p["eta_max_s"].as_f64().unwrap(),
-        );
-        assert!(lo > 0.0 && lo <= hi && hi <= 90.0, "{p}");
-        // Six trials at least: the estimate is the proof's, not one trial's.
-        assert!(lo >= 6.0 * p["trial_eta_s"].as_f64().unwrap() - 1e-6, "{p}");
-        assert!(
-            p["command"]
-                .as_str()
-                .unwrap()
-                .ends_with("--with read.gap=1MiB --max-duration 90s"),
-            "{p}"
-        );
-    }
+    let o = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "read.gap=1MiB",
+        "--max-duration",
+        "90s",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    validate("prove-plan", &json(&o));
+    let p = &json(&o)["proof"];
+    assert_eq!(p["budget_s"], 90.0, "{p}");
+    assert_eq!(p["pairs_min_count"], 3, "{p}");
+    assert_eq!(p["trials_max_count"], 12, "{p}");
+    let (lo, hi) = (
+        p["eta_min_s"].as_f64().unwrap(),
+        p["eta_max_s"].as_f64().unwrap(),
+    );
+    assert!(lo > 0.0 && lo <= hi && hi <= 90.0, "{p}");
+    // Six trials at least: the estimate is the proof's, not one trial's.
+    assert!(lo >= 6.0 * p["trial_eta_s"].as_f64().unwrap() - 1e-6, "{p}");
+    assert!(
+        p["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("--with read.gap=1MiB --max-duration 90s"),
+        "{p}"
+    );
     let o = env.run(&["prove", "last", "--with", "read.gap=1MiB", "--dry-run"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let t = stdout(&o);
@@ -1179,7 +1197,7 @@ fn a_closed_stdout_ends_quietly() {
 }
 
 /// `run A B` runs one workload for every operator (K2): the first operator's, not each lab's
-/// own defaults (7.0: 28 workers on `lab://demo`, 16 on `lab://ratelimit`). The budgets cover
+/// own defaults (7.0: its workers on `lab://demo`, 16 on `lab://ratelimit`). The budgets cover
 /// what all the operators spend together.
 #[test]
 fn several_operators_share_one_workload_and_one_budget() {

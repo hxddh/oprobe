@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 
 use super::capacity::Confidence;
-use super::hypothesis::{Hypothesis, HypothesisKind, HypothesisParams};
+use super::hypothesis::{Direction, Hypothesis, HypothesisKind, HypothesisParams};
 use crate::model::{OpRow, ReqRow};
 
 /// What the rows do not carry: the client's own saturation.
@@ -68,6 +68,8 @@ struct Obs {
     key: u32,
     /// Index into the prefix table.
     prefix: u32,
+    /// The request's API class (an index: equal for requests of one storage API).
+    api: u32,
     body: (i64, i64),
     bytes_down: u64,
     /// When the request body was sent (µs), and its bytes.
@@ -99,6 +101,7 @@ fn observations(reqs: &[&ReqRow], ops: &[&OpRow]) -> (Vec<Obs>, Vec<String>, Vec
     let mut prefixes: Vec<String> = Vec::new();
     let mut kidx: HashMap<&str, u32> = HashMap::new();
     let mut pidx: HashMap<&str, u32> = HashMap::new();
+    let mut aidx: HashMap<&str, u32> = HashMap::new();
     let iv: Vec<(i64, i64)> = reqs.iter().map(|q| server_interval(q)).collect();
     let mut ev: Vec<(i64, i32, usize)> = Vec::with_capacity(iv.len() * 2);
     for (i, (s, e)) in iv.iter().enumerate() {
@@ -130,9 +133,12 @@ fn observations(reqs: &[&ReqRow], ops: &[&OpRow]) -> (Vec<Obs>, Vec<String>, Vec
                 prefixes.push(pre.to_owned());
                 n
             });
+            let n = aidx.len() as u32;
+            let api = *aidx.entry(q.api.label()).or_insert(n);
             let send_start = q.t_us + (q.queue_us + q.connect_us()) as i64;
             let body_start = send_start + (q.send_us + q.ttfb_us) as i64;
             Obs {
+                api,
                 t: iv[i].0,
                 level: level[i],
                 thr: q.is_throttle(),
@@ -775,74 +781,134 @@ fn gauss_ll(sse: f64, n: f64) -> f64 {
 /// busy varies no load, and a curve over 14 to 16 requests in flight is not a limit (N2).
 const QUEUEING_LOAD_SPAN: u32 = 2;
 
+/// A level of requests in flight is populated from this many answered requests.
+const POPULATED: f64 = 10.0;
+
+/// The time a queue of `servers` adds at `level` requests in flight, as a multiple of the
+/// service time: `1 + max(0, level − servers) / servers`.
+fn queue_factor(level: u32, servers: u32) -> f64 {
+    1.0 + level.saturating_sub(servers) as f64 / servers.max(1) as f64
+}
+
+/// Sufficient statistics of `ln(ttfb ms)` in one cell: count, sum, sum of squares.
+type LnStats = (f64, f64, f64);
+
 /// Queueing vs constant latency over the time to first byte by in-flight level, and whether
 /// the run varied its load enough to assert it ([`QUEUEING_LOAD_SPAN`]).
+///
+/// Every storage API has its own service time (K2-7): the queue is one — the level counts
+/// every request in flight — but a HEAD answers faster than a ranged GET at any level. 9.2
+/// fitted one service time to all of them, so a workload whose quick requests run at a low
+/// level and whose slow ones at a high level (a parquet scan: a HEAD, a footer, then the
+/// column ranges side by side) read as latency that grows with load. Both models now carry
+/// one intercept per API, and the growth is what is left within an API.
 fn queueing_fits(obs: &[Obs]) -> Option<(Fit, Fit, bool)> {
-    // Per-level sufficient statistics of ln(ttfb ms).
-    let mut lv: HashMap<u32, (f64, f64, f64)> = HashMap::new();
+    // Per (API, level) sufficient statistics of ln(ttfb ms).
+    let mut cells: HashMap<(u32, u32), LnStats> = HashMap::new();
     for o in obs.iter().filter(|o| o.ok && !o.thr && o.ttfb_us > 0) {
         let y = (o.ttfb_us as f64 / 1000.0).ln();
-        let e = lv.entry(o.level).or_default();
+        let e = cells.entry((o.api, o.level)).or_default();
         e.0 += 1.0;
         e.1 += y;
         e.2 += y * y;
     }
-    let mut levels: Vec<(u32, (f64, f64, f64))> = lv.into_iter().collect();
+    // In a fixed order: the sums are the same on every run (U9).
+    let mut cells: Vec<((u32, u32), LnStats)> = cells.into_iter().collect();
+    cells.sort_by_key(|x| x.0);
+    let mut apis: Vec<u32> = cells.iter().map(|x| x.0.0).collect();
+    apis.dedup();
+    let n: f64 = cells.iter().map(|(_, s)| s.0).sum();
+    // Per level over every API: how many requests, and their mean distance (in ln) from
+    // their own API's mean — the growth that is not a difference between APIs.
+    let api_mean: HashMap<u32, f64> = apis
+        .iter()
+        .map(|a| {
+            let (cnt, sum) = cells
+                .iter()
+                .filter(|x| x.0.0 == *a)
+                .fold((0.0, 0.0), |acc, (_, s)| (acc.0 + s.0, acc.1 + s.1));
+            (*a, sum / cnt)
+        })
+        .collect();
+    let mut levels: Vec<(u32, f64, f64)> = Vec::new();
+    for ((a, l), s) in &cells {
+        let dev = s.1 - s.0 * api_mean[a];
+        match levels.iter_mut().find(|x| x.0 == *l) {
+            Some(x) => {
+                x.1 += s.0;
+                x.2 += dev;
+            }
+            None => levels.push((*l, s.0, dev)),
+        }
+    }
     levels.sort_by_key(|x| x.0);
-    let populated = levels.iter().filter(|(_, s)| s.0 >= 10.0).count();
-    let n: f64 = levels.iter().map(|(_, s)| s.0).sum();
+    let populated = levels.iter().filter(|x| x.1 >= POPULATED).count();
     if populated < 3 || n < 50.0 {
         return None;
     }
-    let sy: f64 = levels.iter().map(|(_, s)| s.1).sum();
-    let syy: f64 = levels.iter().map(|(_, s)| s.2).sum();
-    let null_sse = syy - sy * sy / n;
+    let sy: f64 = cells.iter().map(|(_, s)| s.1).sum();
+    let typical_ms = (sy / n).exp();
+    let null_sse: f64 = cells
+        .iter()
+        .map(|((a, _), s)| {
+            let m = api_mean[a];
+            s.2 - 2.0 * m * s.1 + s.0 * m * m
+        })
+        .sum();
+    let intercepts = apis.len() as f64;
     let null = Fit {
         kind: HypothesisKind::None,
         params: HypothesisParams {
-            service_ms: Some((sy / n).exp()),
+            service_ms: Some(typical_ms),
             ..Default::default()
         },
         ll: gauss_ll(null_sse, n),
-        k: 2.0,
+        k: intercepts + 1.0,
         explains: 0.0,
         evidence: vec![format!(
-            "time to first byte stays ≈{:.1} ms whatever the requests in flight",
-            (sy / n).exp()
+            "time to first byte stays ≈{typical_ms:.1} ms whatever the requests in flight"
         )],
     };
     let max_level = levels.last().map_or(1, |x| x.0);
+    // (servers, ln of the typical service time, sum of squares)
     let mut best: Option<(u32, f64, f64)> = None;
     for c in 1..max_level {
-        let g = |l: u32| (1.0 + (l.saturating_sub(c)) as f64 / c as f64).ln();
-        // Best ln s: mean of y − g(L).
-        let shift: f64 = levels.iter().map(|(l, s)| s.1 - s.0 * g(*l)).sum::<f64>() / n;
-        let sse: f64 = levels
-            .iter()
-            .map(|(l, s)| {
-                let m = shift + g(*l);
-                s.2 - 2.0 * m * s.1 + s.0 * m * m
-            })
-            .sum();
+        let g = |l: u32| queue_factor(l, c).ln();
+        let (mut sse, mut shifts) = (0.0, 0.0);
+        for a in &apis {
+            let of_api = || cells.iter().filter(|x| x.0.0 == *a);
+            let cnt: f64 = of_api().map(|(_, s)| s.0).sum();
+            // Best ln s of this API: mean of y − g(L).
+            let shift: f64 = of_api().map(|((_, l), s)| s.1 - s.0 * g(*l)).sum::<f64>() / cnt;
+            sse += of_api()
+                .map(|((_, l), s)| {
+                    let m = shift + g(*l);
+                    s.2 - 2.0 * m * s.1 + s.0 * m * m
+                })
+                .sum::<f64>();
+            shifts += shift * cnt;
+        }
         if best.as_ref().is_none_or(|b| sse < b.2) {
-            best = Some((c, shift.exp(), sse));
+            best = Some((c, shifts / n, sse));
         }
     }
-    let (c, s_ms, sse) = best?;
+    let (c, ln_s, sse) = best?;
+    let s_ms = ln_s.exp();
     // Effect size: at the busiest well-populated level latency must be ≥ 25 % above service.
     let busiest = levels
         .iter()
         .rev()
-        .find(|(_, s)| s.0 >= 10.0)
+        .find(|x| x.1 >= POPULATED)
         .map_or(c, |x| x.0);
-    let factor = 1.0 + busiest.saturating_sub(c) as f64 / c as f64;
+    let factor = queue_factor(busiest, c);
+    // The typical request's time to first byte at a level.
     let mean_at = |l: u32| {
         levels
             .iter()
             .find(|x| x.0 == l)
-            .map_or(0.0, |(_, s)| (s.1 / s.0).exp())
+            .map_or(0.0, |x| typical_ms * (x.2 / x.1).exp())
     };
-    let lowest = levels.iter().find(|(_, s)| s.0 >= 10.0).map_or(c, |x| x.0);
+    let lowest = levels.iter().find(|x| x.1 >= POPULATED).map_or(c, |x| x.0);
     let observed_growth = mean_at(busiest) / mean_at(lowest).max(1e-9);
     let mut q = Fit {
         kind: HypothesisKind::Queueing,
@@ -852,7 +918,7 @@ fn queueing_fits(obs: &[Obs]) -> Option<(Fit, Fit, bool)> {
             ..Default::default()
         },
         ll: gauss_ll(sse, n),
-        k: 3.0,
+        k: intercepts + 2.0,
         explains: ((factor - 1.0) / factor).clamp(0.0, 1.0),
         evidence: vec![format!(
             "time to first byte grows with the requests in flight: {:.1} ms at {lowest}, {:.1} ms at {busiest} (≈{s_ms:.1} ms of service with {c} served at once)",
@@ -867,42 +933,156 @@ fn queueing_fits(obs: &[Obs]) -> Option<(Fit, Fit, bool)> {
     let varied = busiest >= QUEUEING_LOAD_SPAN * lowest;
     if !varied {
         q.evidence.push(format!(
-            "the requests in flight stayed between {lowest} and {busiest}: one run that varies no load cannot assert it (`oprobe prove` varies the load)"
+            "the requests in flight stayed between {lowest} and {busiest}: one run that varies no load cannot assert it (vary it with `--set shape=ramp:FROM..TO/D`)"
         ));
     }
     Some((q, null, varied))
 }
 
-/// The direction of the bodies a bandwidth fit reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Direction {
-    /// Response bodies (`bytes_down` over the body stage).
-    Download,
-    /// Request bodies (`bytes_up` over the send stage).
-    Upload,
+/// What a fitted queue of `servers` costs the requests of a window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QueueWait {
+    /// The busiest populated level of requests in flight.
+    pub busiest_inflight_count: u32,
+    /// The mean wait in the queue of a request that arrived at that level (ms).
+    pub busiest_wait_ms: f64,
+    /// The wait in the queue of every answered request together (µs).
+    pub wait_us: f64,
 }
 
-/// How the evidence of an upload cap opens; a download cap's opens "the streams share". The
-/// direction of a [`HypothesisKind::BandwidthCap`] is told by its evidence ([`is_upload_cap`]),
-/// not by a field of its own.
-const UPLOAD_CAP: &str = "the upload streams share";
-
-/// `h` is a bandwidth cap fitted on the request bodies (an uplink at its capacity), not on
-/// the response bodies.
-pub fn is_upload_cap(h: &Hypothesis) -> bool {
-    h.kind == HypothesisKind::BandwidthCap
-        && h.evidence
-            .first()
-            .is_some_and(|e| e.starts_with(UPLOAD_CAP))
+/// The wait the queueing model of `servers` attributes to the requests that started in
+/// `[from_us, to_us)`: of a request that arrived at `L` in flight, the share `1 − 1/factor(L)`
+/// of its own time to first byte. It is the model's wait, request by request: unlike "time
+/// to first byte beyond the service time", noise around the service time adds nothing to it.
+pub fn queue_wait(reqs: &[ReqRow], window: (i64, i64), servers: u64) -> Option<QueueWait> {
+    let servers = u32::try_from(servers).ok().filter(|s| *s > 0)?;
+    let rows: Vec<&ReqRow> = reqs
+        .iter()
+        .filter(|q| q.t_us >= window.0 && q.t_us < window.1)
+        .collect();
+    let (obs, _, _) = observations(&rows, &[]);
+    let answered = || obs.iter().filter(|o| o.ok && !o.thr && o.ttfb_us > 0);
+    let wait = |o: &Obs| o.ttfb_us as f64 * (1.0 - 1.0 / queue_factor(o.level, servers));
+    let mut per_level: HashMap<u32, (f64, f64)> = HashMap::new();
+    for o in answered() {
+        let e = per_level.entry(o.level).or_default();
+        e.0 += 1.0;
+        e.1 += wait(o);
+    }
+    let (busiest, (count, sum)) = per_level
+        .into_iter()
+        .filter(|(_, s)| s.0 >= POPULATED)
+        .max_by_key(|(l, _)| *l)?;
+    Some(QueueWait {
+        busiest_inflight_count: busiest,
+        busiest_wait_ms: sum / count / 1000.0,
+        wait_us: answered().map(wait).sum(),
+    })
 }
 
-impl Direction {
-    /// When `o` moved its body in this direction (µs), and how many bytes.
-    fn stream(self, o: &Obs) -> ((i64, i64), u64) {
-        match self {
-            Self::Download => (o.body, o.bytes_down),
-            Self::Upload => (o.upload, o.bytes_up),
-        }
+/// How the time to first byte moved as the requests in flight rose, over the requests of a
+/// window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TtfbGrowth {
+    /// Slope of `ln ttfb` on `ln level`, within each API: 0 for a service that answers as
+    /// fast whatever is in flight, 1 for one where every further request only waits.
+    pub elasticity: f64,
+    /// Standard error of the slope.
+    pub stderr: f64,
+    /// The busiest populated level, and the typical time to first byte there (ms).
+    pub busy_inflight_count: u32,
+    pub busy_ttfb_ms: f64,
+    /// The typical time to first byte at half that level or less (ms).
+    pub quiet_ttfb_ms: f64,
+}
+
+impl TtfbGrowth {
+    /// The time to first byte stayed put as the requests in flight at least doubled, beyond
+    /// doubt (less than a quarter of proportional growth, two standard errors included): the
+    /// service had room for all of them.
+    pub fn flat(&self) -> bool {
+        self.elasticity + 2.0 * self.stderr < 0.25
+    }
+}
+
+/// [`TtfbGrowth`] of the requests that started in `[from_us, to_us)`; `None` when the run
+/// did not send enough of them at half its busiest level or less.
+///
+/// "Enough" is twice the busiest level. The rows of a window do not show the requests still
+/// in flight from before it, so its first requests only seem to arrive at few in flight —
+/// at most one per level below the busiest. They carry the busy level's time to first byte
+/// and would make any service look as if it had room; among twice as many real ones they
+/// cannot.
+pub fn ttfb_growth(reqs: &[ReqRow], window: (i64, i64)) -> Option<TtfbGrowth> {
+    let rows: Vec<&ReqRow> = reqs
+        .iter()
+        .filter(|q| q.t_us >= window.0 && q.t_us < window.1)
+        .collect();
+    let (obs, _, _) = observations(&rows, &[]);
+    // (API, level, ln level, ln ttfb ms)
+    let pts: Vec<(u32, u32, f64, f64)> = obs
+        .iter()
+        .filter(|o| o.ok && !o.thr && o.ttfb_us > 0)
+        .map(|o| {
+            (
+                o.api,
+                o.level,
+                f64::from(o.level).ln(),
+                (o.ttfb_us as f64 / 1000.0).ln(),
+            )
+        })
+        .collect();
+    let mut per_level: HashMap<u32, f64> = HashMap::new();
+    for p in &pts {
+        *per_level.entry(p.1).or_default() += 1.0;
+    }
+    let busy = per_level
+        .iter()
+        .filter(|(_, n)| **n >= POPULATED)
+        .map(|(l, _)| *l)
+        .max()?;
+    let geo_mean = |keep: &dyn Fn(u32) -> bool, at_least: usize| {
+        let v: Vec<f64> = pts.iter().filter(|p| keep(p.1)).map(|p| p.3).collect();
+        (v.len() >= at_least).then(|| (v.iter().sum::<f64>() / v.len() as f64).exp())
+    };
+    let quiet_ttfb_ms = geo_mean(&|l| l * 2 <= busy, 2 * busy as usize)?;
+    let busy_ttfb_ms = geo_mean(&|l| l == busy, 1)?;
+    // Within-API least squares: both axes centred on their API's mean.
+    let mut means: HashMap<u32, (f64, f64, f64)> = HashMap::new();
+    for p in &pts {
+        let e = means.entry(p.0).or_default();
+        e.0 += 1.0;
+        e.1 += p.2;
+        e.2 += p.3;
+    }
+    let (mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0);
+    for p in &pts {
+        let m = means[&p.0];
+        let (x, y) = (p.2 - m.1 / m.0, p.3 - m.2 / m.0);
+        sxx += x * x;
+        sxy += x * y;
+        syy += y * y;
+    }
+    let dof = pts.len() as f64 - means.len() as f64 - 1.0;
+    if sxx <= 0.0 || dof < 30.0 {
+        return None;
+    }
+    let elasticity = sxy / sxx;
+    let residual = (syy - elasticity * sxy).max(0.0);
+    Some(TtfbGrowth {
+        elasticity,
+        stderr: (residual / dof / sxx).sqrt(),
+        busy_inflight_count: busy,
+        busy_ttfb_ms,
+        quiet_ttfb_ms,
+    })
+}
+
+/// When `o` moved its body in direction `dir` (µs), and how many bytes.
+fn stream(dir: Direction, o: &Obs) -> ((i64, i64), u64) {
+    match dir {
+        Direction::Download => (o.body, o.bytes_down),
+        Direction::Upload => (o.upload, o.bytes_up),
     }
 }
 
@@ -913,7 +1093,7 @@ fn bandwidth_fits(obs: &[Obs], dir: Direction) -> Option<(Fit, Fit, f64)> {
     let streams: Vec<(bool, (i64, i64), u64)> = obs
         .iter()
         .map(|o| {
-            let (span, bytes) = dir.stream(o);
+            let (span, bytes) = stream(dir, o);
             (o.ok, span, bytes)
         })
         .collect();
@@ -1002,6 +1182,7 @@ fn bandwidth_fits(obs: &[Obs], dir: Direction) -> Option<(Fit, Fit, f64)> {
         kind: HypothesisKind::BandwidthCap,
         params: HypothesisParams {
             bytes_per_s: Some(agg_mean.exp()),
+            direction: Some(dir),
             ..Default::default()
         },
         ll: gauss_ll(agg_sse, n),
@@ -1011,7 +1192,7 @@ fn bandwidth_fits(obs: &[Obs], dir: Direction) -> Option<(Fit, Fit, f64)> {
             "{} ≈{:.1} MiB/s: a stream's rate falls as 1/n with the streams running beside it (slope {slope:+.2} of ln rate on ln streams, −1 = a shared cap)",
             match dir {
                 Direction::Download => "the streams share",
-                Direction::Upload => UPLOAD_CAP,
+                Direction::Upload => "the upload streams share",
             },
             mib(agg_mean.exp())
         )],
@@ -1666,7 +1847,7 @@ pub(crate) mod tests {
         let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
         let s = selected(&hs);
         assert_eq!(s.kind, HypothesisKind::BandwidthCap, "{hs:#?}");
-        assert!(is_upload_cap(s), "{:?}", s.evidence);
+        assert_eq!(s.params.direction, Some(Direction::Upload), "{s:#?}");
         assert!(s.confidence >= Confidence::Medium, "{s:#?}");
         let mib_s = s.params.bytes_per_s.unwrap() / (1u64 << 20) as f64;
         assert!((7.0..9.0).contains(&mib_s), "{mib_s}");
@@ -1676,7 +1857,7 @@ pub(crate) mod tests {
         let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
         let s = selected(&hs);
         assert_eq!(s.kind, HypothesisKind::BandwidthCap, "{hs:#?}");
-        assert!(!is_upload_cap(s));
+        assert_eq!(s.params.direction, Some(Direction::Download), "{s:#?}");
         assert!(
             s.evidence[0].starts_with("the streams share"),
             "{:?}",
@@ -1800,5 +1981,57 @@ pub(crate) mod tests {
             },
         );
         assert_eq!(selected(&hs).kind, HypothesisKind::ClientBound);
+    }
+
+    /// A scan-like workload: per burst two HEADs (2 ms each) and then six ranged GETs (20 ms
+    /// each) side by side, so the HEADs arrive at 1–2 requests in flight and the GETs at 3–8.
+    /// `get_ms(level)` is a GET's time to first byte.
+    fn heads_then_gets(get_ms: impl Fn(usize) -> f64) -> (Vec<ReqRow>, Vec<OpRow>) {
+        let (mut reqs, mut ops) = (Vec::new(), Vec::new());
+        let mut id = 0;
+        let mut x = 5u64;
+        for burst in 0..300 {
+            let t0 = burst as f64 * 100.0;
+            for j in 0..8usize {
+                id += 1;
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let noise = 1.0 + ((x >> 40) as f64 / (1u64 << 24) as f64 - 0.5) * 0.2;
+                let head = j < 2;
+                let lat = if head { 2.0 } else { get_ms(j + 1) } * noise;
+                let mut r = req(t0 + j as f64 * 0.01, lat, 200, id);
+                if head {
+                    r.api = crate::trace::Api::HeadObject;
+                    r.method = std::borrow::Cow::Borrowed("HEAD");
+                }
+                reqs.push(r);
+                ops.push(op(id, "k", t0));
+            }
+        }
+        (reqs, ops)
+    }
+
+    /// K2-7: 9.2 fitted one service time to every API, so quick HEADs at a low level and
+    /// slower GETs at a high one read as a time to first byte that grows with the requests in
+    /// flight ("2 ms at 1, 20 ms at 8"). Each API has its own service time: nothing grew.
+    #[test]
+    fn apis_that_differ_in_service_time_are_not_queueing() {
+        let (reqs, ops) = heads_then_gets(|_| 20.0);
+        let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
+        let s = selected(&hs);
+        assert_eq!(s.kind, HypothesisKind::None, "{hs:#?}");
+        assert!(
+            crate::analysis::hypothesis::asserted(&hs)
+                .is_some_and(|h| h.kind == HypothesisKind::None)
+        );
+        // A queue behind the same mix is still found, within the GETs: four served at once.
+        let (reqs, ops) = heads_then_gets(|level| 20.0 * (level as f64 / 4.0).max(1.0));
+        let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
+        let s = selected(&hs);
+        assert_eq!(s.kind, HypothesisKind::Queueing, "{hs:#?}");
+        assert!(s.confidence >= Confidence::Medium, "{s:#?}");
+        let c = s.params.servers_count.unwrap();
+        assert!((3..=5).contains(&c), "{c}");
     }
 }

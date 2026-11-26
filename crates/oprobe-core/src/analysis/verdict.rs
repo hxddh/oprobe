@@ -156,16 +156,18 @@ impl Sprt {
         }
     }
 
-    /// The decision after `n` pairs whose signed log ratios average `mean` with a per-pair
-    /// spread `sd`.
-    pub fn decision(&self, n: usize, mean: f64, sd: f64) -> SprtDecision {
-        if n == 0 || !mean.is_finite() {
+    /// The decision on an estimate `mean` of the signed log ratio whose variance is `weight`
+    /// times a pair's, the pairs spreading by `sd`: `weight` is `1/n` for the plain mean of `n`
+    /// pairs, and the crossover estimate's `(1/n_AB + 1/n_BA) / 4` in [`AbTest`] (9.2 passed
+    /// the pair count here, so with an odd number of pairs the stop assumed a tighter estimate
+    /// than the interval beside it).
+    pub fn decision(&self, weight: f64, mean: f64, sd: f64) -> SprtDecision {
+        if !(weight.is_finite() && weight > 0.0 && mean.is_finite()) {
             return SprtDecision::Continue;
         }
-        let nf = n as f64;
-        let var = sd.max(1e-3).powi(2);
-        // log LR of N(μ, σ²) against N(0, σ²).
-        let llr = |mu: f64| nf * (mu * mean - mu * mu / 2.0) / var;
+        let var = sd.max(1e-3).powi(2) * weight;
+        // log LR of N(μ, σ²·w) against N(0, σ²·w).
+        let llr = |mu: f64| (mu * mean - mu * mu / 2.0) / var;
         let (up, down) = (llr(self.delta), llr(-self.delta));
         let side = self.alpha / 2.0;
         let accept = ((1.0 - self.beta) / side).ln();
@@ -191,6 +193,43 @@ pub fn count_resolution(ops: u64) -> f64 {
     } else {
         (1.0 + 1.0 / ops as f64).ln()
     }
+}
+
+/// The latencies around a trial's p99 differ by more than this: the p99 sits on a cliff
+/// ([`p99_spread`]), and which side of it a trial lands on is chance.
+pub const P99_CLIFF_RATIO: f64 = 2.0;
+
+/// The ranks (1-based, within `1..=n`) that bracket the p99 of `n` sorted latencies:
+/// `0.99·n ± 2·√(0.0099·n)`, two standard deviations of how many of `n` samples fall below
+/// the true p99 (a binomial count). The latencies at these ranks are the p99's order-statistic
+/// interval. `None` when nothing was measured.
+pub fn p99_rank_band(n: u64) -> Option<(u64, u64)> {
+    if n == 0 {
+        return None;
+    }
+    let centre = 0.99 * n as f64;
+    let half = 2.0 * (0.0099 * n as f64).sqrt();
+    let lo = ((centre - half).floor().max(1.0) as u64).min(n);
+    let hi = ((centre + half).ceil().max(1.0) as u64).min(n);
+    Some((lo, hi))
+}
+
+/// The spread of one trial's p99 as a log ratio, from the latencies `lo_ms` and `hi_ms` at the
+/// ranks of [`p99_rank_band`]: the band is two standard deviations either way, so a quarter of
+/// its log width. It is to a p99 what [`count_resolution`] is to a count: what one trial cannot
+/// resolve, however well two trials happen to agree. 0 when the band has no width.
+pub fn p99_spread(lo_ms: f64, hi_ms: f64) -> f64 {
+    if lo_ms > 0.0 && hi_ms > lo_ms && hi_ms.is_finite() {
+        (hi_ms / lo_ms).ln() / 4.0
+    } else {
+        0.0
+    }
+}
+
+/// A trial whose p99 spreads by `spread` ([`p99_spread`]) has latencies around its p99 that
+/// differ by more than [`P99_CLIFF_RATIO`].
+pub fn p99_on_a_cliff(spread: f64) -> bool {
+    spread > P99_CLIFF_RATIO.ln() / 4.0
 }
 
 /// The mean squared log ratio of consecutive trials of one side, with how many ratios it
@@ -296,10 +335,35 @@ pub fn critical(max_pairs: usize, pairs: usize) -> f64 {
 pub struct AbPair {
     pub baseline: f64,
     pub candidate: f64,
-    /// The fewest operations either trial counted (the objective's resolution).
+    /// The fewest operations either trial counted (the resolution of a count).
     pub ops_count: u64,
+    /// A spread of this pair's log ratio that its two values cannot show, 0 when none is
+    /// known: for a p99, both trials' order-statistic spreads ([`p99_spread`]) combined.
+    pub resolution: f64,
     /// The candidate ran first ([`candidate_first`]).
     pub candidate_first: bool,
+}
+
+impl AbPair {
+    /// Both values can be compared as a ratio: finite and above zero. A trial with no
+    /// successful operation has no goodput, and one that measured nothing has no p99; 9.2
+    /// clamped such a value to 1e-9, so a candidate with no latency at all "improved" the p99
+    /// by 100 %.
+    pub fn comparable(&self) -> bool {
+        [self.baseline, self.candidate]
+            .iter()
+            .all(|v| v.is_finite() && *v > 0.0)
+    }
+}
+
+/// The smallest change a proof planned for `max_pairs` pairs can show when a pair's log ratio
+/// spreads by `sd`, as a log ratio: the half-width of its interval at the last look, on the
+/// balanced schedule ([`candidate_first`]).
+pub fn resolvable(max_pairs: usize, sd: f64) -> f64 {
+    let k = max_pairs.clamp(MIN_DECISIVE_PAIRS, MAX_PAIRS);
+    let (n_first, n_second) = (k.div_ceil(2) as f64, (k / 2) as f64);
+    let w = (1.0 / n_first + 1.0 / n_second) / 4.0;
+    critical(k, k) * sd * w.sqrt()
 }
 
 /// What the pairs so far say about the candidate.
@@ -364,8 +428,13 @@ fn crossover(d: &[f64], candidate_first: &[bool]) -> (f64, f64, f64) {
 ///   the chance of a verdict on a change that is none stays under 5 %.
 /// - **Early stop.** From `min_pairs` on, sampling stops once the interval excludes no change
 ///   and an [`Sprt`] agrees the change is at least the minimum effect, or once the SPRT says
-///   no change of that effect is there (futility). Its effect and spread are plug-ins; they
-///   only choose when to stop.
+///   no change of that effect is there (futility). The minimum effect is the smallest change
+///   the planned pairs can show at the spread seen so far ([`resolvable`], at least
+///   [`MIN_EFFECT`]): a proof is abandoned only for a change it could not have shown anyway.
+///   (9.2 took twice the noise floor: a real 15 % gain at a 15 % floor was given up at the
+///   third pair.) The effect and the spread are plug-ins; they only choose when to stop, so
+///   the boundary's error rate holds. An estimate read after an early stop is biased away
+///   from zero (the proof stopped because it was large); the interval's coverage is not.
 #[derive(Clone, Debug)]
 pub struct AbTest {
     higher_is_better: bool,
@@ -388,9 +457,12 @@ impl AbTest {
         }
     }
 
-    /// Add a completed pair; whether to run another.
+    /// Add a completed pair; whether to run another. A pair that cannot be compared
+    /// ([`AbPair::comparable`]) is not added: it is never judged.
     pub fn push(&mut self, pair: AbPair) -> AbDecision {
-        self.pairs.push(pair);
+        if pair.comparable() {
+            self.pairs.push(pair);
+        }
         self.decision()
     }
 
@@ -403,17 +475,33 @@ impl AbTest {
     pub fn noise_floor(&self) -> f64 {
         let a: Vec<f64> = self.pairs.iter().map(|p| p.baseline).collect();
         let b: Vec<f64> = self.pairs.iter().map(|p| p.candidate).collect();
-        let resolution = self
+        let count = self
             .pairs
             .iter()
             .map(|p| p.ops_count)
             .min()
             .map_or(0.0, count_resolution);
-        noise_floor_ab(&a, &b, resolution)
+        // The pairs' own resolution, as the spread it adds to a pair on average.
+        let own = if self.pairs.is_empty() {
+            0.0
+        } else {
+            (self.pairs.iter().map(|p| p.resolution.powi(2)).sum::<f64>() / self.pairs.len() as f64)
+                .sqrt()
+        };
+        noise_floor_ab(&a, &b, count.max(own))
     }
 
-    /// `(estimate, half-width, spread)` of the mean signed log ratio, positive = better.
-    fn estimate(&self) -> Option<(f64, f64, f64)> {
+    /// The smallest change this proof can show at the spread of its pairs so far, as a
+    /// relative change ([`resolvable`]): what a futility stop gave up on. `None` before the
+    /// first pair.
+    pub fn resolvable_change(&self) -> Option<f64> {
+        let (_, _, sd, _) = self.estimate()?;
+        Some(resolvable(self.max_pairs, sd).max(MIN_EFFECT).exp() - 1.0)
+    }
+
+    /// `(estimate, half-width, spread, weight)` of the mean signed log ratio, positive =
+    /// better; the estimate's variance is `weight` times a pair's.
+    fn estimate(&self) -> Option<(f64, f64, f64, f64)> {
         let n = self.pairs.len();
         if n == 0 {
             return None;
@@ -422,25 +510,24 @@ impl AbTest {
             .pairs
             .iter()
             .map(|p| {
-                let (a, b) = (p.baseline.max(1e-9), p.candidate.max(1e-9));
                 if self.higher_is_better {
-                    (b / a).ln()
+                    (p.candidate / p.baseline).ln()
                 } else {
-                    (a / b).ln()
+                    (p.baseline / p.candidate).ln()
                 }
             })
             .collect();
         let orders: Vec<bool> = self.pairs.iter().map(|p| p.candidate_first).collect();
         let (est, w, s) = crossover(&d, &orders);
         let sd = s.max(self.noise_floor());
-        Some((est, critical(self.max_pairs, n) * sd * w.sqrt(), sd))
+        Some((est, critical(self.max_pairs, n) * sd * w.sqrt(), sd, w))
     }
 
     /// The objective's relative change (candidate vs baseline) with its sequential,
     /// order-adjusted 95 % interval, in the metric's own direction (goodput +: more; p99 −:
     /// faster), as `exp(·) − 1` — never below −100 %.
     pub fn interval(&self) -> Interval {
-        let Some((est, half, _)) = self.estimate() else {
+        let Some((est, half, _, _)) = self.estimate() else {
             return Interval::default();
         };
         let (est, lo, hi) = if self.higher_is_better {
@@ -459,7 +546,7 @@ impl AbTest {
     /// fewer than [`MIN_DECISIVE_PAIRS`]).
     pub fn verdict(&self) -> AbVerdict {
         match self.estimate() {
-            Some((est, half, _)) if self.pairs.len() >= MIN_DECISIVE_PAIRS => {
+            Some((est, half, _, _)) if self.pairs.len() >= MIN_DECISIVE_PAIRS => {
                 if est - half > 0.0 {
                     AbVerdict::Improved
                 } else if est + half < 0.0 {
@@ -475,11 +562,11 @@ impl AbTest {
     /// Whether to run another pair.
     pub fn decision(&self) -> AbDecision {
         let n = self.pairs.len();
-        let Some((est, _, sd)) = self.estimate().filter(|_| n >= self.min_pairs) else {
+        let Some((est, _, sd, w)) = self.estimate().filter(|_| n >= self.min_pairs) else {
             return AbDecision::Continue;
         };
-        let delta = (2.0 * self.noise_floor()).max(MIN_EFFECT);
-        let sprt = Sprt::new(delta, ALPHA, BETA).decision(n, est, sd);
+        let delta = resolvable(self.max_pairs, sd).max(MIN_EFFECT);
+        let sprt = Sprt::new(delta, ALPHA, BETA).decision(w, est, sd);
         match (self.verdict(), sprt) {
             (AbVerdict::Improved, SprtDecision::Better)
             | (AbVerdict::Worse, SprtDecision::Worse) => AbDecision::Decided,
@@ -516,24 +603,24 @@ mod tests {
     #[test]
     fn the_sprt_stops_early_on_clear_evidence_and_needs_more_for_noise() {
         let s = Sprt::new(0.05, 0.05, 0.1);
-        assert_eq!(s.decision(0, 0.4, 0.02), SprtDecision::Continue);
-        assert_eq!(s.decision(2, 0.39, 0.02), SprtDecision::Better);
-        assert_eq!(s.decision(2, -0.31, 0.02), SprtDecision::Worse);
+        assert_eq!(s.decision(0.0, 0.4, 0.02), SprtDecision::Continue);
+        assert_eq!(s.decision(0.5, 0.39, 0.02), SprtDecision::Better);
+        assert_eq!(s.decision(0.5, -0.31, 0.02), SprtDecision::Worse);
         // Noise around zero: no early verdict either way.
-        assert_eq!(s.decision(2, 0.005, 0.08), SprtDecision::Continue);
+        assert_eq!(s.decision(0.5, 0.005, 0.08), SprtDecision::Continue);
         assert_eq!(
-            Sprt::new(0.1, 0.05, 0.1).decision(4, 0.0, 0.01),
+            Sprt::new(0.1, 0.05, 0.1).decision(0.25, 0.0, 0.01),
             SprtDecision::Same
         );
         // Two-sided: each side takes half of alpha, so "better" needs more than a one-sided
         // test at the same alpha would (9.1 gave each side the whole 5 %).
-        let (n, mean, sd) = (3, 0.045, 0.03);
+        let (w, mean, sd) = (1.0 / 3.0, 0.045, 0.03);
         assert_eq!(
-            Sprt::new(0.06, 0.10, 0.1).decision(n, mean, sd),
+            Sprt::new(0.06, 0.10, 0.1).decision(w, mean, sd),
             SprtDecision::Better
         );
         assert_eq!(
-            Sprt::new(0.06, 0.05, 0.1).decision(n, mean, sd),
+            Sprt::new(0.06, 0.05, 0.1).decision(w, mean, sd),
             SprtDecision::Continue
         );
     }
@@ -543,6 +630,7 @@ mod tests {
             baseline,
             candidate,
             ops_count: 10_000,
+            resolution: 0.0,
             candidate_first,
         }
     }
@@ -612,14 +700,6 @@ mod tests {
         );
     }
 
-    /// 9.1.0's order: one independent coin per pair.
-    fn coin_9_1(seed: u64, pair: u64) -> bool {
-        let mut z = seed.wrapping_add((pair + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        (z ^ (z >> 31)) >> 63 == 1
-    }
-
     #[test]
     fn the_ab_order_is_balanced_in_blocks_drawn_from_the_seed() {
         let orders = |seed: u64| {
@@ -649,11 +729,6 @@ mod tests {
         );
         assert!((0..100u64).any(|s| candidate_first(s, 0) != candidate_first(s, 2)));
         assert_ne!(orders(1), orders(2));
-        // 9.1's coin ran the first three pairs in one order for about a seed in four.
-        let same = (0..1000u64)
-            .filter(|s| coin_9_1(*s, 0) == coin_9_1(*s, 1) && coin_9_1(*s, 1) == coin_9_1(*s, 2))
-            .count();
-        assert!((200..=300).contains(&same), "{same}");
     }
 
     #[test]
@@ -918,67 +993,6 @@ mod tests {
         }
     }
 
-    /// 9.1.0's rule on pairs drawn by `next(pair index)` (signed log ratios aside, the same
-    /// floor): an SPRT with the whole alpha on each side, its effect and spread plugged in
-    /// anew at each look; a stop as soon as it agrees with a fixed-sample Student interval; and
-    /// that interval deciding alone when the SPRT did not. Returns whether a change was called.
-    fn rule_9_1(max_pairs: usize, mut next: impl FnMut(u64) -> AbPair) -> bool {
-        let (mut a, mut b, mut d) = (Vec::new(), Vec::new(), Vec::new());
-        loop {
-            let p = next(a.len() as u64);
-            a.push(p.baseline);
-            b.push(p.candidate);
-            d.push((p.candidate / p.baseline).ln());
-            let n = d.len();
-            let floor = noise_floor_ab(&a, &b, 0.0);
-            let (mean, var) = mean_var(&d);
-            let sd = var.sqrt().max(floor);
-            let sprt = if n >= MIN_DECISIVE_PAIRS {
-                Sprt::new((2.0 * floor).max(MIN_EFFECT), 0.10, 0.10).decision(n, mean, sd)
-            } else {
-                SprtDecision::Continue
-            };
-            let half = t975(n as f64 - 1.0) * sd / (n as f64).sqrt();
-            let excludes_zero = n >= MIN_DECISIVE_PAIRS && mean.abs() > half;
-            let agrees = match sprt {
-                SprtDecision::Better | SprtDecision::Worse => excludes_zero,
-                SprtDecision::Same => true,
-                SprtDecision::Continue => false,
-            };
-            if agrees || n >= max_pairs {
-                let decided = matches!(sprt, SprtDecision::Better | SprtDecision::Worse);
-                return excludes_zero && (decided || mean.abs() > floor);
-            }
-        }
-    }
-
-    #[test]
-    fn the_9_1_rule_called_an_order_effect_a_change() {
-        // No change; the second trial of a pair runs 4 σ better (a warm cache, a refilled
-        // bucket). 9.1's independent coins put most pairs of a short proof in one order often
-        // enough, and its unadjusted interval then calls the order effect a change, in 15 to
-        // 25 % of proofs; the balanced schedule and the crossover estimate do not.
-        let w = World {
-            sigma: 0.05,
-            effect: 0.0,
-            carry: 0.20,
-        };
-        let proofs = 4000;
-        for max_pairs in [3, 6, 12] {
-            let mut rng = SmallRng::seed_from_u64(9100 + max_pairs as u64);
-            let old = (0..proofs)
-                .filter(|_| {
-                    let seed = rng.r#gen::<u64>();
-                    rule_9_1(max_pairs, |i| w.pair(&mut rng, coin_9_1(seed, i)))
-                })
-                .count() as f64
-                / proofs as f64;
-            assert!(old > 0.10, "{max_pairs} pairs: 9.1 called {old}");
-            let new = w.verdict_rate(9100 + max_pairs as u64, proofs, max_pairs);
-            assert!(new <= 0.05, "{max_pairs} pairs: {new}");
-        }
-    }
-
     #[test]
     fn a_real_change_is_still_found() {
         // A change of 3 σ of a pair's log ratio (σ_pair = √2 σ_trial): found within the default
@@ -1047,5 +1061,149 @@ mod tests {
                 assert!(d != AbDecision::Continue || k + 1 < max_pairs);
             }
         }
+    }
+
+    /// K3-1: a value that is zero, negative or not finite is no ratio. 9.2 clamped it to
+    /// 1e-9: a candidate with no latency at all "improved" the p99 by 100 %.
+    #[test]
+    fn a_pair_without_a_value_is_never_judged() {
+        for (a, b) in [
+            (50.0, 0.0),
+            (0.0, 50.0),
+            (50.0, -1.0),
+            (50.0, f64::NAN),
+            (f64::INFINITY, 50.0),
+        ] {
+            assert!(!pair(a, b, false).comparable(), "{a} {b}");
+            for higher_is_better in [true, false] {
+                let mut t = AbTest::new(higher_is_better, 3, 6);
+                for i in 0..6 {
+                    assert_eq!(t.push(pair(a, b, i % 2 == 0)), AbDecision::Continue);
+                }
+                assert_eq!(t.pairs(), 0);
+                assert_eq!(t.verdict(), AbVerdict::Inconclusive);
+                assert_eq!(t.interval(), Interval::default());
+            }
+        }
+        // Among good pairs it changes nothing.
+        let mut t = AbTest::new(false, 3, 6);
+        let mut with = t.clone();
+        for (i, (a, b)) in [(50.0, 40.0), (51.0, 40.5), (49.0, 39.5)]
+            .into_iter()
+            .enumerate()
+        {
+            t.push(pair(a, b, i % 2 == 0));
+            with.push(pair(a, 0.0, i % 2 == 0));
+            with.push(pair(a, b, i % 2 == 0));
+        }
+        assert_eq!(with.interval(), t.interval());
+        assert_eq!(t.verdict(), AbVerdict::Improved);
+    }
+
+    /// K3-4: the futility stop gives up only on what the plan could not have shown. 9.2's
+    /// minimum effect was twice the noise floor: at a 15 % floor it looked for 30 %, and a
+    /// proof whose pairs showed a steady +7 % was abandoned at the third pair.
+    #[test]
+    fn futility_gives_up_only_on_what_the_plan_cannot_show() {
+        // What a plan can show shrinks with its pairs: 2.8 σ for three, 1.5 σ for six, under
+        // one σ for twelve.
+        let sd = 0.15;
+        let shown: Vec<f64> = [3, 6, 12].iter().map(|k| resolvable(*k, sd) / sd).collect();
+        assert!(
+            (shown[0] - 4.607 * 0.375f64.sqrt()).abs() < 1e-9,
+            "{shown:?}"
+        );
+        assert!((shown[1] - 3.659 / 6f64.sqrt()).abs() < 1e-9, "{shown:?}");
+        assert!((shown[2] - 3.215 / 12f64.sqrt()).abs() < 1e-9, "{shown:?}");
+        assert_eq!(resolvable(40, sd), resolvable(12, sd));
+        // Three pairs at a 15 % floor (A and B each swing ±15 %), the candidate +7 %.
+        let pairs = |max_pairs: usize| {
+            let mut t = AbTest::new(true, 3, max_pairs);
+            let mut last = AbDecision::Continue;
+            for (i, a) in [100.0, 116.0, 100.0].into_iter().enumerate() {
+                last = t.push(pair(a, a * 1.07, i % 2 == 1));
+            }
+            (t, last)
+        };
+        let (t, last) = pairs(12);
+        assert!(
+            (t.noise_floor() - 0.148).abs() < 0.01,
+            "{}",
+            t.noise_floor()
+        );
+        // 9.2's rule on the same pairs: futile.
+        let (est, _, sd, _) = t.estimate().unwrap();
+        let old = Sprt::new((2.0 * t.noise_floor()).max(MIN_EFFECT), ALPHA, BETA).decision(
+            1.0 / 3.0,
+            est,
+            sd,
+        );
+        assert_eq!(old, SprtDecision::Same);
+        // Twelve pairs can show less than a floor: the proof goes on.
+        assert_eq!(last, AbDecision::Continue);
+        let shown = t.resolvable_change().unwrap();
+        assert!(shown > 0.13 && shown < 0.16, "{shown}");
+        // No change at all (both sides swinging 20 % together) is still futile once the pairs
+        // rule out what the plan could show:
+        // at the first look of six pairs, not yet of twelve.
+        for (max_pairs, at) in [(6, 3), (12, 6)] {
+            let mut t = AbTest::new(true, 3, max_pairs);
+            let mut stopped = None;
+            for i in 0..max_pairs {
+                let a = [100.0, 120.0][i % 2];
+                if t.push(pair(a, a, i % 2 == 0)) != AbDecision::Continue {
+                    stopped = Some((t.pairs(), t.decision()));
+                    break;
+                }
+            }
+            assert_eq!(stopped, Some((at, AbDecision::Futile)), "{max_pairs}");
+        }
+        assert_eq!(AbTest::new(true, 3, 6).resolvable_change(), None);
+    }
+
+    /// The early stop reads the same variance as the interval: the crossover estimate's
+    /// weight, not `1/n` (they differ when the orders are unbalanced: 0.375 against 0.333 at
+    /// three pairs).
+    #[test]
+    fn the_sprt_reads_the_estimates_own_variance() {
+        let s = Sprt::new(0.1, 0.05, 0.1);
+        // The same evidence is weaker on a less precise estimate.
+        assert_eq!(s.decision(1.0 / 3.0, 0.082, 0.05), SprtDecision::Better);
+        assert_eq!(s.decision(0.375, 0.082, 0.05), SprtDecision::Continue);
+        assert_eq!(s.decision(f64::NAN, 0.3, 0.05), SprtDecision::Continue);
+        assert_eq!(s.decision(0.25, f64::NAN, 0.05), SprtDecision::Continue);
+    }
+
+    /// K3-9: the ranks around a p99, and what their latencies say about it.
+    #[test]
+    fn the_p99_has_an_order_statistic_resolution() {
+        assert_eq!(p99_rank_band(0), None);
+        // 1000 samples: 990 ± 2·√9.9 = 983.7..996.3.
+        assert_eq!(p99_rank_band(1000), Some((983, 997)));
+        // Few samples: the band reaches the slowest one.
+        assert_eq!(p99_rank_band(100), Some((97, 100)));
+        assert_eq!(p99_rank_band(1), Some((1, 1)));
+        assert_eq!(p99_rank_band(100_000), Some((98_937, 99_063)));
+        assert_eq!(p99_spread(10.0, 10.0), 0.0);
+        assert_eq!(p99_spread(0.0, 10.0), 0.0);
+        assert!((p99_spread(10.0, 20.0) - 2f64.ln() / 4.0).abs() < 1e-12);
+        // More than 2× is a cliff; exactly 2× is not.
+        assert!(!p99_on_a_cliff(p99_spread(10.0, 20.0)));
+        assert!(p99_on_a_cliff(p99_spread(10.0, 21.0)));
+        // A pair's resolution is a floor of the noise, like a count's.
+        let mut t = AbTest::new(false, 3, 6);
+        let mut plain = t.clone();
+        for i in 0..4 {
+            let p = pair(100.0, 100.0, i % 2 == 0);
+            plain.push(p);
+            t.push(AbPair {
+                resolution: 0.3,
+                ..p
+            });
+        }
+        assert_eq!(plain.noise_floor(), MIN_NOISE_SD);
+        assert!((t.noise_floor() - 0.3).abs() < 1e-12);
+        let w = |i: Interval| i.high - i.low;
+        assert!(w(t.interval()) > 10.0 * w(plain.interval()));
     }
 }

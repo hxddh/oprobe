@@ -272,7 +272,8 @@ fn is_ctrl_c(ev: &Event) -> bool {
 }
 
 /// Run the app full-screen in this terminal until Ctrl+C. Ctrl+C while a job runs stops it
-/// and waits for its cleanup (30 s at most); a second Ctrl+C leaves at once.
+/// and waits for its cleanup (`STOP_GRACE` at most, then says what was left); a second Ctrl+C
+/// leaves at once.
 pub fn run(monochrome: bool) -> io::Result<()> {
     let mut options = AppOptions::default();
     options.ui_sets = crate::ui::ui_sets();
@@ -307,9 +308,11 @@ pub fn run(monochrome: bool) -> io::Result<()> {
     view.load(Root::of::<crate::ui::App>())
         .map_err(|e| io::Error::other(e.to_string()))?;
     let mut stopping: Option<Instant> = None;
+    // A second Ctrl+C: leave without waiting any longer.
+    let mut hurried = false;
     let res = run_app(&mut term, &mut view, |timeout: Duration| {
         if let Some(since) = stopping
-            && (!jobs::busy() || since.elapsed() >= Duration::from_secs(30))
+            && (!jobs::busy() || since.elapsed() >= crate::app::STOP_GRACE)
         {
             return Ok(RunEvent::Exit);
         }
@@ -319,9 +322,10 @@ pub fn run(monochrome: bool) -> io::Result<()> {
         let ev = event::read()?;
         if is_ctrl_c(&ev) {
             if stopping.is_some() || !jobs::busy() {
+                hurried = stopping.is_some();
                 return Ok(RunEvent::Exit);
             }
-            jobs::shutdown(Duration::ZERO);
+            jobs::stop_all();
             stopping = Some(Instant::now());
             return Ok(RunEvent::Redraw);
         }
@@ -330,6 +334,13 @@ pub fn run(monochrome: bool) -> io::Result<()> {
     drop(term);
     drop(guard);
     std::panic::set_hook(Box::new(move |info| prev(info)));
-    crate::ui::store::finish_jobs();
+    // What is left of the wait Ctrl+C started (none of it after a second Ctrl+C); what a job
+    // then left behind is said on the restored terminal.
+    let waited = match stopping {
+        Some(_) if hurried => crate::app::STOP_GRACE,
+        Some(since) => since.elapsed(),
+        None => Duration::ZERO,
+    };
+    crate::ui::store::finish_jobs(crate::app::STOP_GRACE.saturating_sub(waited));
     res
 }

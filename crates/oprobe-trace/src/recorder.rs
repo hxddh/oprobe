@@ -548,11 +548,17 @@ impl Agg {
         if is_cut {
             self.res.tail_cuts += 1;
         }
-        let connected = r.conn_id > 0 || r.status != 0 || r.protocol == Protocol::InProcess;
-        if connected {
-            if r.reused {
-                self.reused_requests += 1;
-            }
+        // Whether the request reused a connection is only known where its connection was
+        // observed: the instrumented client names it (`conn_id`), and an in-process call has
+        // none to dial. A request through a transport the layer only wraps
+        // (`Config::keep_http_transport`) was answered on a connection nobody saw: it counts
+        // by protocol, and neither as warm nor as a dial (9.2 counted every one as warm:
+        // "100 % reused").
+        let observed = r.conn_id > 0 || r.protocol == Protocol::InProcess;
+        if observed && r.reused {
+            self.reused_requests += 1;
+        }
+        if observed || r.status != 0 {
             match r.protocol {
                 Protocol::Http1 => self.h1_requests += 1,
                 Protocol::Http2 => self.h2_requests += 1,
@@ -585,7 +591,7 @@ impl Agg {
         if r.is_throttle() {
             a.throttled += 1;
         }
-        if connected {
+        if observed {
             a.connected += 1;
             if r.reused {
                 a.reused += 1;
@@ -694,7 +700,9 @@ pub trait Exporter: Send + Sync {
         let _ = (lookups, hits);
     }
     /// The OpenDAL service the layer was applied to (once, before its first request): its
-    /// scheme, name (the bucket: OpenDAL's `namespace` label) and root.
+    /// scheme, name (the bucket: OpenDAL's `namespace` label) and root. A layer applied to
+    /// several operators reports the first one here; each HTTP request names its own
+    /// ([`RequestRecord::service`]).
     fn on_service(&self, scheme: &str, name: &str, root: &str) {
         let _ = (scheme, name, root);
     }
@@ -1115,8 +1123,17 @@ impl Recorder {
     /// races a new dial against an idle connection and keeps the loser. It is a new connection
     /// (counted, with its handshake phases), but the request that later takes it saw it warm,
     /// so the phases are not charged to that request.
+    ///
+    /// During the warm-up it is one of the cold start's connections, like the ones the
+    /// warm-up's operations waited for: every connection the client dials is counted once,
+    /// in the phase it was dialed in (until 9.2 these were in no count, so a profile showed
+    /// more connections in use than it said were dialed).
     pub fn record_unclaimed_dial(&self, dns_us: u64, tcp_us: u64, proxy_us: u64, tls_us: u64) {
         if !self.is_measuring() {
+            if self.phase() == Phase::Warmup {
+                let mut cold = self.cold.lock().unwrap_or_else(|e| e.into_inner());
+                rec(&mut cold.0, dns_us + tcp_us + proxy_us + tls_us);
+            }
             return;
         }
         self.with_current_bucket(|b| b.dials += 1);
@@ -1137,13 +1154,15 @@ impl Recorder {
         crate::scope::note_backend_request();
         // The capture boundary: an error text never keeps a URL's credentials.
         let redacted;
-        let r = if r.error.as_deref().is_some_and(|e| e.contains("://")) {
-            let mut clean = r.clone();
-            clean.redact();
-            redacted = clean;
-            &redacted
-        } else {
-            r
+        let r = match r.error.as_deref().and_then(crate::util::redacted) {
+            Some(error) => {
+                redacted = RequestRecord {
+                    error: Some(error),
+                    ..r.clone()
+                };
+                &redacted
+            }
+            None => r,
         };
         if let Some(g) = self.guard.get() {
             g.add(1, r.bytes_up + r.bytes_down);
@@ -1274,8 +1293,8 @@ impl Recorder {
     /// Record a completed logical operation (only if it started inside the window).
     pub fn complete_op(&self, measured: bool, mut c: OpCompletion) {
         // The capture boundary, as for requests: no URL credentials in an error text.
-        if let Some(error) = c.error.as_mut().filter(|e| e.contains("://")) {
-            *error = crate::util::strip_url_credentials(error);
+        if let Some(clean) = c.error.as_deref().and_then(crate::util::redacted) {
+            c.error = Some(clean);
         }
         let n = self.completions.fetch_add(1, Ordering::Relaxed);
         if n.is_multiple_of(OBSERVER_SAMPLE_EVERY) {
@@ -2216,6 +2235,7 @@ mod tests {
             remote: None,
             server: None,
             service_op: None,
+            service: None,
             tls: None,
             tcp: None,
             detail: None,
@@ -2548,5 +2568,87 @@ mod tests {
         assert_eq!(d.retry_waits.len(), 1);
         assert_eq!(d.retry_waits[0].1 - d.retry_waits[0].0, 5000);
         assert!(d.throttled);
+    }
+
+    /// A request answered on a connection nobody observed (a transport the layer only wraps:
+    /// `conn_id` 0) is neither warm nor a dial: reuse is counted over the requests whose
+    /// connection is known (9.2 counted every answered request as warm, so a kept transport
+    /// read "100 % reused").
+    #[test]
+    fn requests_on_unobserved_connections_are_neither_warm_nor_dials() {
+        let answered = |conn_id: u64| RequestRecord {
+            conn_id,
+            status: 200,
+            ..req(0, 0, 1000)
+        };
+        let kept = Recorder::always_on(8);
+        for _ in 0..3 {
+            kept.record_unscoped_request(&answered(0));
+        }
+        let s = kept.snapshot();
+        let c = &s.connections;
+        assert_eq!((c.requests, c.http1_requests), (3, 3), "{c:?}");
+        assert_eq!((c.reused_requests, c.reuse_pct, c.dialed), (0, 0.0, 0), "{c:?}");
+        assert!(!c.observed(), "{c:?}");
+        assert_eq!(s.apis[0].reused_pct, 0.0);
+
+        let own = Recorder::always_on(8);
+        own.record_unscoped_request(&RequestRecord {
+            reused: false,
+            ..answered(1)
+        });
+        for _ in 0..3 {
+            own.record_unscoped_request(&answered(1));
+        }
+        let s = own.snapshot();
+        let c = &s.connections;
+        assert_eq!((c.reused_requests, c.reuse_pct, c.dialed), (3, 75.0, 1), "{c:?}");
+        assert!(c.observed(), "{c:?}");
+        assert_eq!(s.apis[0].reused_pct, 75.0);
+        // Nothing over HTTP: nothing to observe.
+        assert!(Recorder::always_on(8).snapshot().connections.observed());
+    }
+
+    /// Every connection the client dials is counted once, in the phase it was dialed in: one
+    /// that no request waited for (hyper races a dial against a connection coming idle) is
+    /// one of the cold start's during the warm-up, as it is one of the window's during the
+    /// window (until 9.2 the warm-up dropped it: a profile showed 24 connections in use and
+    /// "22 dialed during warm-up · 0 in the window").
+    #[test]
+    fn a_warm_up_dial_nobody_waited_for_is_one_of_the_cold_starts() {
+        let r = Recorder::new();
+        r.set_phase(Phase::Warmup);
+        let mut dialing = req(0, 0, 1000);
+        dialing.reused = false;
+        dialing.status = 200;
+        dialing.timing.tcp_us = 400;
+        r.op_started(1);
+        r.complete_op(
+            false,
+            OpCompletion {
+                verb: "read",
+                op_id: 1,
+                started: Instant::now(),
+                latency_us: 1000,
+                logical_read: 0,
+                logical_write: 0,
+                error: None,
+                key: String::new(),
+                data: OpScopeData {
+                    requests: vec![dialing],
+                    ..Default::default()
+                },
+                schedule_us: None,
+            },
+        );
+        r.record_unclaimed_dial(0, 300, 0, 0);
+        r.set_phase(Phase::Measure);
+        r.record_unclaimed_dial(0, 200, 0, 0);
+        let c = r.snapshot().connections;
+        let cold = c.cold_start.as_ref().expect("the warm-up dialed");
+        assert_eq!(cold.connections_count, 2, "{cold:?}");
+        // The operations that waited for a dial: one.
+        assert_eq!(cold.first_ops.count, 1, "{cold:?}");
+        assert_eq!(c.dialed, 1, "{c:?}");
     }
 }

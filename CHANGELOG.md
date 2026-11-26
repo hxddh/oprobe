@@ -4,6 +4,184 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v9.3.0 — 2026-11-26
+
+9.3 is a truth-and-stop release. A deep review of 9.2 (`docs/design/v9.2-review.md`: a bug hunt on
+the binary and two code-review passes) found that the weakest part of the loop was Explain:
+several findings said the wrong thing on ordinary runs, a proof could be improved by failing, and
+a few stop paths still left data behind. 9.3 fixes those. It adds no command and no flag. It
+no longer promises to read what an older version wrote (see Removed); no format version changed.
+
+### Fixed
+
+#### Stopping
+
+- **A closed stderr no longer costs the cleanup.** A terminal or SSH session that goes away, or
+  `oprobe run … 2>&1 | head`, made the next progress line panic (`eprintln!`): exit 101, no
+  cleanup, no saved run, the test data left on the target, also after the SIGHUP 9.2 handles.
+  Nothing oprobe prints for stderr can fail now, and the first line a closed stderr refuses stops
+  the command as a signal does: the requests in flight are cut, the multipart uploads aborted, the
+  test data deleted, the partial run saved, exit 130.
+- **Nothing is left when a run stops while it opens.** The preflight's probe object is deleted
+  outside the budgets and the cancellation, also when its write failed: with `--max-requests 3`,
+  or Ctrl-C between its write and its delete, 9.2 left `oprobe-run-<id>/.oprobe-preflight`. A run
+  whose file cannot be created now removes the dataset it had uploaded. A run stopped while it
+  opens fails as `run.interrupted` (exit 130) instead of "preflight: cannot list the target" with
+  a hint to check the credentials.
+- **Stopping is bounded.** A `CreateMultipartUpload` in flight when the run is stopped has 10 s to
+  answer, and a stopped run waits at most 45 s for its uploads to abort before it cleans up; 9.2
+  waited for both without a bound, so a stalled service hung the run after Ctrl-C. An upload that
+  could not be aborted is named in the cleanup error.
+- **A hint or a replay never retargets a run.** After a run that cannot be judged, `prove` hints
+  the run's whole command (9.2: the operator alone, which sent a run on a local endpoint to the
+  real service with ambient credentials). Run Again keeps the operator's values when only the
+  workload changes in New Run (9.2 dropped them with the preset), and "Runs again as" shows the
+  command the form will start. `skip_signature=true` is no longer taken for a signature and
+  dropped from the stored operator and the replay command.
+- **Budgets say what happened.** A request body that does not fit in what is left of `--max-bytes`
+  is refused with "the next request (8.0 MiB) does not fit the byte budget: 1 B of 4.0 MiB used".
+  Once the byte budget is spent exactly, a request without a body is refused too. An interrupted
+  open loop no longer counts the operations a stop cut as issued.
+- **Quitting the app waits, shows it, and says what it left.** Stop and Quit used to quit at once
+  and then freeze for up to 30 s. The app now waits up to 60 s in a dialog that shows what each
+  job is doing, and past that names the job that was left and its `oprobe-run-…/` prefix.
+
+#### Findings
+
+- **Failures are named for what they are.** A run whose writes OpenDAL's `ThrottleLayer` refused
+  (a `layers.throttle.burst` below the write size) has an `errors` finding that names the burst;
+  9.2 had none and called the client the bound. The `errors` remedy stays the retry backoff when a
+  few operations ran out of retries on the same transient failures the retries recovered. A
+  handful of 429/503 is `throttling` at low confidence, never "random" `errors`. A 5xx whose
+  response carries `access-control-allow-credentials`, or a failure on a key named
+  `credentials.json`, is no longer `auth.no_credentials`.
+- **A body that stalls is a hung request.** The stage was called `transfer` in one place and
+  `body` in another, so body-stalled requests were never counted; it is `body` everywhere now
+  (`--by stage` says so). A large download, downloads under a
+  `bandwidth_cap`, and a slow upload through a kept HTTP client are not hung.
+- **An open loop that fell behind is judged on evidence.** It no longer says "raise `-c`" unless
+  the service answered as fast with every worker in flight; a steady overload says that one run
+  cannot tell too few workers from a service at its capacity. An open loop in which more than 1 %
+  of the scheduled arrivals never completed is stalled: the headline and the checks say so, with
+  the run's own p99 as the lower bound, and no limit is needed. The p99 limit of 9.2, which no
+  flag could set, is gone, and so are the docs that told you to set it.
+- **The queueing form of `throttling` is advice.** It is fitted with one service time per storage
+  API, judged against the client's own scheduling lag with the wait the model predicts (9.2: a
+  1 ms mean that was biased by noise), and never made on a client-bound run. A cap moves the queue
+  and shortens nothing, so its `next` shows the evidence and `prove` refuses it.
+- **`repeated_reads` offers no proof `prove` would refuse.** When a whole-object cache does not
+  fit the reads (ranges of large objects, or an object above 1 GiB), the remedy is advice and
+  says why; the finding and `prove` share one sizing rule.
+- **A healthy run's headline** says the load was not varied and how to vary it
+  (`--set shape=ramp:…`) instead of "Inconclusive … prove sizes a change" above a `prove` that
+  refused the run. The tail split counts an operation's own queue time. A default `large-objects`
+  run no longer warns about a `chunk_size 0B` or reports a part size it did not write.
+
+#### Prove
+
+- **A proof is not improved by failing.** A changed operator whose operations fail more than the
+  run allows, and more than the current operator's beyond chance, is `inconclusive` with a note,
+  on either objective: the throttle gate's twin. 9.2 called `layers.timeout.io=200ms` "improved"
+  on p99 for failing the slow operations. A pair in which a trial has no objective at all is no
+  longer clamped into a ratio ("improved by 100 %"): it is not judged.
+- **The ETA is learned, and corrected.** The estimate comes from the run being proved (what it
+  took around its window, how long its last operations kept retrying, a cool-down per throttled
+  trial), the first trial of each arm corrects it, and under `--max-duration` the plan says what
+  the budget is *estimated* to fit. 9.2 printed "23–45 s" for a proof of 54 s, and "too few
+  pairs to decide" before a proof that decided.
+- **A cool-down never runs past the budget** (9.2: up to 5 s and a trial over).
+- **A futility stop says what it gave up on,** and gives up only on a change the planned pairs
+  could not have shown (9.2 looked for twice the noise floor). Secondary metrics use their own
+  spread, not the objective's noise floor.
+- **A p99 has a resolution.** The spread of the latencies around rank 0.99·n of a trial is a
+  floor of the noise, and when they differ by more than 2× a note says "p99 sits on a cliff:
+  lengthen the trial" (`trials[].p99_spread_ratio`, optional).
+- **A rate limit is sized under the fitted rate:** a cap whose sizing trial sends more requests
+  per second than the finding's fit is not chosen, even when its two seconds saw no throttle
+  (9.2 chose it and then measured it `worse`).
+- `--pairs` outside 3–12 is a usage error (9.2 clamped it silently) and, with `--trial`, is in
+  `prove --help`. Notes are redacted where they enter the result. A prove with no pair offers no
+  profile of the change; a prove of a run whose secrets were given by value says they were not
+  stored.
+
+#### Run files
+
+- **A run file is bounded while it is decoded, and a run never writes one it cannot read.** A
+  segment's columns are capped as they are deserialised (65 536 entries a column), so a crafted
+  segment repeating `[0,{}],` no longer expands some forty times before the row budget is
+  charged; a segment may hold 64 MiB of JSON (was 256 MiB; real ones are 2 to 7 MiB). The writers
+  keep to the same limits, and a streamed run stops keeping rows before the file passes what a
+  reader takes, with a warning in the report. Failed and throttled operations are kept in full
+  for twice `max_requests`, then thinned with their weight recorded: 9.2 kept them all, so a long
+  run against a failing target saved a file it then refused.
+- **A time range of an open-loop run counts its missed arrivals** (`missed_arrivals_count`), and
+  its percentiles are marked "at least" (`≥`, `latency_at_least`).
+
+#### The embedded layer and privacy
+
+- **No request waits for the layer, and the layer survives its runtime.** The lookup of a new
+  connection's socket runs beside the requests; 9.2 awaited it at the response headers, so a busy
+  blocking pool held cold responses back. A descriptor scan dropped by a runtime that shuts down
+  gives its queue back: 9.2 left the finder busy for ever, and an operator shared across runtimes
+  hung on its next new connection.
+- **Credentials are removed from any text, not only from URLs**: from a query with no URL around
+  it, a fragment (`#access_token=…`), a percent-encoded URL in a value and a quoted
+  `Authorization` header; a password holding `/`, `?` or `#` is removed whole; `temp_url_sig`,
+  `*_sig`, `upload_id` (a GCS resumable session), `jwt` and `hmac` are secret. Listing cursors
+  (`continuation-token`, `pageToken`, `start_key`, …) are not.
+- **A kept HTTP client is "not observed", not "100 % reused".** With
+  `Config::keep_http_transport`, reuse counts only where the connection was observed; the file's
+  `service` says `"http_transport": "installed"`; `oprobe show` and the app print
+  `dials not observed · reuse not observed`.
+- **Retransmits are charged to the upload that retransmitted**, not to the small GET that ended
+  beside it. A response OpenDAL cannot use (a `Content-Encoding` that does not parse) is a failed
+  request in the trace. OpenTelemetry stage points carry their own operator's labels when one
+  layer is cloned onto several operators. Connection ids number a client's connections in dial
+  order, so the Connections section counts one set.
+
+#### Operator and the app
+
+- **No cache that fetches huge objects whole**, and `docs/operator.md` documents what
+  `FoyerLayer` costs (a whole-object fetch on a ranged read, a `HEAD` per miss, write-through
+  buffering) and a known OpenDAL issue: a stale read after a write on a versioned bucket.
+  A `layers.throttle.burst` below `write.chunk` is refused.
+- **The whole operator as Rust.** The prove result's `diff` carries `operator_rust` (optional),
+  code that compiles as written, and "Copy Rust" in the app copies it when no edit is pending.
+- **A menu shortcut is no longer lost to a rebuilt menu bar.** The bar was rebuilt on every
+  selection change; it is rebuilt only when an item changes.
+
+### Changed
+
+- **Lab defaults sit well inside their limits**, so the cap that fits is the same on every
+  machine: `lab://parquet` 6 workers (was 8), `lab://demo` 16 (was 28), `lab://throttle` 64 (was
+  48), and `lab://ratelimit` is 100 requests/s at 12 ms (was 300 at 5 ms). The convergence tests
+  run every scenario once; 9.2's retried until one run passed.
+- **Binary size has no hard target.** It must not cost usability or function; CI still reports it.
+- Papercuts: `oprobe lab --bind` on a busy port is a usage error with a hint; an unreachable proxy
+  is named instead of the endpoint; an interrupted run says "interrupted", whatever stopped it;
+  `show --rm X X` removes X once; `show --list` cuts a long change; `show FILE` of an
+  `oprobe run -o json` document says what it is; the `r2://` examples in the docs run as written.
+
+### Removed
+
+- **Compatibility with older versions and their data.** oprobe reads what its own version wrote:
+  a prove result without `pairs_max_count` (9.1) is refused as unreadable, and the fallbacks for
+  reports before 6.3 are gone. Also removed: the stage name `transfer` (it is `body`), the p99
+  limit remnants (`sla.p99_ms` in a config and in the report), the hidden `prove --budget`
+  spelling of `--max-duration`, and the 5.x preset names (`parquet`, `small`, `mixed`, …).
+  `oprobe-trace`'s API and the CLI and JSON output stay stable across 9.x.
+
+### Known issues
+
+- A steady overloaded open loop cannot tell too few workers from a saturated service: only a run
+  that varied its load can.
+- A stop that arrives after the window (during verification or cleanup) still marks a complete
+  run interrupted.
+- A menu shortcut typed across a change that rebuilds the menu bar (a dialog, a run starting, a
+  page switch) can still be lost: nsh 0.7 gives menu items new ids on each rebuild.
+- The limits OpenDAL sets remain: an HTTP permit wait counts in `timeout.io`, and multipart
+  uploads cannot be listed.
+
 ## v9.2.0 — 2026-11-26
 
 9.2 is a hardening release on 9.1: what oprobe does to a target, what it reads from an untrusted

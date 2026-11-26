@@ -87,6 +87,11 @@ pasted code stacks the layers exactly as they were measured.
   `tail_cut` would cut and re-issue into the same queue.
 - **A throttled write waits before it takes a permit.** `throttle` is outside the limiter and the
   timers, so its wait is neither a held permit nor a slow call.
+- **A write larger than `throttle.burst` fails; it does not wait.** `ThrottleLayer` refuses a
+  single write above the burst with `rate_limited` ("burst size is smaller than the request
+  size"). Keep `burst` at least as large as the largest single write: `write.chunk` when it is
+  set (oprobe refuses a `burst` below it), otherwise the largest buffer the application writes
+  at once, which for a workload without `write.chunk` can be a whole object.
 - **Every attempt starts over.** `retry` is outside all of them: a retried call is throttled,
   limited and timed again, and a `stat` or a read gives its permit back during the backoff.
 - **A cache hit touches nothing else.**
@@ -109,8 +114,34 @@ shard, weighs each entry by its object's size and admits any object no larger th
 requests and is never fetched or buffered whole. (Foyer's default of 8 shards splits the budget
 by key hash: an object above an eighth of it could not be cached, and a budget that covers the
 objects read still evicted whenever one shard filled first.) The generated Rust builds the
-same cache: `.with_shards(1)`, the weighter, and `.with_size_limit(..=memory)`. `prove` sizes
-`memory` from the distinct objects the run read, and never below its largest object.
+same cache: `.with_shards(1)`, the weighter, and `.with_size_limit(..=memory)`.
+
+What `FoyerLayer` costs, as OpenDAL 0.59 implements it:
+
+- **A ranged read caches the whole object.** The first read of an object, of any range, fetches
+  the object whole and keeps it; later reads are slices of it. A cache therefore pays off for
+  objects that are read again, and costs more than it saves for a few small ranges of large
+  objects.
+- **A `HEAD` before every read that misses.** The layer asks for the object's size first. An
+  object larger than `memory` is then read through, and the next read of it asks again: one
+  extra `HEAD` per read of an oversize object.
+- **A write is buffered until it is closed.** A write through the layer is also kept in memory,
+  up to `memory`, and enters the cache when the writer closes. A writer of a larger object
+  stops buffering once it passes `memory`.
+- **Nothing expires.** An entry stays until the budget evicts it. An object that another client
+  changes or deletes is served from the cache as it was.
+
+`prove` sizes `memory` from the distinct objects the run read, with a quarter of headroom, up to
+1 GiB. It sizes no cache at all, and says why, when the largest object read is above 1 GiB, or
+when the reads are ranges of objects that hold more bytes than the run read of them: the layer
+would fetch more than it could save. `--with layers.cache.memory=SIZE` still tests any cache.
+
+**Known issue (OpenDAL 0.59, versioned buckets): a stale read after a write.** The layer keys a
+written object by the version the service returns for the write, and an ordinary read by no
+version. On a bucket with versioning on, an object that was read, then overwritten through the
+same operator, is still served as it was before the write, until the old entry is evicted. On a
+bucket without versioning the write replaces the entry. Do not put `cache` on an operator that
+overwrites objects it also reads in a versioned bucket.
 
 ## `[read]` and `[write]`
 
@@ -121,7 +152,7 @@ The options of `read_with` / `reader_with` and `writer_with`; unset means OpenDA
 | `read.chunk` | read in chunks of this size |
 | `read.concurrent` | chunks fetched at once |
 | `read.gap` | merge ranges closer than this into one request |
-| `write.chunk` | multipart part size (OpenDAL clamps it to the service's limits; the profile shows the effective value) |
+| `write.chunk` | multipart part size (OpenDAL clamps it to the service's limits; the profile shows the effective value). Unset, OpenDAL fixes no part size: it buffers up to the service's minimum and sends each write as it comes, so the parts are as large as the caller's writes, and the profile shows the parts that were uploaded |
 | `write.concurrent` | parts uploaded at once |
 
 ## `[http]`
@@ -149,8 +180,10 @@ takes the same paths. The paths: `url`, `options.KEY`, `layers.NAME` (`on`/`off`
 `--set` also takes the workload's keys, the ones without a flag of their own included:
 `concurrency`, `preset`, `duration`, `warmup` (e.g. `--set warmup=2s`), `max_ops`, `rate`,
 `arrivals`, `shape`, `access`, `objects`, `object_size`, `partitions`, `existing`, `persist`,
-`verify`, `cleanup`, `seed` and `mix`; the SLA's `max_error_rate`, `max_throttle_rate`, `p99_ms`
-and `sla`; and the run's `label`.
+`verify`, `cleanup`, `seed` and `mix`; and the run's `label`. There are no limits to set: the
+findings judge a run, an open loop that stalled fails its checks by itself (see
+[reading the profile](reading-the-profile.md#how-it-is-measured)), and `prove --max-throttle`
+bounds the throttling a sized change may cause.
 
 ```bash
 oprobe run op.toml --set layers.concurrent_limit.http=32 --set read.gap=1MiB

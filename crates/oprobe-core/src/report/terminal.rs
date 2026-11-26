@@ -73,6 +73,14 @@ pub fn request_line(i: usize, r: &ReqRow, op_t_us: i64, detail: bool) -> String 
     };
     let conn = match r.protocol {
         WireProtocol::Inproc => "in-process".to_owned(),
+        // The operator's own HTTP client: which connection, warm or cold, nobody observed.
+        p if r.connection_unobserved() => {
+            let protocol = if p == WireProtocol::H2 { "h2" } else { "h1" };
+            format!(
+                "{protocol} conn {}",
+                super::view::ConnectionView::NOT_OBSERVED
+            )
+        }
         p => format!(
             "{} conn#{} {}",
             if p == WireProtocol::H2 { "h2" } else { "h1" },
@@ -104,7 +112,7 @@ pub fn request_line(i: usize, r: &ReqRow, op_t_us: i64, detail: bool) -> String 
     if r.protocol != WireProtocol::Inproc {
         parts.push(format!("send {}", ms(t.send_us)));
         parts.push(format!("ttfb {}", ms(t.ttfb_us)));
-        parts.push(format!("transfer {}", ms(t.body_us)));
+        parts.push(format!("body {}", ms(t.body_us)));
         if t.stall_us > 0 {
             parts.push(format!("stall {}", ms(t.stall_us)));
         }
@@ -329,6 +337,16 @@ fn p50_p99(p50: f64, p99: f64) -> String {
 /// Backend requests: compact columns by default (the app's: ttfb and total p50/p99, bytes
 /// down/up, statuses), every stage's p50/p99 with `detail`.
 pub fn apis_table(r: &Report, detail: bool) -> String {
+    // No share of warm requests where the connections were not observed (the operator's own
+    // HTTP client): unknown is not 0 %.
+    let observed = r.connections.observed();
+    let warm = |pct: f64| {
+        if observed {
+            format!("{pct:.0}%")
+        } else {
+            "-".to_owned()
+        }
+    };
     if detail {
         // Busiest first, as the compact table (`view::apis`).
         let mut apis: Vec<&ApiStats> = r.apis.iter().filter(|a| a.count > 0).collect();
@@ -343,7 +361,7 @@ pub fn apis_table(r: &Report, detail: bool) -> String {
                 vec![
                     a.api.label().to_owned(),
                     a.count.to_string(),
-                    format!("{:.0}%", a.reused_pct),
+                    warm(a.reused_pct),
                     q(&st.queue),
                     if st.connect.count > 0 {
                         q(&st.connect)
@@ -362,8 +380,8 @@ pub fn apis_table(r: &Report, detail: bool) -> String {
             .collect();
         return table(
             &[
-                "request", "count", "warm", "queue", "connect", "send", "ttfb", "transfer",
-                "stall", "total", "down/up", "status",
+                "request", "count", "warm", "queue", "connect", "send", "ttfb", "body", "stall",
+                "total", "down/up", "status",
             ],
             &rows,
             2,
@@ -375,7 +393,7 @@ pub fn apis_table(r: &Report, detail: bool) -> String {
             vec![
                 a.api.clone(),
                 a.requests_count.to_string(),
-                format!("{:.0}%", a.reused_ratio * 100.0),
+                warm(a.reused_ratio * 100.0),
                 p50_p99(a.ttfb_p50_ms, a.ttfb_p99_ms),
                 p50_p99(a.total_p50_ms, a.total_p99_ms),
                 format!("{}/{}", fmt_bytes(a.down_bytes), fmt_bytes(a.up_bytes)),
@@ -551,7 +569,7 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         let line = view.retry.line();
         if view.retry.quiet() { dim(&line) } else { line }
     });
-    // A corrupted object or too many failed operations (the run's checks).
+    // A corrupted object, too many failed operations, a stalled open loop (the run's checks).
     if !r.verdict.sla.breaches.is_empty() {
         kv(
             &mut out,
@@ -702,9 +720,9 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         );
         let _ = writeln!(
             out,
-            "  {} · {:.1}% of requests warm · peak {} in flight{}",
+            "  {} · {} · peak {} in flight{}",
             c.dials_line(),
-            c.reuse_ratio * 100.0,
+            c.reuse_line(),
             c.peak_inflight_count,
             if c.dial_failures_count > 0 {
                 red(&format!(" · {} failed dials", c.dial_failures_count))
@@ -712,6 +730,9 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
                 String::new()
             }
         );
+        if let Some(note) = c.unobserved_note() {
+            let _ = writeln!(out, "  {}", dim(note));
+        }
         if !c.phases.is_empty() {
             let _ = writeln!(out, "  dial p50/p99 {}", c.phases);
         }
@@ -1169,6 +1190,18 @@ pub fn wrap_text(s: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// `2.0–6.0 s`, with the digits a short range needs to show its length (`0.000–0.001 s`,
+/// not `0.0–0.0 s`): one decimal, and as many more as the length's first digit lies after.
+pub fn range_span(since_s: f64, until_s: f64) -> String {
+    let span = until_s - since_s;
+    let decimals = if span > 0.0 {
+        ((-span.log10() - 1e-9).ceil() as usize).clamp(1, 6)
+    } else {
+        6
+    };
+    format!("{since_s:.decimals$}–{until_s:.decimals$} s")
+}
+
 /// `show --since/--until`: one time range of a run, recomputed from its trace rows
 /// ([`super::range::RangeView`]): the numbers, where the time went, the verbs, the requests by
 /// API and the slowest operations of the range.
@@ -1191,8 +1224,9 @@ pub fn range_section_with(run: &Run, v: &super::range::RangeView, detail: bool) 
         "{} {}",
         bold(&r.target.display),
         dim(&format!(
-            "· {:.1}–{:.1} s of the {:.1} s window",
-            v.since_s, v.until_s, r.run.window_s
+            "· {} of the {:.1} s window",
+            range_span(v.since_s, v.until_s),
+            r.run.window_s
         ))
     );
     if v.sampled {
@@ -1207,6 +1241,13 @@ pub fn range_section_with(run: &Run, v: &super::range::RangeView, detail: bool) 
     }
     if v.is_empty() {
         let _ = writeln!(out, "\n  no operation started in this range");
+        if v.missed_arrivals_count > 0 {
+            let _ = writeln!(
+                out,
+                "  {} open-loop arrivals due in it never started",
+                v.missed_arrivals_count
+            );
+        }
         return out;
     }
     section(&mut out, "Range");
@@ -1218,11 +1259,14 @@ pub fn range_section_with(run: &Run, v: &super::range::RangeView, detail: bool) 
             v.goodput_ops_per_s, v.ops_per_s, v.mib_per_s
         ),
     );
+    // With arrivals that never started the percentiles are lower bounds, as the whole
+    // run's are: "at least".
+    let at_least = if v.latency_at_least { "≥ " } else { "" };
     kv(
         &mut out,
         "latency",
         &format!(
-            "p50 {} · p90 {} · p99 {} · p99.9 {} · max {}",
+            "p50 {at_least}{} · p90 {at_least}{} · p99 {at_least}{} · p99.9 {at_least}{} · max {}",
             fmt_ms(v.p50_ms),
             fmt_ms(v.p90_ms),
             fmt_ms(v.p99_ms),
@@ -1240,6 +1284,16 @@ pub fn range_section_with(run: &Run, v: &super::range::RangeView, detail: bool) 
             v.error_ratio * 100.0
         ),
     );
+    if v.missed_arrivals_count > 0 {
+        kv(
+            &mut out,
+            "missed",
+            &format!(
+                "{} open-loop arrivals due in this range never started: the percentiles count each at the least it waited, so they are \"at least\" values (max is of the operations that started)",
+                v.missed_arrivals_count
+            ),
+        );
+    }
     kv(
         &mut out,
         "requests",
@@ -1353,6 +1407,26 @@ mod tests {
 
     use super::*;
 
+    /// `show --until 1ms` printed "0.0–0.0 s of the 10.0 s window": a short range reads
+    /// with the digits it needs.
+    #[test]
+    fn a_short_range_reads_as_a_range() {
+        assert_eq!(range_span(2.0, 6.0), "2.0–6.0 s");
+        assert_eq!(range_span(0.1, 0.2), "0.1–0.2 s");
+        assert_eq!(range_span(0.0, 0.001), "0.000–0.001 s");
+        assert_eq!(range_span(0.0, 0.05), "0.00–0.05 s");
+        assert_eq!(range_span(1.25, 1.5), "1.2–1.5 s");
+        assert_eq!(range_span(0.0, 0.00000001), "0.000000–0.000000 s");
+        set(false);
+        let run = super::super::fixture::run();
+        let v = super::super::range::RangeView::of(&run, 0.0, 0.001);
+        let text = range_section(&run, &v);
+        assert!(
+            text.contains("0.000–0.001 s of the 10.0 s window"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn full_report_fits_80_columns_and_detail_adds_sections() {
         set(false);
@@ -1406,6 +1480,50 @@ mod tests {
         }
         // No SLA line, no label.
         assert!(!text.contains("sla") && !detail.contains("sla "), "{text}");
+    }
+
+    /// The connections of a profile whose operator kept its own HTTP client were not
+    /// observed: no count of dials, no share of warm requests, in the section or the table.
+    #[test]
+    fn unobserved_connections_print_not_observed() {
+        set(false);
+        let mut run = super::super::fixture::run();
+        let r = &mut run.report;
+        r.connections.requests = 1100;
+        r.connections.http1_requests = 1100;
+        r.connections.peak_inflight_requests = 8;
+        r.apis = vec![crate::trace::ApiStats {
+            api: crate::trace::Api::GetObject,
+            count: 1100,
+            status: [(200, 1100)].into_iter().collect(),
+            ..Default::default()
+        }];
+        for detail in [false, true] {
+            let text = render_run_with(&run, detail);
+            let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                words.contains("dials not observed · reuse not observed · peak 8 in flight"),
+                "{text}"
+            );
+            assert!(
+                words.contains("connecting and sending are part of ttfb"),
+                "{text}"
+            );
+            // The table's warm column has no number either.
+            assert!(words.contains("GetObject 1100 - "), "{text}");
+            for wrong in ["requests warm", "dialed in the window", "plain"] {
+                assert!(!words.contains(wrong), "{wrong}\n{text}");
+            }
+        }
+        // A request of such a profile: answered, on a connection nobody saw.
+        let mut q = run.reqs[0].clone();
+        (q.status, q.conn_id, q.protocol) = (200, 0, WireProtocol::H1);
+        let line = request_line(0, &q, 0, true);
+        assert!(line.contains("h1 conn not observed"), "{line}");
+        assert!(!line.contains("warm") && !line.contains("conn#"), "{line}");
+        // The instrumented client's request names its connection.
+        q.conn_id = 7;
+        assert!(request_line(0, &q, 0, true).contains("h1 conn#7"), "{line}");
     }
 
     #[test]

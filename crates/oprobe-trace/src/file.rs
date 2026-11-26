@@ -9,7 +9,8 @@
 //!   "format": "oprobe.trace/9",
 //!   "oprobe_trace_version": "9.1.0",
 //!   "created_at": "2026-11-25T10:00:00Z",
-//!   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/" },   // optional
+//!   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/",
+//!                "http_version": "auto", "keep_alive": true },              // optional
 //!   "snapshot": { … the aggregates: per API and stage, connections, bytes, timeline … },
 //!   "rows": { "ops": [ … ], "reqs": [ … ], "info": { … }, "sampling": { … } }   // optional
 //! }
@@ -17,6 +18,10 @@
 //!
 //! The format is stable across 9.x: fields are only ever added. `oprobe.trace/9` holds the
 //! application's operations (`rows.ops`), each request linked to the operation that issued it.
+//!
+//! A layer that kept the operator's own HTTP transport (`Config::keep_http_transport`) writes
+//! `"http_transport": "installed"` in `service` instead of `http_version` and `keep_alive`: the
+//! client is the application's, and its connections were not observed (9.3).
 
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -34,14 +39,14 @@ pub const TRACE_FORMAT: &str = "oprobe.trace/9";
 /// The formats [`TraceFile`] reads.
 pub const TRACE_FORMATS_READ: &[&str] = &[TRACE_FORMAT];
 
-fn default_true() -> bool {
-    true
-}
+/// [`ServiceRecord::http_transport`] of a layer that kept the transport installed on the
+/// operator and observed it from outside (`Config::keep_http_transport`).
+pub const HTTP_TRANSPORT_INSTALLED: &str = "installed";
 
 /// The OpenDAL service the traced operator talks to, as the layer saw it (the first operator
 /// the layer was applied to). No credentials or secret options: the scheme, the service's name
 /// (the bucket or container), the root and the client's transport posture.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct ServiceRecord {
     /// The OpenDAL scheme (`s3`, `gcs`, `memory`, ...).
@@ -52,27 +57,32 @@ pub struct ServiceRecord {
     /// The operator's root (`/` by default).
     #[serde(default)]
     pub root: String,
-    /// Configured HTTP version of the traced client (`auto` / `h1` / `h2`).
-    #[serde(default)]
-    pub http_version: crate::HttpVersion,
-    /// Whether connection pooling (`keep_alive`) was enabled on the traced client.
-    #[serde(default = "default_true")]
-    pub keep_alive: bool,
-    /// Configured in-flight HTTP request limit on the traced client, if any.
+    /// Configured HTTP version of the instrumented client (`auto` / `h1` / `h2`). Absent when
+    /// that client was not in use ([`Self::http_transport`]), and in files that do not say:
+    /// the client's default (`auto`) then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_version: Option<crate::HttpVersion>,
+    /// Whether connection pooling (`keep_alive`) was enabled on the instrumented client.
+    /// Absent like `http_version`: the client's default (on) then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive: Option<bool>,
+    /// Configured in-flight HTTP request limit of the layer, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_inflight_count: Option<usize>,
+    /// Whose HTTP client carried the requests: absent for oprobe's instrumented client;
+    /// [`HTTP_TRANSPORT_INSTALLED`] for the transport installed on the operator, observed from
+    /// outside. Its connections were not observed then (reuse and dials are unknown, not
+    /// zero: [`crate::ConnStats::observed`]), and a request's time to first byte includes its
+    /// dial and the sending of its body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_transport: Option<String>,
 }
 
-impl Default for ServiceRecord {
-    fn default() -> Self {
-        Self {
-            scheme: String::new(),
-            name: String::new(),
-            root: String::new(),
-            http_version: crate::HttpVersion::Auto,
-            keep_alive: true,
-            max_inflight_count: None,
-        }
+impl ServiceRecord {
+    /// Whether the requests went through the transport installed on the operator
+    /// (`Config::keep_http_transport`) instead of the instrumented client.
+    pub fn keeps_http_transport(&self) -> bool {
+        self.http_transport.as_deref() == Some(HTTP_TRANSPORT_INSTALLED)
     }
 }
 
@@ -247,6 +257,28 @@ mod tests {
                       "sampling": SamplingStats::default() },
         }))
         .unwrap()
+    }
+
+    /// The `service` of an operator that kept its own transport says `http_transport` and
+    /// leaves out the instrumented client's `http_version` and `keep_alive`.
+    #[test]
+    fn the_service_of_a_kept_transport_round_trips() {
+        let read = |json: &str| serde_json::from_str::<ServiceRecord>(json).unwrap();
+        let kept = ServiceRecord {
+            scheme: "s3".into(),
+            name: "b".into(),
+            root: "/".into(),
+            max_inflight_count: Some(8),
+            http_transport: Some(HTTP_TRANSPORT_INSTALLED.into()),
+            ..Default::default()
+        };
+        let written = serde_json::to_string(&kept).unwrap();
+        assert_eq!(
+            written,
+            r#"{"scheme":"s3","name":"b","root":"/","max_inflight_count":8,"http_transport":"installed"}"#
+        );
+        assert!(read(&written).keeps_http_transport());
+        assert_eq!(read(&written), kept);
     }
 
     #[test]

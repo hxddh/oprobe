@@ -827,6 +827,21 @@
       ],
       "type": "object"
     },
+    "Direction": {
+      "description": "The direction of the bodies a [`HypothesisKind::BandwidthCap`] was fitted on.",
+      "oneOf": [
+        {
+          "const": "download",
+          "description": "Response bodies (`bytes_down` over the body stage).",
+          "type": "string"
+        },
+        {
+          "const": "upload",
+          "description": "Request bodies (`bytes_up` over the send stage): an uplink at its capacity.",
+          "type": "string"
+        }
+      ]
+    },
     "EffectiveKnobs": {
       "description": "Knob values as OpenDAL applies them, which can differ from what was requested.",
       "properties": {
@@ -1253,6 +1268,17 @@
             "type": "number"
           },
           "type": "array"
+        },
+        "direction": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Direction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which bodies share `bytes_per_s` (a bandwidth cap)."
         },
         "key": {
           "description": "The key or prefix of a [`HypothesisKind::KeyLimit`] (the hottest one).",
@@ -2868,14 +2894,6 @@
             "number",
             "null"
           ]
-        },
-        "p99_ms": {
-          "description": "Max acceptable p99 per operation verb (ms); unset = no latency constraint.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
         }
       },
       "required": [
@@ -2897,13 +2915,6 @@
         },
         "max_throttled_request_ratio": {
           "description": "Throttled responses / requests the run may have (`sla.max_throttle_rate`).",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "p99_ms": {
           "format": "double",
           "type": [
             "number",

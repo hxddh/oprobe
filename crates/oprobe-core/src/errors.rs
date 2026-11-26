@@ -386,6 +386,39 @@ fn chain_message(err: &anyhow::Error) -> String {
     crate::util::strip_url_credentials(&format!("{err:#}"))
 }
 
+/// What OpenDAL and reqsign say when no credential could be loaded to sign a request
+/// (lowercase): `new_request_credential_error` ("loading credential to sign http request"),
+/// reqsign's signer ("failed to load signing credential") and its error kind ("invalid
+/// credentials"), and the services' "no valid credential found".
+const NO_CREDENTIAL_TEXTS: [&str; 4] = [
+    "loading credential",
+    "load signing credential",
+    "no valid credential",
+    "invalid credentials",
+];
+
+/// `oe` says that no credential could be loaded: its own message, or the cause of a failure
+/// to sign a request. Never its context: that quotes the request and the response — a path
+/// (`credentials.json`), a header (`access-control-allow-credentials`) — and 9.2, which
+/// searched the whole rendering for "credential", called a 5xx on such a request
+/// `auth.no_credentials`. For the same reason the message is matched against what the
+/// libraries say, not for the word: a service's error body names the key it was asked for.
+fn no_credentials(oe: &opendal::Error) -> bool {
+    let says = |text: &str| {
+        let text = text.to_ascii_lowercase();
+        NO_CREDENTIAL_TEXTS.iter().any(|t| text.contains(t))
+    };
+    let message = oe.message();
+    if says(message) {
+        return true;
+    }
+    // "signing http request": the reason is the source (reqsign's error).
+    let signing = message.to_ascii_lowercase().contains("sign");
+    signing
+        && std::iter::successors(std::error::Error::source(oe), |e| e.source())
+            .any(|e| e.to_string().to_ascii_lowercase().contains("credential"))
+}
+
 /// The code of an OpenDAL error, from its kind (and, for `Unexpected`, the failure class
 /// `engine::ops::error_class_of` derives from its status and source). Credential failures
 /// (`failed to load signing credential`, `no valid credential found`: OpenDAL raises these as
@@ -393,8 +426,7 @@ fn chain_message(err: &anyhow::Error) -> String {
 /// `None` when the error says nothing more specific than "unexpected".
 pub fn opendal_code(oe: &opendal::Error) -> Option<ErrorCode> {
     use opendal::ErrorKind as K;
-    // The message, its context (`called: reqsign::Sign`) and its source.
-    let credential = oe.to_string().to_ascii_lowercase().contains("credential");
+    let credential = no_credentials(oe);
     Some(match oe.kind() {
         K::NotFound => ErrorCode::StorageNotFound,
         K::PermissionDenied => ErrorCode::AuthDenied,
@@ -615,6 +647,59 @@ mod tests {
         assert_eq!(classify(&e, "s3").code, ErrorCode::AuthNoCredentials);
         let e = anyhow::anyhow!("something odd");
         assert_eq!(classify(&e, "s3").code, ErrorCode::Internal);
+    }
+
+    /// K2-9: 9.2 searched OpenDAL's whole rendering of an error for "credential", context
+    /// included, so a 5xx whose response carried `access-control-allow-credentials`, or any
+    /// failure on a key named `credentials.json`, was `auth.no_credentials`.
+    #[test]
+    fn a_credential_in_the_context_of_an_error_is_not_a_missing_credential() {
+        use opendal::{Error, ErrorKind};
+        // A 5xx as OpenDAL reports it: the response and the path are context.
+        let cors = Error::new(ErrorKind::Unexpected, "S3Error { code: \"InternalError\" }")
+            .with_context(
+                "response",
+                "Parts { status: 500, headers: {\"access-control-allow-credentials\": \"true\"} }",
+            )
+            .with_context("path", "data/part-0.parquet")
+            .set_temporary();
+        assert!(cors.to_string().contains("credentials"));
+        assert_ne!(opendal_code(&cors), Some(ErrorCode::AuthNoCredentials));
+        // A key named after credentials, in the context and in the service's own error body.
+        let key = Error::new(
+            ErrorKind::Unexpected,
+            "S3Error { code: \"InternalError\", resource: \"/b/credentials.json\" }",
+        )
+        .with_context("path", "credentials.json")
+        .with_context("uri", "http://127.0.0.1:9000/b/credentials.json");
+        assert_ne!(opendal_code(&key), Some(ErrorCode::AuthNoCredentials));
+        let e = anyhow::Error::new(key).context("read credentials.json");
+        assert_ne!(classify(&e, "s3").code, ErrorCode::AuthNoCredentials);
+        // A transport failure on that key: the source quotes the URL.
+        let io = Error::new(ErrorKind::Unexpected, "send http request")
+            .with_context("path", "credentials.json")
+            .set_source(anyhow::anyhow!(
+                "error sending request for url (http://127.0.0.1:9000/b/credentials.json)"
+            ));
+        assert_ne!(opendal_code(&io), Some(ErrorCode::AuthNoCredentials));
+        // What OpenDAL and reqsign say when there is no credential still is one: in the
+        // message, or as the cause of a failure to sign.
+        let load = Error::new(
+            ErrorKind::Unexpected,
+            "loading credential to sign http request",
+        )
+        .with_operation("reqsign::LoadCredential")
+        .set_source(anyhow::anyhow!("metadata endpoint unreachable"));
+        assert_eq!(opendal_code(&load), Some(ErrorCode::AuthNoCredentials));
+        let sign = Error::new(ErrorKind::Unexpected, "signing http request")
+            .with_operation("reqsign::Sign")
+            .set_source(anyhow::anyhow!("failed to load signing credential"));
+        assert_eq!(opendal_code(&sign), Some(ErrorCode::AuthNoCredentials));
+        let config = Error::new(
+            ErrorKind::ConfigInvalid,
+            "no valid credential found and anonymous access is not allowed",
+        );
+        assert_eq!(opendal_code(&config), Some(ErrorCode::AuthNoCredentials));
     }
 
     /// A wrong S3 key: the provider's code and message lead, the raw chain stays in `detail`.

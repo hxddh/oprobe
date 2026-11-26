@@ -221,10 +221,17 @@ async fn show_opens_a_production_trace_and_prove_refuses_it() {
         .unwrap();
     assert!(throttled >= requests / 6, "{throttled} of {requests}");
     let findings = r["findings"].as_array().unwrap();
+    // Which finding carries the 503s is not this test's subject: a 503 on every fifth request
+    // follows neither the load, the rate nor the keys, so on one machine the fit calls them a
+    // limit and on another transient `errors` (Windows CI). Either way a finding reports
+    // them, and its next step is the run below.
     let thr = findings
         .iter()
-        .find(|f| ["throttling", "rate_limit", "key_limit"].contains(&f["code"].as_str().unwrap()))
-        .unwrap_or_else(|| panic!("a throttling finding: {findings:#?}"));
+        .find(|f| {
+            ["throttling", "rate_limit", "key_limit", "errors"]
+                .contains(&f["code"].as_str().unwrap())
+        })
+        .unwrap_or_else(|| panic!("a finding for the 503s: {findings:#?}"));
     // The concrete run of the traced service, with the lab's endpoint (K8: 7.0 printed
     // `oprobe run OPERATOR` literally).
     let run_cmd = "oprobe run s3://app-bucket/prod --set options.endpoint=http://127.0.0.1:";
@@ -613,5 +620,80 @@ async fn an_aggregates_only_trace_refuses_ranges_and_groupings() {
         Some(0),
         "{}",
         String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+/// A trace of an operator that kept its own HTTP client (`Config::keep_http_transport`): its
+/// connections were not observed, and the profile says so instead of counting them (9.2
+/// printed "0 dialed in the window · 100.0% of requests warm" and described the instrumented
+/// client the application did not use).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trace_of_the_operators_own_client_says_its_connections_were_not_observed() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kept.oprobe");
+    let lab = LabServer::spawn("127.0.0.1:0", LabConfig::default())
+        .await
+        .expect("lab starts");
+    let opts = [
+        ("bucket", "app-bucket"),
+        ("region", "us-east-1"),
+        ("endpoint", lab.endpoint_url.as_str()),
+        ("access_key_id", "oprobe-lab"),
+        ("secret_access_key", "oprobe-lab-secret"),
+        ("disable_config_load", "true"),
+    ];
+    // The application's own client: OpenDAL's reqwest transport, built by the application.
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let own = opendal_http_transport_reqwest::ReqwestTransport::new(client);
+    let context =
+        opendal::OperationContext::new().with_http_transport(opendal::HttpTransporter::new(own));
+    let cfg = oprobe::trace::Config::default().keep_http_transport(true);
+    let (layer, handle) = oprobe::trace::layer(cfg);
+    opendal::init_default_registry();
+    let op = opendal::Operator::via_iter("s3", opts.map(|(k, v)| (k.to_owned(), v.to_owned())))
+        .unwrap()
+        .with_context(context)
+        .layer(layer);
+    for i in 0..40 {
+        op.write(&format!("logs/k{i}"), vec![7u8; 4096])
+            .await
+            .unwrap();
+        assert_eq!(op.read(&format!("logs/k{i}")).await.unwrap().len(), 4096);
+        op.stat(&format!("logs/k{i}")).await.unwrap();
+    }
+    handle.save(&file).unwrap();
+    let served = lab.requests_served();
+    assert!(served >= 100, "{served} requests reached the lab");
+
+    let saved: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    let service = &saved["service"];
+    assert_eq!(service["http_transport"], "installed", "{service}");
+    assert!(service.get("http_version").is_none(), "{service}");
+
+    let shown = oprobe(dir.path(), &["show", file.to_str().unwrap(), "--detail"]);
+    let text = String::from_utf8_lossy(&shown.stdout);
+    assert_eq!(shown.status.code(), Some(0), "{text}");
+    let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        words.contains("dials not observed · reuse not observed"),
+        "{text}"
+    );
+    assert!(words.contains("conn not observed"), "{text}");
+    for wrong in ["requests warm", "dialed in the window", "conn#0"] {
+        assert!(!words.contains(wrong), "{wrong}\n{text}");
+    }
+
+    let o = oprobe(dir.path(), &["show", file.to_str().unwrap(), "-o", "json"]);
+    let doc = json(&o);
+    validate("report", &doc["report"]);
+    let c = &doc["report"]["connections"];
+    assert_eq!(c["reused_requests_count"], 0, "{c}");
+    assert_eq!(c["dialed_count"], 0, "{c}");
+    assert!(c["http1_requests_count"].as_u64().unwrap() >= 100, "{c}");
+    // No finding reads what was not observed.
+    let findings = doc["report"]["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().all(|f| f["code"] != "cold_connections"),
+        "{findings:#?}"
     );
 }

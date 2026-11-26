@@ -60,6 +60,12 @@ pub use run::{PlanOutput, RunOutput, RunPlan, RunSet};
 pub use runs::{Comparison, Profile, RemovedRuns, RunList, TrashedRuns};
 pub use save::SavedOperator;
 
+/// How long a front end waits for a job it cancelled before it gives up on it (the app
+/// quitting): the abort of one multipart upload may take 30 s to give up on a service that
+/// does not answer (the engine's abort timeout), and removing the test data gets as long
+/// again.
+pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Where a command's log lines, warnings, progress and events go: [`crate::output::Output`].
 /// Front ends that consume events in-process use `EventSink::silent()` and `sink.bus()`.
 pub type EventSink = crate::output::Output;
@@ -185,6 +191,75 @@ impl std::ops::DerefMut for Ctx {
     }
 }
 
+/// What a front end's New Run form shows and edits of a run: its operators, the preset, the
+/// duration, the concurrency and an existing prefix. Everything else a run has (the open-loop
+/// rate, the dataset, the seed, the operator's `--set` values) has no field: it comes from
+/// the run being repeated, if there is one ([`RunForm::request`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunForm {
+    /// URLs, operator files or configured names
+    pub operators: Vec<String>,
+    pub preset: Option<String>,
+    pub duration: Option<String>,
+    pub concurrency: Option<usize>,
+    /// Profile existing objects under this prefix (read-only)
+    pub existing: Option<String>,
+}
+
+impl RunForm {
+    /// The fields as they show `req`.
+    pub fn of(req: &RunRequest) -> Self {
+        let w = &req.workload;
+        Self {
+            operators: req.operators.clone(),
+            preset: w.preset.clone(),
+            duration: w.duration.clone(),
+            concurrency: w.concurrency,
+            existing: w.existing.clone(),
+        }
+    }
+
+    /// The request the form sends: its fields, over what `repeated` (the request of the run
+    /// being repeated, [`App::replaying`]) has no field for.
+    ///
+    /// - While the form names the operators of `repeated`, the operator's values are kept
+    ///   (its `--set` pairs: an endpoint, a layer) and the label. Dropping them would send
+    ///   the run to another service than the one it repeats.
+    /// - While it names its preset too, the rest of the workload is kept (the rate, the
+    ///   dataset, the seed, the settings without a flag). Another preset is another workload:
+    ///   it starts from its own defaults.
+    /// - Other operators are another run: nothing of `repeated` is kept.
+    pub fn request(&self, repeated: Option<&RunRequest>) -> RunRequest {
+        let repeated = repeated.filter(|r| r.operators == self.operators);
+        let same_workload = repeated.is_some_and(|r| r.workload.preset == self.preset);
+        let mut req = RunRequest::new(self.operators.iter().cloned());
+        if let Some(r) = repeated {
+            req.label = r.label.clone();
+            req.set = r
+                .set
+                .iter()
+                .filter(|pair| same_workload || crate::model::spec::is_operator_set(pair))
+                .cloned()
+                .collect();
+            if same_workload {
+                req.workload = r.workload.clone();
+            }
+        }
+        req.workload.preset = self.preset.clone();
+        req.workload.duration = self.duration.clone();
+        req.workload.concurrency = self.concurrency;
+        req.workload.existing = self.existing.clone();
+        req.safety.read_only = self.existing.is_some();
+        req
+    }
+
+    /// The command of the request the form sends while it repeats `repeated` (it still names
+    /// its operators); `None` once it names others.
+    pub fn repeat_command(&self, repeated: &RunRequest) -> Option<String> {
+        (repeated.operators == self.operators).then(|| self.request(Some(repeated)).command())
+    }
+}
+
 /// A resolved profile: the operator with its credentials (never serialized) and where it
 /// came from.
 #[derive(Clone, Debug)]
@@ -240,20 +315,70 @@ impl RunRequest {
         self
     }
 
-    /// Run a stored run's `spec` again: its operator as it was given, its whole workload (the
-    /// open-loop rate, the dataset, the seed, …) and every operator value that is not the
-    /// default of its URL ([`RunSpec::replay`]), under the same label. Secrets are not in a
-    /// spec: they come from where the operator does (its file, the config file, the
-    /// environment), as for any run.
-    pub fn replaying(spec: &RunSpec) -> Self {
-        let (workload, set) = spec.replay();
-        Self {
-            operators: vec![spec.operator_ref.clone()],
-            workload,
-            set,
-            label: spec.label.clone(),
-            ..Default::default()
+    /// The arguments of the `oprobe` command that sends this request: `run`, the operators,
+    /// the workload flags, `--set` for every workload setting without a flag and for every
+    /// pair of `set`, then the safety flags. (The label has no flag.)
+    pub fn args(&self) -> Vec<String> {
+        let w = &self.workload;
+        let mut a: Vec<String> = vec!["run".into()];
+        a.extend(self.operators.iter().cloned());
+        let flags = [
+            ("--preset", w.preset.clone()),
+            ("-c", w.concurrency.map(|c| c.to_string())),
+            ("-d", w.duration.clone()),
+            ("--rate", w.rate.map(|r| r.to_string())),
+            ("--existing", w.existing.clone()),
+            ("--objects", w.objects.map(|n| n.to_string())),
+            ("--object-size", w.object_size.clone()),
+            ("--seed", w.seed.map(|s| s.to_string())),
+        ];
+        let on = |b: bool, v: &str| b.then(|| v.to_owned());
+        let sets = [
+            ("warmup", w.warmup.clone()),
+            ("max_ops", w.max_ops.map(|n| n.to_string())),
+            ("access", w.access.clone()),
+            ("persist", on(w.persist_dataset, "on")),
+            ("verify", on(w.no_verify, "off")),
+            ("cleanup", on(w.keep_data, "off")),
+            ("arrivals", w.arrivals.clone()),
+            ("shape", w.shape.clone()),
+        ];
+        let s = &self.safety;
+        let safety = [
+            ("--max-requests", s.max_requests.map(|n| n.to_string())),
+            ("--max-bytes", s.max_bytes.clone()),
+            ("--max-duration", s.max_duration.clone()),
+        ];
+        for (flag, value) in flags {
+            if let Some(v) = value {
+                a.extend([flag.to_owned(), v]);
+            }
         }
+        let sets = sets
+            .into_iter()
+            .filter_map(|(k, v)| Some(format!("{k}={}", v?)))
+            .chain(self.set.iter().cloned());
+        for set in sets {
+            a.extend(["--set".to_owned(), set]);
+        }
+        // `--existing` implies it.
+        if s.read_only && w.existing.is_none() {
+            a.push("--read-only".into());
+        }
+        for (flag, value) in safety {
+            if let Some(v) = value {
+                a.extend([flag.to_owned(), v]);
+            }
+        }
+        if s.dry_run {
+            a.push("--dry-run".into());
+        }
+        a
+    }
+
+    /// The `oprobe run …` command line that sends this request.
+    pub fn command(&self) -> String {
+        crate::model::spec::command_line(&self.args())
     }
 
     /// The profile request of one of the operators.
@@ -278,6 +403,31 @@ pub enum RunOutcome {
 }
 
 impl App {
+    /// Run a stored run's `spec` again: its operator as it was given, its whole workload (the
+    /// open-loop rate, the dataset, the seed, …) and every operator value that is not what
+    /// the reference names today (the operator file's, the configured operator's, or the
+    /// default operator of a URL: [`RunSpec::replay_on`]), under the same label. Secrets are
+    /// not in a spec: they come from where the operator does (its file, the config file, the
+    /// environment), as for any run. A reference that no longer resolves is kept as it is
+    /// (running it says so), its values those that differ from its URL's defaults.
+    pub fn replaying(&self, spec: &RunSpec) -> RunRequest {
+        let given = self
+            .config()
+            .ok()
+            .and_then(|cfg| crate::operator::resolve::resolve(&spec.operator_ref, &cfg).ok());
+        let (workload, set) = match &given {
+            Some((operator, _)) => spec.replay_on(operator),
+            None => spec.replay(),
+        };
+        RunRequest {
+            operators: vec![spec.operator_ref.clone()],
+            workload,
+            set,
+            label: spec.label.clone(),
+            ..Default::default()
+        }
+    }
+
     /// Resolve and validate the profile of every operator of `req`.
     pub fn resolve(&self, req: &RunRequest) -> Result<Vec<Resolved>> {
         if req.operators.is_empty() {
@@ -349,11 +499,7 @@ impl App {
         }
         let resolved = self.resolve(&req)?;
         let ctx = self.ctx(&sink);
-        let guard = run::guard_for(
-            &ctx,
-            &resolved[0].profile,
-            &run::budgets(&ctx, &req.safety)?,
-        );
+        let guard = crate::engine::measure::guard_for(&run::budgets(&ctx, &req.safety)?);
         let mut runs = Vec::new();
         for r in resolved {
             if cancel.is_cancelled() {
@@ -479,13 +625,10 @@ impl App {
 mod tests {
     use super::*;
 
-    /// Running a run again resolves to the spec it had: the open-loop rate, the dataset, the
-    /// seed, the workload settings without a flag, and the operator's options, layers and
-    /// HTTP client (9.1's app rebuilt the run from five form fields and lost the rest).
-    #[test]
-    fn replaying_a_spec_resolves_to_the_same_spec() {
-        let d = tempfile::tempdir().unwrap();
-        let config_file = d.path().join("config.toml");
+    /// An app on a temporary directory whose config file declares `[operators.prod]` (with a
+    /// secret and a layer of its own), and an operator file `op.toml` beside it.
+    fn app_with_operators(d: &std::path::Path) -> (App, String) {
+        let config_file = d.join("config.toml");
         std::fs::write(
             &config_file,
             "[operators.prod]\nurl = \"s3://bkt/data\"\n\n[operators.prod.options]\n\
@@ -493,10 +636,45 @@ mod tests {
              [operators.prod.layers]\nretry = { max_times = 9 }\n",
         )
         .unwrap();
+        let file = d.join("op.toml");
+        std::fs::write(
+            &file,
+            "url = \"s3://bkt/files\"\n\n[options]\nendpoint = \"http://127.0.0.1:9000\"\n\
+             region = \"us-east-1\"\n\n[layers]\ntimeout = { op = \"7s\" }\n\n[read]\nconcurrent = 3\n",
+        )
+        .unwrap();
         let app = App::new(Paths {
             config_file,
-            data_dir: d.path().join("data"),
+            data_dir: d.join("data"),
         });
+        (app, file.display().to_string())
+    }
+
+    /// Every leaf of `v` as `(path, value)`.
+    fn leaves(v: &serde_json::Value, path: &str, out: &mut BTreeMap<String, serde_json::Value>) {
+        match v {
+            serde_json::Value::Object(o) => {
+                for (k, v) in o {
+                    leaves(v, &format!("{path}.{k}"), out);
+                }
+            }
+            // An array is one value (the mix: its order and its weights).
+            other => {
+                out.insert(path.to_owned(), other.clone());
+            }
+        }
+    }
+
+    /// Running a run again resolves to the spec it had (T8): every field of the workload (the
+    /// open-loop rate, its arrival process and shape, the dataset with its partitions and
+    /// size distribution, the mix, the seed, the settings without a flag) and the operator's
+    /// options, layers and HTTP client. 9.1's app rebuilt the run from five form fields and
+    /// lost the rest; 9.2's test left out `mix`, `shape`, `partitions` and the size
+    /// distributions.
+    #[test]
+    fn replaying_a_spec_resolves_to_the_same_spec() {
+        let d = tempfile::tempdir().unwrap();
+        let (app, op_file) = app_with_operators(d.path());
         let workload = WorkloadInput {
             preset: Some("range-reads".into()),
             concurrency: Some(7),
@@ -525,12 +703,35 @@ mod tests {
         ]
         .map(str::to_owned)
         .to_vec();
+        let with = |more: &[&str]| -> Vec<String> {
+            set.iter()
+                .cloned()
+                .chain(more.iter().map(|s| (*s).to_owned()))
+                .collect()
+        };
         let requests = [
             RunRequest {
                 operators: vec!["s3://bkt/prefix".into()],
                 workload: workload.clone(),
-                set: set.clone(),
+                set: with(&[
+                    "partitions=7",
+                    r#"mix=[{"op":"read","size":"64KiB","weight":3},{"op":"stat"},{"op":"list","recursive":true,"weight":2}]"#,
+                ]),
                 label: Some("nightly".into()),
+                ..Default::default()
+            },
+            // A rate that changes over the window, sizes drawn from a distribution.
+            RunRequest {
+                operators: vec!["s3://bkt/prefix".into()],
+                workload: WorkloadInput {
+                    preset: Some("small-files".into()),
+                    rate: None,
+                    arrivals: None,
+                    shape: Some("ramp:10..500/30s".into()),
+                    object_size: Some("dist:lognormal(256KiB,1.5)".into()),
+                    ..workload.clone()
+                },
+                set: with(&["partitions=2"]),
                 ..Default::default()
             },
             // A configured operator: its secret is redacted in the spec and comes from the
@@ -543,24 +744,291 @@ mod tests {
                     object_size: None,
                     persist_dataset: false,
                     keep_data: false,
-                    ..workload
+                    ..workload.clone()
                 },
-                set,
+                set: set.clone(),
+                ..Default::default()
+            },
+            // An operator file with values of its own.
+            RunRequest {
+                operators: vec![op_file.clone()],
+                workload: workload.clone(),
+                set: vec!["layers.retry.max_times=2".into(), "read.gap=1MiB".into()],
                 ..Default::default()
             },
             RunRequest::new(["lab://throttle"]),
         ];
+        let mut specs = Vec::new();
         for req in requests {
             let first = app.resolve(&req).unwrap().remove(0);
             let spec = first.spec();
-            let again = RunRequest::replaying(&spec);
+            let again = app.replaying(&spec);
             let second = app.resolve(&again).unwrap().remove(0);
-            assert_eq!(second.spec(), spec, "{:?}", spec.command());
+            assert_eq!(second.spec(), spec, "{:?}", again.command());
             // The secret itself is back, not its redaction.
             assert_eq!(
                 second.profile.operator.options.get("secret_access_key"),
                 first.profile.operator.options.get("secret_access_key")
             );
+            // The command of the request is a run of the same spec too.
+            assert_eq!(again.args()[0], "run");
+            specs.push(spec);
         }
+        // Every field: each leaf of a spec's workload is varied by one of the requests above
+        // (a field added to the workload fails here until a request sets it).
+        let default = app
+            .resolve(&RunRequest::new(["s3://bkt/prefix"]))
+            .unwrap()
+            .remove(0)
+            .spec();
+        let flat = |s: &RunSpec| {
+            let mut out = BTreeMap::new();
+            let mut v = serde_json::to_value(s).unwrap();
+            // The dataset and the mix as the run has them, the preset's defaults resolved.
+            let w = s.resolved_profile().workload;
+            v["profile"]["workload"]["dataset"] =
+                serde_json::to_value(w.effective_dataset()).unwrap();
+            v["profile"]["workload"]["mix"] = serde_json::to_value(w.effective_mix()).unwrap();
+            leaves(&v["profile"]["workload"], "workload", &mut out);
+            for k in ["seed", "existing", "label"] {
+                out.insert(k.to_owned(), v[k].clone());
+            }
+            out
+        };
+        let base = flat(&default);
+        let varied: Vec<_> = specs.iter().map(flat).collect();
+        let paths: std::collections::BTreeSet<&String> = varied
+            .iter()
+            .flat_map(|v| v.keys())
+            .chain(base.keys())
+            .collect();
+        for field in [
+            "workload.mix",
+            "workload.shape",
+            "workload.arrivals",
+            "workload.dataset.partitions",
+            "workload.dataset.size_dist",
+            "workload.dataset.existing_prefix",
+            "workload.rate",
+            "seed",
+        ] {
+            assert!(paths.iter().any(|p| *p == field), "{field} of {paths:?}");
+        }
+        for path in paths {
+            assert!(
+                varied.iter().any(|v| v.get(path) != base.get(path)),
+                "no request of this test sets `{path}`: the round trip does not cover it"
+            );
+        }
+    }
+
+    /// A configured operator and an operator file are read again when the run is repeated:
+    /// the request names what the run changed on top of them, not what they say themselves.
+    /// 9.2 compared the run's operator with the default operator of its URL, so every value
+    /// of the file became a `--set` pair that then overrode the file.
+    #[test]
+    fn replaying_names_what_the_run_changed_not_what_its_operator_file_says() {
+        let d = tempfile::tempdir().unwrap();
+        let (app, op_file) = app_with_operators(d.path());
+        for (operator, own) in [
+            ("prod", ["options.region", "layers.retry.max_times"]),
+            (op_file.as_str(), ["options.endpoint", "layers.timeout.op"]),
+        ] {
+            let req = RunRequest {
+                operators: vec![operator.to_owned()],
+                set: vec!["read.gap=1MiB".into(), "http.version=h1".into()],
+                ..Default::default()
+            };
+            let spec = app.resolve(&req).unwrap().remove(0).spec();
+            let again = app.replaying(&spec);
+            assert_eq!(again.operators, [operator]);
+            let mut set = again.set.clone();
+            set.sort();
+            assert_eq!(set, ["http.version=h1", "read.gap=1MiB"], "{operator}");
+            let command = again.command();
+            assert!(own.iter().all(|k| !command.contains(k)), "{command}");
+            assert!(
+                !command.contains("hunter2") && !command.contains("redacted"),
+                "{command}"
+            );
+            // The file's values still reach the run, and a value edited in the file since
+            // is the one the next run has.
+            assert_eq!(app.resolve(&again).unwrap().remove(0).spec(), spec);
+        }
+        // An operator that no longer resolves is kept as it is: its values against its URL.
+        let req = RunRequest {
+            operators: vec![op_file.clone()],
+            ..Default::default()
+        };
+        let spec = app.resolve(&req).unwrap().remove(0).spec();
+        std::fs::remove_file(&op_file).unwrap();
+        let again = app.replaying(&spec);
+        assert_eq!(again.operators, [op_file]);
+        assert!(
+            again.set.iter().any(|s| s.starts_with("options.endpoint=")),
+            "{again:?}"
+        );
+    }
+
+    /// K1-3. The New Run form over a run being repeated. 9.2 dropped everything of the run
+    /// once the preset changed: an `s3://` run on a local endpoint was sent, without its
+    /// `options.endpoint`, to the real service.
+    #[test]
+    fn a_form_keeps_the_operators_values_while_it_names_the_operator() {
+        let repeated = RunRequest {
+            operators: vec!["s3://bench/x".into()],
+            workload: WorkloadInput {
+                preset: Some("range-reads".into()),
+                concurrency: Some(3),
+                duration: Some("5s".into()),
+                rate: Some(150.0),
+                objects: Some(6),
+                seed: Some(7),
+                ..Default::default()
+            },
+            set: [
+                "warmup=0s",
+                "partitions=2",
+                "options.endpoint=http://127.0.0.1:9000",
+                "layers.retry.max_times=5",
+                "endpoint=http://127.0.0.1:9000",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            label: Some("nightly".into()),
+            ..Default::default()
+        };
+        let form = RunForm::of(&repeated);
+        assert_eq!(form.operators, ["s3://bench/x"]);
+        assert_eq!(form.preset.as_deref(), Some("range-reads"));
+        // Unchanged, the form sends the run again; a field changes only itself.
+        let same = form.request(Some(&repeated));
+        assert_eq!(same.args(), repeated.args());
+        assert_eq!(same.label.as_deref(), Some("nightly"));
+        let longer = RunForm {
+            duration: Some("9s".into()),
+            concurrency: None,
+            ..form.clone()
+        };
+        let r = longer.request(Some(&repeated));
+        assert_eq!(r.workload.duration.as_deref(), Some("9s"));
+        assert_eq!(
+            (r.workload.concurrency, r.workload.rate),
+            (None, Some(150.0))
+        );
+        assert_eq!(r.set, repeated.set);
+        // Another preset is another workload on the same operator.
+        let other_preset = RunForm {
+            preset: Some("small-files".into()),
+            ..form.clone()
+        };
+        let r = other_preset.request(Some(&repeated));
+        assert_eq!(
+            r.set,
+            [
+                "options.endpoint=http://127.0.0.1:9000",
+                "layers.retry.max_times=5",
+                "endpoint=http://127.0.0.1:9000"
+            ]
+        );
+        assert_eq!(
+            (r.workload.rate, r.workload.objects, r.workload.seed),
+            (None, None, None)
+        );
+        assert_eq!(r.workload.duration.as_deref(), Some("5s"));
+        let command = other_preset.repeat_command(&repeated).unwrap();
+        assert_eq!(
+            command,
+            "oprobe run s3://bench/x --preset small-files -c 3 -d 5s \
+             --set options.endpoint=http://127.0.0.1:9000 --set layers.retry.max_times=5 \
+             --set endpoint=http://127.0.0.1:9000"
+        );
+        // An existing prefix is read-only, and the command says what the request does.
+        let existing = RunForm {
+            existing: Some("tables/".into()),
+            ..form.clone()
+        };
+        let r = existing.request(Some(&repeated));
+        assert!(r.safety.read_only);
+        assert!(r.command().contains("--existing tables/") && !r.command().contains("--read-only"));
+        // Other operators are another run: nothing is carried over.
+        let other = RunForm {
+            operators: vec!["s3://bench/y".into()],
+            ..form.clone()
+        };
+        let r = other.request(Some(&repeated));
+        assert!(r.set.is_empty() && r.label.is_none() && r.workload.rate.is_none());
+        assert_eq!(other.repeat_command(&repeated), None);
+        assert_eq!(r.args(), form_only(&other).args());
+        fn form_only(f: &RunForm) -> RunRequest {
+            f.request(None)
+        }
+    }
+
+    /// A request's command names everything it sends: the workload settings without a flag
+    /// and the safety rails too.
+    #[test]
+    fn a_requests_command_names_what_it_sends() {
+        let req = RunRequest {
+            operators: vec!["s3://a/b".into(), "my op.toml".into()],
+            workload: WorkloadInput {
+                preset: Some("list-stat".into()),
+                warmup: Some("0s".into()),
+                max_ops: Some(10),
+                access: Some("zipf:1.1".into()),
+                persist_dataset: true,
+                no_verify: true,
+                keep_data: true,
+                arrivals: Some("poisson".into()),
+                shape: Some("step:1,2/1s".into()),
+                ..Default::default()
+            },
+            set: vec!["read.gap=1MiB".into()],
+            safety: Safety {
+                read_only: true,
+                max_requests: Some(100),
+                max_bytes: Some("1GiB".into()),
+                max_duration: Some("5m".into()),
+                dry_run: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            req.command(),
+            "oprobe run s3://a/b 'my op.toml' --preset list-stat --set warmup=0s \
+             --set max_ops=10 --set access=zipf:1.1 --set persist=on --set verify=off \
+             --set cleanup=off --set arrivals=poisson --set shape=step:1,2/1s \
+             --set read.gap=1MiB --read-only --max-requests 100 --max-bytes 1GiB \
+             --max-duration 5m --dry-run"
+        );
+        // The command is the request: its workload resolves as the request's does.
+        let d = tempfile::tempdir().unwrap();
+        let (app, _) = app_with_operators(d.path());
+        let one = RunRequest {
+            operators: vec!["s3://a/b".into()],
+            safety: Safety::default(),
+            ..req.clone()
+        };
+        let args = one.args();
+        let sets: Vec<String> = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .filter(|(flag, _)| *flag == "--set")
+            .map(|(_, v)| v.clone())
+            .collect();
+        let typed = RunRequest {
+            operators: vec!["s3://a/b".into()],
+            workload: WorkloadInput {
+                preset: Some("list-stat".into()),
+                ..Default::default()
+            },
+            set: sets,
+            ..Default::default()
+        };
+        assert_eq!(
+            app.resolve(&typed).unwrap().remove(0).spec(),
+            app.resolve(&one).unwrap().remove(0).spec()
+        );
     }
 }

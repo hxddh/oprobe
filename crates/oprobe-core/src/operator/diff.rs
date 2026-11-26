@@ -46,6 +46,11 @@ pub struct OperatorDiff {
     pub rust: String,
     /// The changed parts of `b` as `op.toml` lines.
     pub toml: String,
+    /// The whole of `b` as Rust that compiles as written ([`to_rust`]: `build_operator()`,
+    /// `reader()`, `writer()`), secrets left to the credential chain. The `rust` lines above
+    /// show a change and do not paste.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operator_rust: String,
 }
 
 impl OperatorDiff {
@@ -156,6 +161,7 @@ pub fn diff(a: &OperatorSpec, b: &OperatorSpec) -> OperatorDiff {
     OperatorDiff {
         rust: rust_diff(a, b, &changes),
         toml: toml_diff(b, &changes),
+        operator_rust: to_rust(&b.redacted()),
         changes,
     }
 }
@@ -1406,5 +1412,28 @@ mod tests {
             code.find("op.with_context(").unwrap() < code.find("op.reader_with(").unwrap(),
             "{code}"
         );
+    }
+
+    /// K4-2: the `+`/`~` lines of a diff do not paste; the whole changed operator does, and
+    /// travels beside them (`diff.operator_rust`), with no secret in it.
+    #[test]
+    fn a_diff_carries_the_whole_operator_as_rust() {
+        let a = OperatorSpec::from_url("s3://bucket/x");
+        let mut b = a.clone();
+        b.set("layers.concurrent_limit.http", "24").unwrap();
+        b.set("options.secret_access_key", "hunter2hunter2")
+            .unwrap();
+        let d = diff(&a, &b);
+        assert_eq!(d.operator_rust, to_rust(&b.redacted()));
+        assert!(
+            d.operator_rust.contains("fn build_operator()"),
+            "{}",
+            d.operator_rust
+        );
+        assert!(d.operator_rust.contains("with_http_concurrent_limit(24)"));
+        assert!(!d.operator_rust.contains("hunter2"), "{}", d.operator_rust);
+        assert!(!d.operator_rust.starts_with('+'));
+        // An operator with nothing changed still has its Rust.
+        assert!(diff(&a, &a).operator_rust.contains("fn build_operator()"));
     }
 }

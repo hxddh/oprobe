@@ -37,6 +37,17 @@ fn at_least<const MIN: usize>(v: &str) -> Result<usize, String> {
     Ok(n)
 }
 
+/// `prove --pairs`: the plans the sequential test is calibrated for (rejected outside them,
+/// never clamped).
+fn pairs(v: &str) -> Result<usize, String> {
+    use crate::app::prove::{MAX_PAIRS, MIN_DECISIVE_PAIRS};
+    let n = at_least::<MIN_DECISIVE_PAIRS>(v)?;
+    if n > MAX_PAIRS {
+        return Err(format!("must be at most {MAX_PAIRS}"));
+    }
+    Ok(n)
+}
+
 /// `-o/--output` (the clap side of [`OutputFormat`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum OutputArg {
@@ -233,11 +244,11 @@ pub struct ProveArgs {
     /// Share of throttled requests a sized value may cause, e.g. 0.1% or 0.001 (default 0.1%)
     #[arg(long, value_name = "RATIO", value_parser = parse::share, allow_hyphen_values = true)]
     pub max_throttle: Option<String>,
-    /// Measurement window of one trial (default 2s)
-    #[arg(long, value_name = "DURATION", value_parser = parse::positive_duration, allow_hyphen_values = true, hide = true)]
+    /// Measurement window of one trial (default 2s, at most the run's own window)
+    #[arg(long, value_name = "DURATION", value_parser = parse::positive_duration, allow_hyphen_values = true)]
     pub trial: Option<String>,
-    /// A/B pairs at most (default 6; at least 3, the fewest that can decide)
-    #[arg(long, value_name = "N", value_parser = at_least::<3>, hide = true)]
+    /// A/B pairs at most, 3 to 12 (default 6; 3 are the fewest that can decide)
+    #[arg(long, value_name = "N", value_parser = pairs)]
     pub pairs: Option<usize>,
     /// Save the proven operator to an op.toml file or [operators.NAME] when improved
     #[arg(long, value_name = "FILE|OPERATOR")]
@@ -270,31 +281,6 @@ pub struct ProveSafetyArgs {
         allow_hyphen_values = true
     )]
     pub max_duration: Option<String>,
-    /// `--budget`: the 6.0–6.2 spelling of `--max-duration`, hidden; with both, the shorter
-    /// bounds the proof.
-    #[arg(
-        long,
-        hide = true,
-        value_name = "DURATION",
-        value_parser = parse::positive_duration,
-        allow_hyphen_values = true
-    )]
-    pub budget: Option<String>,
-}
-
-impl ProveSafetyArgs {
-    /// The one wall-time budget: `--max-duration`, `--budget`, or the shorter of the two.
-    pub fn wall_budget(&self) -> Option<String> {
-        let secs = |d: &String| {
-            crate::util::parse_duration(d)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(f64::INFINITY)
-        };
-        match (&self.max_duration, &self.budget) {
-            (Some(a), Some(b)) => Some(if secs(b) < secs(a) { b } else { a }.clone()),
-            (a, b) => a.clone().or_else(|| b.clone()),
-        }
-    }
 }
 
 /// `--by`.
@@ -357,26 +343,4 @@ pub struct LabArgs {
     /// Cap total in-memory object bytes stored by the lab (default 8GiB)
     #[arg(long, value_name = "SIZE", value_parser = parse::nonzero_size, hide = true)]
     pub max_store_size: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ProveSafetyArgs;
-
-    #[test]
-    fn the_old_budget_spelling_still_bounds_the_proof() {
-        let s = |max: Option<&str>, budget: Option<&str>| ProveSafetyArgs {
-            max_duration: max.map(str::to_owned),
-            budget: budget.map(str::to_owned),
-            ..Default::default()
-        };
-        assert_eq!(s(Some("5m"), None).wall_budget().as_deref(), Some("5m"));
-        assert_eq!(s(None, Some("2m")).wall_budget().as_deref(), Some("2m"));
-        // Both (a 6.2 script that passed both): the shorter bounds it, no error.
-        assert_eq!(
-            s(Some("5m"), Some("90s")).wall_budget().as_deref(),
-            Some("90s")
-        );
-        assert_eq!(s(None, None).wall_budget(), None);
-    }
 }

@@ -225,6 +225,20 @@ impl RequestTiming {
     }
 }
 
+/// The OpenDAL service a request was issued to, as OpenDAL's own metrics label it
+/// (`opendal-layer-otelmetrics`): one [`crate::TraceLayer`] may be applied to several
+/// operators, and an [`crate::Exporter`] tells their requests apart by this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
+pub struct ServiceLabels {
+    /// The OpenDAL scheme (`s3`, `gcs`, …).
+    pub scheme: std::sync::Arc<str>,
+    /// The service's name: the bucket or container.
+    pub namespace: std::sync::Arc<str>,
+    /// The operator's root.
+    pub root: std::sync::Arc<str>,
+}
+
 /// One backend request (HTTP request or in-process backend call).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -265,6 +279,10 @@ pub struct RequestRecord {
     /// request row's `api`. `api` above is its class (aggregation).
     #[serde(skip)]
     pub service_op: Option<&'static str>,
+    /// The service of the operator that issued the request, for an [`crate::Exporter`]: set
+    /// on HTTP requests when the layer has one.
+    #[serde(skip)]
+    pub service: Option<std::sync::Arc<ServiceLabels>>,
     /// TLS handshake of the connection, on the request that dialed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<Box<crate::rows::TlsRow>>,
@@ -282,8 +300,8 @@ impl RequestRecord {
     /// (`OpScope::push_request`, `Recorder::record_unscoped_request`), whatever transport or
     /// backend wrote the text, so no exporter, snapshot or file sees a signature or token.
     pub(crate) fn redact(&mut self) {
-        if let Some(error) = self.error.as_mut().filter(|e| e.contains("://")) {
-            *error = crate::util::strip_url_credentials(error);
+        if let Some(clean) = self.error.as_deref().and_then(crate::util::redacted) {
+            self.error = Some(clean);
         }
     }
 

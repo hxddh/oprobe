@@ -152,15 +152,62 @@ fn toggle_full_screen(s: Store) {
     });
 }
 
-/// The menus of the menu bar, in the app's language and state.
-pub fn application(s: Store) -> Vec<MenuItem> {
-    let modal = s.modal();
-    let running = s.running();
-    let proving = s.proving();
-    let one = s.selection.with(|v| v.len() == 1) && s.current.with(|c| c.is_some());
-    let sel = s.selection.get();
-    let page = s.page.get();
-    let sidebar = s.sidebar.get();
+/// How many runs are selected, as far as a menu shows it: Copy Run ID and Delete need one,
+/// Run Again and Prove exactly one, Compare two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Selected {
+    None,
+    One,
+    Several,
+}
+
+/// Everything the menu bar shows of the app's state: its language, what is enabled and
+/// checked, the sidebar item's label. The bar is rebuilt when one of these changes and at no
+/// other time ([`install`]); what an item acts on (which runs are selected) is read when the
+/// item is chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Shown {
+    lang: crate::ui::i18n::Lang,
+    modal: bool,
+    running: bool,
+    proving: bool,
+    selected: Selected,
+    page: Page,
+    sidebar: bool,
+}
+
+impl Shown {
+    fn of(s: Store) -> Self {
+        Self {
+            lang: s.lang.get(),
+            modal: s.modal(),
+            running: s.running(),
+            proving: s.proving(),
+            selected: s.selection.with(|v| match v.len() {
+                0 => Selected::None,
+                1 => Selected::One,
+                _ => Selected::Several,
+            }),
+            page: s.page.get(),
+            sidebar: s.sidebar.get(),
+        }
+    }
+}
+
+/// The menus of the menu bar for what `shown` says of the app's state.
+fn application(s: Store, shown: Shown) -> Vec<MenuItem> {
+    let Shown {
+        modal,
+        running,
+        proving,
+        selected,
+        page,
+        sidebar,
+        ..
+    } = shown;
+    // Run Again and Prove act on the run that is shown: while it still loads they do
+    // nothing (`Store::run_again`, `Store::start_prove`).
+    let one = selected == Selected::One;
     let mut menus = Vec::new();
     if mac() {
         menus.push(MenuItem::submenu(
@@ -197,7 +244,6 @@ pub fn application(s: Store) -> Vec<MenuItem> {
         file.push(quit_item(s));
     }
     menus.push(MenuItem::submenu(tr("menu.file"), file));
-    let copy_ids = sel.join(" ");
     menus.push(MenuItem::submenu(
         tr("menu.edit"),
         [
@@ -212,12 +258,10 @@ pub fn application(s: Store) -> Vec<MenuItem> {
             MenuItem::new(tr("menu.copy_id"))
                 .shortcut("mod+shift+c")
                 .shortcut_when(When::NotEditing)
-                .disabled(modal || sel.is_empty())
-                .on_select(move || s.copy(copy_ids.clone())),
+                .disabled(modal || selected == Selected::None)
+                .on_select(move || s.copy(s.selection.get_untracked().join(" "))),
         ],
     ));
-    let del = sel.clone();
-    let cmp = sel.clone();
     menus.push(MenuItem::submenu(
         tr("menu.run"),
         [
@@ -241,14 +285,14 @@ pub fn application(s: Store) -> Vec<MenuItem> {
                     s.start_prove();
                 }),
             MenuItem::new(tr("menu.compare"))
-                .disabled(modal || cmp.len() < 2)
-                .on_select(move || s.show_selection(cmp.clone())),
+                .disabled(modal || selected != Selected::Several)
+                .on_select(move || s.show_selection(s.selection.get_untracked())),
             MenuItem::separator(),
             MenuItem::new(tr("menu.delete"))
                 .shortcut(if mac() { DELETE_MAC } else { DELETE })
                 .shortcut_when(When::NotEditing)
-                .disabled(modal || del.is_empty())
-                .on_select(move || s.ask_delete(del.clone())),
+                .disabled(modal || selected == Selected::None)
+                .on_select(move || s.ask_delete(s.selection.get_untracked())),
         ],
     ));
     let mut view = vec![
@@ -301,24 +345,19 @@ pub fn application(s: Store) -> Vec<MenuItem> {
     menus
 }
 
-/// Keep the menu bar in step with the language and the app's discrete state transitions
-/// (never rebuilding OS menus on 100 ms progress ticks).
+/// Keep the menu bar in step with what it shows ([`Shown`]), and rebuild it for nothing
+/// else. nsh gives the items of a rebuilt bar new ids, so a shortcut pressed while the bar is
+/// rebuilt names an item that is gone and does nothing: 9.2 rebuilt it whenever the selection
+/// changed (every arrow key in the sidebar, every run that landed or finished loading), and
+/// its tests waited for the bar to settle. It is still rebuilt when the language changes, a
+/// dialog or an alert opens or closes, a run or a prove starts or ends, the selection goes
+/// between none, one and several runs, the page changes (its check mark) or the sidebar
+/// shows or hides (its item's label): each changes an item.
 pub fn install(s: Store) {
-    let key = computed(move || {
-        (
-            s.lang.get(),
-            s.modal(),
-            s.running(),
-            s.proving(),
-            s.selection.get(),
-            s.current.with(|c| c.is_some()),
-            s.page.get(),
-            s.sidebar.get(),
-        )
-    });
+    let shown = computed(move || Shown::of(s));
     effect(move || {
-        let _ = key.get();
-        set_application_menu(untracked(|| application(s)));
+        let shown = shown.get();
+        set_application_menu(untracked(|| application(s, shown)));
     });
 }
 

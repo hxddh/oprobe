@@ -234,6 +234,31 @@ impl Report {
                     run_file_hint(),
                 ));
             }
+            // The whole result of `oprobe run -o json`: its runs, each with its report.
+            None if v.get("runs").and_then(|r| r.as_array()).is_some() => {
+                let runs = v["runs"].as_array().map_or(&[][..], |r| r.as_slice());
+                let ids: Vec<&str> = runs
+                    .iter()
+                    .filter_map(|r| r.get("run_id").and_then(|i| i.as_str()))
+                    .collect();
+                let hint = match ids.as_slice() {
+                    [] => "pass one run's report: `.runs[0].report` of this document".to_owned(),
+                    [id] => format!(
+                        "pass the run it holds, `{id}`, or its report: `.runs[0].report` of this document"
+                    ),
+                    ids => format!(
+                        "pass one of the runs it holds ({}), or one's report: `.runs[N].report` of this document",
+                        ids.join(", ")
+                    ),
+                };
+                return Err(bad(
+                    format!(
+                        "it is the result of `oprobe run -o json` ({} runs), not one run's report",
+                        runs.len()
+                    ),
+                    hint,
+                ));
+            }
             None if str_of("workload_hash").is_some() && str_of("target_id").is_some() => {
                 let id = str_of("id").unwrap_or("RUN");
                 return Err(bad(
@@ -489,8 +514,6 @@ pub struct SlaInfo {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_throttle_ratio: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub p99_ms: Option<f64>,
 }
 
 impl From<&crate::config::Sla> for SlaInfo {
@@ -499,7 +522,6 @@ impl From<&crate::config::Sla> for SlaInfo {
             enforced: s.enforce,
             max_error_ratio: s.max_error_rate,
             max_throttle_ratio: s.max_throttle_rate,
-            p99_ms: s.p99_ms,
         }
     }
 }
@@ -866,8 +888,12 @@ pub fn evidence_label(key: &str, v: f64) -> (String, String) {
         "typical_ttfb_ms" => Some("Typical time to first byte"),
         "median_request_ms" => Some("Median request"),
         "slowest_request_ms" => Some("Slowest request"),
-        "body_pct" => Some("Time receiving the body"),
-        "upload_pct" => Some("Time uploading"),
+        "body_pct" | "body_time_ratio" => Some("Time receiving the body"),
+        "upload_pct" | "upload_time_ratio" => Some("Time uploading"),
+        "busiest_inflight_count" => Some("Busiest level (in flight)"),
+        "busiest_queue_wait_ms" => Some("Wait in the queue there"),
+        "busiest_ttfb_ms" => Some("Time to first byte there"),
+        "ttfb_growth_ratio" => Some("Added wait per further request in flight"),
         "dns_p50_ms" => Some("DNS p50"),
         "tcp_p50_ms" => Some("TCP connect p50"),
         "tls_p50_ms" => Some("TLS handshake p50"),
@@ -878,6 +904,7 @@ pub fn evidence_label(key: &str, v: f64) -> (String, String) {
         "explains_ratio" => Some("Share it explains"),
         "stream_bytes_per_s" => Some("Per-stream throughput"),
         "fitted_bytes_per_s" => Some("Fitted bandwidth"),
+        "typical_transfer_ms" => Some("Typical transfer time"),
         "fitted_requests_per_s" => Some("Fitted request rate"),
         "fitted_inflight_count" => Some("Fitted limit (in flight)"),
         "requests_per_op_mean" => Some("Requests per operation"),
@@ -1000,6 +1027,23 @@ mod tests {
             assert_eq!(b.code, crate::errors::ErrorCode::UsageInvalidArgument);
             (b.message, b.hint.unwrap_or_default())
         };
+        // The result of `oprobe run -o json` holds the reports of its runs: it says where.
+        let (m, h) = err(serde_json::json!({
+            "runs": [
+                {"run_id": "20261120-140000-0001", "report": {"schema": REPORT_SCHEMA}},
+                {"run_id": "20261120-140100-0002", "report": {"schema": REPORT_SCHEMA}},
+            ]
+        }));
+        assert!(m.contains("`oprobe run -o json` (2 runs)"), "{m}");
+        assert!(
+            h.contains(".runs[N].report") && h.contains("20261120-140100-0002"),
+            "{h}"
+        );
+        let (_, h) = err(serde_json::json!({"runs": [{"run_id": "20261120-140000-0001"}]}));
+        assert!(
+            h.contains(".runs[0].report") && h.contains("`20261120-140000-0001`"),
+            "{h}"
+        );
         let (m, h) = err(serde_json::json!({
             "schema": "oprobe.prove/9", "prove_id": "20261120-143005-a1b2",
             "run_id": "20261120-140000-0001", "verdict": "improved"

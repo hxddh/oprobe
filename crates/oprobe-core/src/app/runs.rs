@@ -116,7 +116,9 @@ impl CommandOutput for RunList {
                             p.objective.label(),
                             p.objective_delta_ratio * 100.0
                         ),
-                        p.change.join(" "),
+                        // The whole change is in `show PROVE`: a long one would pad every
+                        // row of the table to its width.
+                        clip(&p.change.join(" "), CHANGE_WIDTH),
                     ]
                 })
                 .collect();
@@ -149,6 +151,19 @@ impl CommandOutput for RunList {
         o += &dim("show one: oprobe show RUN  (id, prefix, last, last~1)\n");
         o
     }
+}
+
+/// The widest a prove's change prints in the list.
+const CHANGE_WIDTH: usize = 48;
+
+/// `s`, cut to `width` characters with an ellipsis when it is longer.
+fn clip(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// `3m ago`, `5h ago`, `2d ago` from a run id's timestamp.
@@ -390,9 +405,8 @@ impl CommandOutput for Profile {
             let mut o = String::new();
             if let Some(v) = &self.range {
                 o += &dim(&format!(
-                    "{:.1}–{:.1} s of the {:.1} s window · {} ops · {} requests\n",
-                    v.since_s,
-                    v.until_s,
+                    "{} of the {:.1} s window · {} ops · {} requests\n",
+                    crate::report::terminal::range_span(v.since_s, v.until_s),
                     self.run.report.run.window_s,
                     v.ops_count,
                     v.requests_count
@@ -745,7 +759,13 @@ impl CommandOutput for RemovedRuns {
 /// The ids of the stored runs (or proves) `refs` name (a file outside the store is refused).
 pub fn stored_ids(app: &App, refs: &[RunRef]) -> Result<Vec<String>> {
     let store = app.store();
-    let mut ids = Vec::new();
+    let mut ids: Vec<String> = Vec::new();
+    // A run named twice (`show --rm X X`, an id and `last`) is one run: once in the result.
+    let push = |ids: &mut Vec<String>, id: String| {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    };
     for RunRef(r) in refs {
         if let Some(p) = store.resolve_prove(r)? {
             if p.parent() != Some(store.dir()) {
@@ -760,7 +780,7 @@ pub fn stored_ids(app: &App, refs: &[RunRef]) -> Result<Vec<String>> {
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_suffix(".prove.json"))
             {
-                ids.push(id.to_owned());
+                push(&mut ids, id.to_owned());
                 continue;
             }
         }
@@ -776,7 +796,7 @@ pub fn stored_ids(app: &App, refs: &[RunRef]) -> Result<Vec<String>> {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        ids.push(id);
+        push(&mut ids, id);
     }
     Ok(ids)
 }
@@ -878,6 +898,80 @@ mod tests {
         assert_eq!(when(id, t + s(5)), "just now");
         assert_eq!(when(id, t + s(600)), "10m ago");
         assert_eq!(when(id, t + s(3 * 86_400)), "3d ago");
+    }
+
+    /// `show --rm X X` failed on the second X (the run was gone by then): a run named twice,
+    /// by its id or another way, is removed once.
+    #[test]
+    fn a_run_named_twice_is_removed_once() {
+        let d = tempfile::tempdir().unwrap();
+        let app = App::new(crate::store::Paths {
+            config_file: d.path().join("config.toml"),
+            data_dir: d.path().join("data"),
+        });
+        let (a, b) = ("20261120-143005-a1b2", "20261120-143006-c3d4");
+        for id in [a, b] {
+            app.store()
+                .save(&crate::store::runs::tests::sample_run(id, None))
+                .unwrap();
+        }
+        let twice = [
+            RunRef::from(a),
+            RunRef::from(a),
+            RunRef::from("20261120-143005"),
+        ];
+        assert_eq!(app.run_ids(&twice).unwrap(), [a]);
+        let removed = rm(&app, &twice).unwrap();
+        assert_eq!(removed.removed, [a]);
+        let left: Vec<String> = app.list().unwrap().runs.into_iter().map(|r| r.id).collect();
+        assert_eq!(left, [b]);
+        // The trash takes a run named twice once too.
+        let t = app.trash(&[RunRef::from(b), RunRef::from("last")]).unwrap();
+        assert_eq!(t.ids, [b]);
+    }
+
+    /// `show --list` padded every row of the proves table to the longest `change` (300
+    /// columns for a change of a dozen values): a long change is cut in the list.
+    #[test]
+    fn a_long_change_does_not_widen_the_list() {
+        crate::report::style::set(false);
+        let prove = |id: &str, change: Vec<String>| ProveSummary {
+            prove_id: id.into(),
+            run_id: "20261120-143005-a1b2".into(),
+            finding: Some("throttling".into()),
+            objective: crate::app::ProveObjective::Goodput,
+            verdict: crate::app::ProveVerdict::Improved,
+            objective_delta_ratio: 0.12,
+            change,
+        };
+        let long: Vec<String> = (0..12)
+            .map(|i| format!("options.some_long_option_{i}=a-rather-long-value-{i}"))
+            .collect();
+        let list = RunList {
+            runs: vec![RunSummary::from(
+                &crate::store::runs::tests::sample_run("20261120-143005-a1b2", None).report,
+            )],
+            total_count: 1,
+            hidden_trials_count: 0,
+            proves: vec![
+                prove(
+                    "20261120-150000-0001",
+                    vec!["layers.retry.jitter=true".into()],
+                ),
+                prove("20261120-150100-0002", long),
+            ],
+            proves_total_count: 2,
+        };
+        let text = list.text();
+        let widest = text.lines().map(|l| l.chars().count()).max().unwrap();
+        assert!(widest <= 140, "{widest} columns:\n{text}");
+        assert!(text.contains("layers.retry.jitter=true"), "{text}");
+        assert!(
+            text.contains("options.some_long_option_0=a-rather-long-value-…"),
+            "{text}"
+        );
+        assert_eq!(clip("short", 48), "short");
+        assert_eq!(clip("中文中文中文", 4), "中文中…");
     }
 
     #[test]

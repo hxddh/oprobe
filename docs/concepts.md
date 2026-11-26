@@ -58,18 +58,35 @@ command sends to the target and every body byte, as they are sent and received:
 - a request the budget has no room for is never sent, and a download stops at the chunk that
   crosses the byte budget, so a budget is overshot by at most the response chunks in flight,
   never by a whole operation;
-- cleanup is never counted and never refused: deleting the run prefix and aborting multipart
-  uploads always run.
+- once a budget is spent, nothing more is sent: a request without a body is refused too, since
+  its answer would only be cut. A body that does not fit in what is left of `--max-bytes` is
+  refused and the error says so ("the next request (8.0 MiB) does not fit the byte budget: 1 B
+  of 4.0 MiB used");
+- cleanup is never counted and never refused: deleting the run prefix, deleting the preflight's
+  probe object and aborting multipart uploads always run.
 
 In-process services (`memory://`, `fs://`) send no HTTP request: their calls are counted as they
 complete.
 
 **A stopped run leaves no multipart upload.** When a budget, `--max-duration`, Ctrl-C (or
-SIGTERM, SIGHUP) or Stop ends a run, the requests in flight are cut and the operations they
-belong to end at once; they are neither completed nor failed operations, and are not in the
-profile. Every multipart upload a failed, timed-out or stopped write or dataset upload had
-started is aborted (`AbortMultipartUpload`), so no part stays on the target to be billed where no
-object listing shows it. An upload whose abort fails is named in the cleanup error.
+SIGTERM, SIGHUP), a closed terminal or Stop ends a run, the requests in flight are cut and the
+operations they belong to end at once; they are neither completed nor failed operations, and are
+not in the profile (an open-loop run counts them in neither its arrivals nor its achieved rate).
+Every multipart upload a failed, timed-out or stopped write or dataset upload had started is
+aborted (`AbortMultipartUpload`), so no part stays on the target to be billed where no object
+listing shows it.
+
+Stopping is bounded. An upload that was being created when the run stopped has 10 s to answer
+(its answer carries the id it is aborted with), each abort 30 s, and the run waits at most 45 s
+for all of them before it deletes its test data. An upload whose abort failed, whose creation
+never answered or that was still in flight after that wait is named in the cleanup error: check
+the target for it (`aws s3api list-multipart-uploads`, or a lifecycle rule that aborts
+incomplete uploads).
+
+**A closed stderr stops the run like a signal.** Progress goes to stderr. When its reader is
+gone (the terminal or SSH session closed, `oprobe run … 2>&1 | head`), the first line that cannot
+be written stops the command as Ctrl-C does: it cleans up, saves the partial run and exits 130.
+With `-q` nothing is written while the run measures, so it runs to its end.
 
 ## Profile
 
@@ -86,7 +103,8 @@ A profile is what one operator did on one workload, saved as one `.oprobe` file:
 
 Each operation's wall time splits exactly into queue + backend + retry + client, so "network,
 server or my code?" has a measured answer. Long runs keep every aggregate exact and sample whole
-operations (failed, throttled and slowest ones are always kept), so memory stays bounded.
+operations (failed, throttled and slowest ones first: a run that fails for hours thins those
+too), so memory and the run file stay bounded.
 
 `.oprobe` files come from `oprobe run` and from [`oprobe-trace`](embedding.md) in production;
 `oprobe show FILE` and the app open both. A production trace has the same shape: every OpenDAL
@@ -104,17 +122,27 @@ hung I/O, cold connections, small ranges, slow multipart, repeated reads, a busy
 
 Every finding has a confidence: **high** only when the model explains most of the effect and
 agrees across repeats. Throttling that made operations fail is reported as throttling, never as
-an invalid run. The codes and their remedies are in the [README](../README.md#findings-and-their-remedy);
-besides those, `errors` reports failures that are not throttling (when retries recovered every
-operation, its remedy is a shorter first retry backoff with jitter, `layers.retry.min_delay`) and
-`invalid_run` a run whose numbers cannot be trusted (too short, nothing measured).
+an invalid run, and a handful of 429/503 that no limit model explains is still `throttling`, at
+low confidence, never `errors`. The codes and their remedies are in the
+[README](../README.md#findings-and-their-remedy); besides those, `errors` reports failures that
+are not throttling and `invalid_run` a run whose numbers cannot be trusted (too short, nothing
+measured). The remedy of `errors` follows what failed:
+
+- transient failures the retries recovered (5xx, lost connections), a few operations that ran
+  out of retries included: a shorter first retry backoff with jitter (`layers.retry.min_delay`);
+- writes that OpenDAL's `ThrottleLayer` refused because they are larger than
+  `layers.throttle.burst` (they fail as rate-limited with no 429/503 from the service): raise
+  the burst to at least the largest write;
+- anything else (credentials, permissions, the endpoint): not a layer.
 
 ## Remedy
 
 Each finding names exactly **one** remedy, as an `op.toml` path: `layers.concurrent_limit.http`,
 `layers.tail_cut`, `read.gap`, `http.keep_alive`, … A remedy that is not a layer (spreading keys
-over prefixes for `key_limit`) is reported as advice, and `client_bound` has no storage remedy:
-their `next` says where to look (`oprobe show RUN --detail`), and `prove` refuses them.
+over prefixes for `key_limit`), or that no A/B test can measure (capping the requests in flight
+in front of a service that queues without rejecting: the cap moves the wait, it shortens
+nothing), is reported as advice, and `client_bound` has no storage remedy: their `next` says
+where to look (`oprobe show RUN --detail`), and `prove` refuses them.
 
 `run` gives the remedy and **no number**. A single run varies no load, so it cannot say how
 large a limit should be or how much it would help; claiming so would be a guess.
@@ -125,7 +153,10 @@ large a limit should be or how much it would help; claiming so would be a guess.
 
 1. **Choose the change**: the finding's remedy (the top finding by default), or `--with PATH=VALUE`.
 2. **Size it**: when the remedy has a size (a limit, a chunk), short trials over that one value
-   find the knee of the objective, within `--max-throttle`.
+   find the knee of the objective, within `--max-throttle`. For a `rate_limit` finding the
+   value must also stay under the rate the finding fitted: a cap whose own trial sends more
+   requests per second than that is not chosen, even when its two seconds saw no throttle (a
+   token bucket's burst hides the limit from a short trial).
 3. **A/B test**: trials of A and B run in pairs. The order is balanced: the pairs come in blocks
    of two, one `AB` and one `BA`, and which comes first in a block is drawn from the run's seed.
    A sequential test on the objective, against a noise floor learned from each side's
@@ -146,9 +177,29 @@ large a limit should be or how much it would help; claiming so would be a guess.
      are calibrated by simulation for the planned number of pairs, `--pairs`). Whenever the
      proof stops — a decision, the pair limit, the budget — the chance that it calls a change
      that is none stays under 5 %. An order effect widens the interval; it never moves it.
+   - The proof also stops early when more pairs would not help (**futility**): the pairs so
+     far rule out the smallest change the planned pairs could show at the noise measured. A
+     note names that smallest change. A proof is never given up for a change it could have
+     shown.
+   - **After an early stop, read the interval, not the estimate.** A proof that stops early
+     on a decision stopped because its estimate was large, so the estimate overstates the
+     change on average. The interval does not: its coverage holds whenever the proof stops.
    - Shares (throttled requests, errors) are compared with Newcombe's interval. Secondary
-     metrics are shown and never decide (their intervals are plain, not sequential).
+     metrics are shown and never decide; each has a plain interval (not sequential) on its
+     own trial-to-trial spread, not the objective's.
    - Deciding takes at least 3 pairs of trials; with fewer, the verdict is `inconclusive`.
+   - **Two gates come before the objective.** A changed operator that throttles more than
+     `--max-throttle` allows, or fails more operations than the run allows (1 %), and more
+     than the current operator beyond chance, is `inconclusive` with a note: operations that
+     fail fast lower a p99, and that is no improvement. A pair in which a trial has no
+     objective at all (no successful operation, nothing measured) is not judged, and ends
+     the proof.
+   - **A p99 needs enough operations.** The p99 of a trial is one order statistic: its
+     resolution is the spread of the latencies at the ranks 0.99·n ± 2·√(0.0099·n) of the
+     trial's n operations, and the noise floor is never below it. When those latencies
+     differ by more than 2× the p99 sits on a cliff (the edge of the throttled or retried
+     operations, say), which side a trial lands on is chance, and a note says "p99 sits on a
+     cliff: lengthen the trial" (`--trial`).
 5. **Save**: every trial is saved as a run, a child of the prove, hidden from `show --list`.
 
 The result is a **proven layer diff**: the objective's change with its interval, the evidence,

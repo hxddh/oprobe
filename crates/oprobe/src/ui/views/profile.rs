@@ -248,6 +248,8 @@ struct Numbers {
     errors: f64,
     throttled: f64,
     counts: String,
+    /// The percentiles are lower bounds (a range with arrivals that never started).
+    at_least: bool,
 }
 
 fn tiles(m: &ProfileModel, cx: Ctx) -> View {
@@ -267,6 +269,7 @@ fn tiles(m: &ProfileModel, cx: Ctx) -> View {
                 &fmt::clock_s(m.window_s),
             ],
         ),
+        at_least: false,
     };
     let whole = Rc::new(whole);
     view().test_id("tiles").child(dynamic(move || {
@@ -282,14 +285,24 @@ fn tiles(m: &ProfileModel, cx: Ctx) -> View {
                     p999: v.p999_ms,
                     errors: v.error_ratio,
                     throttled: v.throttled_request_ratio,
-                    counts: fill(
-                        "range.counts",
-                        &[
-                            &fmt::count(v.ops_count),
-                            &fmt::count(v.requests_count),
-                            &fmt::clock_s(v.span_s()),
-                        ],
-                    ),
+                    counts: {
+                        let counts = fill(
+                            "range.counts",
+                            &[
+                                &fmt::count(v.ops_count),
+                                &fmt::count(v.requests_count),
+                                &fmt::clock_s(v.span_s()),
+                            ],
+                        );
+                        if v.missed_arrivals_count > 0 {
+                            let missed =
+                                fill("range.missed", &[&fmt::count(v.missed_arrivals_count)]);
+                            format!("{counts} · {missed}")
+                        } else {
+                            counts
+                        }
+                    },
+                    at_least: v.latency_at_least,
                 })
             }
             None => whole.clone(),
@@ -301,6 +314,15 @@ fn tiles(m: &ProfileModel, cx: Ctx) -> View {
 fn numbers_view(n: &Numbers) -> View {
     let t = |label: &'static str, v: String, tone: Tone| {
         tile(tr(label), move || v.clone().into(), move || tone)
+    };
+    // A lower bound reads "≥ 1.20 s".
+    let at_least = n.at_least;
+    let pct = |ms: f64| {
+        if at_least {
+            format!("≥ {}", fmt::dur_ms(ms))
+        } else {
+            fmt::dur_ms(ms)
+        }
     };
     view()
         .gap(px(6.0))
@@ -316,9 +338,9 @@ fn numbers_view(n: &Numbers) -> View {
                     format!("{} MiB/s", fmt::sig3(n.mib)),
                     Tone::Neutral,
                 ))
-                .child(t("metric.p50", fmt::dur_ms(n.p50), Tone::Neutral))
-                .child(t("metric.p99", fmt::dur_ms(n.p99), Tone::Neutral))
-                .child(t("metric.p999", fmt::dur_ms(n.p999), Tone::Neutral))
+                .child(t("metric.p50", pct(n.p50), Tone::Neutral))
+                .child(t("metric.p99", pct(n.p99), Tone::Neutral))
+                .child(t("metric.p999", pct(n.p999), Tone::Neutral))
                 .child(t(
                     "metric.errors_of_ops",
                     fmt::ratio(n.errors),
@@ -517,7 +539,12 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
                                     fmt::bytes(a.down_bytes),
                                     fmt::bytes(a.up_bytes)
                                 ),
-                                fmt::ratio(a.reused_ratio),
+                                // Unknown is not 0 %: the operator's own HTTP client.
+                                if m.conns.observed {
+                                    fmt::ratio(a.reused_ratio)
+                                } else {
+                                    "–".to_owned()
+                                },
                             ]
                         })
                         .collect();
@@ -2164,7 +2191,9 @@ fn conns(m: &ProfileModel, cx: Ctx) -> View {
         .child(
             prop(
                 tr("conn.dialed"),
-                if c.warmup_dialed_count > 0 {
+                if !c.observed {
+                    tr("conn.not_observed").to_owned()
+                } else if c.warmup_dialed_count > 0 {
                     fill(
                         "conn.dialed_of",
                         &[
@@ -2182,7 +2211,14 @@ fn conns(m: &ProfileModel, cx: Ctx) -> View {
             (c.dial_failures_count > 0)
                 .then(|| prop(tr("conn.dial_failures"), fmt::count(c.dial_failures_count))),
         )
-        .child(prop(tr("conn.reuse"), fmt::ratio(c.reuse_ratio)))
+        .child(prop(
+            tr("conn.reuse"),
+            if c.observed {
+                fmt::ratio(c.reuse_ratio)
+            } else {
+                tr("conn.not_observed").to_owned()
+            },
+        ))
         .child(prop(
             tr("conn.protocols"),
             [

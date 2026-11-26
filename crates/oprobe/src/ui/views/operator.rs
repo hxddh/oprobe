@@ -293,7 +293,17 @@ fn changes(s: Store, m: Rc<ProfileModel>, edited: Edited) -> View {
         let base = m.operator.clone();
         untracked(|| {
             if edits.is_empty() {
-                return small(tr("operator.no_changes")).into_element();
+                // Nothing pending: "Copy Rust" copies the whole operator, ready to paste.
+                let rust = data::rust(&base);
+                return view()
+                    .gap_2()
+                    .child(small(tr("operator.no_changes")))
+                    .child(view().flex_row().child(btn(
+                        tr("operator.copy_rust"),
+                        || Kind::Plain,
+                        move || s.copy(rust.clone()),
+                    )))
+                    .into_element();
             }
             let (rust, toml) = data::diff(&base, &spec);
             view()
@@ -482,7 +492,17 @@ fn prove_state(s: Store, st: crate::ui::jobs::State, p99: bool, has_file: bool) 
     // The interval is the one of the prove's plan (its sequential boundary).
     let (ab, max_pairs) = match &st.outcome {
         Some(Outcome::Proved(p)) if !p.ab.is_empty() => (p.ab.clone(), p.max_pairs),
-        _ => (crate::ui::jobs::ab_live(&st.trials), st.prove_pairs),
+        _ => (
+            crate::app::prove::ab_pairs(
+                if p99 {
+                    ProveObjective::P99
+                } else {
+                    ProveObjective::Goodput
+                },
+                &st.trials,
+            ),
+            st.prove_pairs,
+        ),
     };
     let ps: Vec<(f64, f64, f64)> = ab
         .iter()

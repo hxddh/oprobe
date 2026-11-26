@@ -1110,6 +1110,7 @@ mod tests {
             baseline,
             candidate,
             ops_count,
+            resolution: 0.0,
             candidate_first: i % 2 == 1,
         };
         let ab: Vec<AbPair> = (0..6)
