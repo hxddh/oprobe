@@ -399,6 +399,28 @@ deletes the prefix. A run killed before it could clean up leaves its prefix behi
 against the same target deletes it. The guard enforces budgets (`--max-requests`, `--max-bytes`,
 `--max-duration`), `--read-only` and `--dry-run`.
 
+**Budgets hold on the wire.** `--max-requests` and `--max-bytes` count every HTTP request the
+command sends to the target and every body byte, as they are sent and received:
+
+- in every phase before cleanup: the reachability check, the preflight, the dataset upload, the
+  warm-up, the measurement and the verification of written objects;
+- retries and re-sent requests included, each with its body;
+- a request the budget has no room for is never sent, and a download stops at the chunk that
+  crosses the byte budget, so a budget is overshot by at most the response chunks in flight,
+  never by a whole operation;
+- cleanup is never counted and never refused: deleting the run prefix and aborting multipart
+  uploads always run.
+
+In-process services (`memory://`, `fs://`) send no HTTP request: their calls are counted as they
+complete.
+
+**A stopped run leaves no multipart upload.** When a budget, `--max-duration`, Ctrl-C (or
+SIGTERM, SIGHUP) or Stop ends a run, the requests in flight are cut and the operations they
+belong to end at once; they are neither completed nor failed operations, and are not in the
+profile. Every multipart upload a failed, timed-out or stopped write or dataset upload had
+started is aborted (`AbortMultipartUpload`), so no part stays on the target to be billed where no
+object listing shows it. An upload whose abort fails is named in the cleanup error.
+
 ## Profile
 
 A profile is what one operator did on one workload, saved as one `.oprobe` file:
@@ -796,12 +818,14 @@ from the config file's `[operators.NAME]` also works.
 |---|---|
 | `--dry-run` | print the plan (requests, bytes, objects written and deleted, ETA, budgets; a warning when it would spend one) and exit (`-o json`: `schemas/plan.json`) |
 | `--read-only` | refuse every write and delete (exit 5) |
-| `--max-requests N` | stop after this many backend requests (exit 4) |
-| `--max-bytes SIZE` | stop after transferring this many bytes, e.g. `10GiB` (exit 4) |
+| `--max-requests N` | send at most this many HTTP requests to the target, retries and the dataset upload included; the next one is not sent (exit 4) |
+| `--max-bytes SIZE` | transfer at most this many body bytes, up and down, e.g. `10GiB`; a request body that does not fit is not sent, a download is cut where it crosses the budget (exit 4) |
 | `--max-duration DURATION` | stop after this much wall time, e.g. `5m` (exit 4) |
 
-A budget that stops a run saves the partial run and cleans up. Budgets cover the whole command:
-every operator of the run. `[defaults.budgets]` in the config file sets defaults.
+A budget that stops a run cuts what is in flight, aborts the multipart uploads it interrupted,
+saves the partial run and cleans up. Budgets cover the whole command: every operator of the
+run, and every phase but cleanup (see [concepts](concepts.md)). `[defaults.budgets]` in the
+config file sets defaults. Ctrl-C, SIGTERM and SIGHUP stop a run the same way (exit 130).
 
 ```bash
 oprobe run s3://bucket/oprobe
@@ -888,7 +912,7 @@ the service at its limit). The objective's change prints with its 95 % interval
 | `--save FILE\|OPERATOR` | when the verdict is `improved`, write the proven change to an `op.toml` file or to `[operators.OPERATOR]` in the config file. A new file gets the operator with its `${ENV}` references and without secret values; the run's own `op.toml` (or another of the same service) is patched in place; the config file's path saves to the run's `[operators.NAME]`. Any other existing file is refused before a trial runs. The proof is saved first: a save that fails is a note |
 | `--dry-run` | print the number of trials and the ETA of the whole proof, and exit (`-o json`: `schemas/prove-plan.json`) |
 | `--read-only` | refuse every write and delete (exit 5) |
-| `--max-requests N`, `--max-bytes SIZE` | stop after this many backend requests or bytes, over every trial (exit 4) |
+| `--max-requests N`, `--max-bytes SIZE` | send at most this many HTTP requests or body bytes, over every trial (exit 4) |
 
 Every trial is saved as a run, a child of the prove, and hidden from `show --list`. A prove
 stopped before its result is saved (Ctrl-C) deletes its trials.
@@ -970,7 +994,7 @@ unambiguous id prefix. `show` also takes a path to a file.
 | 3 | `prove`: the change is worse on the objective |
 | 4 | a budget stopped the command |
 | 5 | a safety rail refused the command |
-| 130 | interrupted (Ctrl-C) |
+| 130 | interrupted (Ctrl-C, SIGTERM, SIGHUP) |
 
 Errors carry a stable code (`-o json`: `{"type":"error","error":{"code":…}}`, schema
 `schemas/error.json`); [troubleshooting](troubleshooting.md#error-codes) lists them.
@@ -1113,7 +1137,12 @@ Each operation's wall time is split exactly; an instant counts once even when re
   OpenDAL's background tasks.
 - **Open loop** (`--rate`): latency counts from the intended start, and arrivals that never
   started count in every percentile as censored values, so a slow server cannot hide behind fewer
-  requests.
+  requests. A censored value is a lower bound (the arrival had waited that long when the window
+  ended; nothing says how much longer it would have taken), so those percentiles are "at least"
+  values. A p99 limit (`p99_ms`) is therefore checked against the worst the censored arrivals
+  allow: it is breached when more than 1 % of the scheduled arrivals never completed (the p99
+  then has no upper bound), and otherwise when the p99 with each of them counted as slower than
+  every completed operation exceeds it.
 - **Percentiles** are exact when every operation was kept, otherwise from histograms with three
   significant digits. Counts always agree with the totals. The report keeps the run's whole
   latency distribution (`latency_histogram`, 20 bins per decade), and the latency distribution
@@ -2020,9 +2049,12 @@ preset.
 ### `safety.budget_exceeded` (exit 4)
 
 A budget (`--max-requests`, `--max-bytes`, `--max-duration`, or `[defaults.budgets]`) stopped the
-command. Budgets cover the whole command: every operator of `run`, every trial of `prove`. The
-partial run is saved and test data cleaned up. Raise the budget or shorten the run; `--dry-run`
-shows the estimates.
+command. Budgets cover the whole command: every operator of `run`, every trial of `prove`, and
+every HTTP request sent to the target before cleanup (the preflight, the dataset upload and
+retries included). The request the budget had no room for was not sent, the operations in flight
+were cut, their multipart uploads aborted, the partial run saved and the test data cleaned up.
+When the budget runs out during the preflight or the dataset upload there is no run to save.
+Raise the budget or shorten the run; `--dry-run` shows the estimates.
 
 <a id="safety-read_only"></a>
 ### `safety.read_only` (exit 5)
@@ -2051,8 +2083,9 @@ The change made things worse on the objective: `prove`'s verdict is `worse`. Rea
 <a id="run-interrupted"></a>
 ### `run.interrupted` (exit 130, retryable)
 
-Ctrl-C or Stop ended the command. Test data was cleaned up unless Ctrl-C was pressed twice. Run it
-again.
+Ctrl-C, SIGTERM, SIGHUP or Stop ended the command. The requests in flight were cut, the multipart
+uploads they belonged to aborted, and the test data cleaned up, unless a second signal ended the
+cleanup too. Run it again.
 
 <a id="internal"></a>
 ### `internal` (exit 1)

@@ -112,6 +112,20 @@ impl oprobe_trace::Budget for Guard {
     }
 }
 
+/// Move `counter` to `room(current)` atomically: `Ok(previous)` when there was room,
+/// `Err(current)` when `room` refused. (The standard library's own method for this was renamed
+/// between the minimum supported Rust and current stable; this loop builds on both.)
+fn take_room(counter: &AtomicU64, room: impl Fn(u64) -> Option<u64>) -> Result<u64, u64> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = room(current).ok_or(current)?;
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(previous) => return Ok(previous),
+            Err(seen) => current = seen,
+        }
+    }
+}
+
 impl Guard {
     pub fn new(budgets: Budgets) -> Arc<Self> {
         Arc::new(Self {
@@ -173,10 +187,7 @@ impl Guard {
         match self.budgets.max_bytes {
             Some(max) => {
                 let room = |b: u64| b.checked_add(body_bytes).filter(|n| *n <= max);
-                match self
-                    .bytes
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, room)
-                {
+                match take_room(&self.bytes, room) {
                     Ok(b) if b + body_bytes == max => spent = Some(("bytes", max)),
                     Ok(_) => {}
                     Err(b) => return Err(self.refuse("bytes", max as f64, b as f64)),
@@ -189,10 +200,7 @@ impl Guard {
         match self.budgets.max_requests_count {
             Some(max) => {
                 let room = |r: u64| (r < max).then_some(r + 1);
-                match self
-                    .requests
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, room)
-                {
+                match take_room(&self.requests, room) {
                     Ok(r) if r + 1 == max => spent = Some(("requests", max)),
                     Ok(_) => {}
                     Err(r) => {
