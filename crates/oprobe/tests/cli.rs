@@ -1199,7 +1199,7 @@ fn a_closed_stdout_ends_quietly() {
 }
 
 /// `run A B` runs one workload for every operator (K2): the first operator's, not each lab's
-/// own defaults (7.0: 28 workers on `lab://demo`, 16 on `lab://ratelimit`). The budgets cover
+/// own defaults (7.0: its workers on `lab://demo`, 16 on `lab://ratelimit`). The budgets cover
 /// what all the operators spend together.
 #[test]
 fn several_operators_share_one_workload_and_one_budget() {

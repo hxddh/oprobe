@@ -28,6 +28,8 @@ a `hint:` line. `--dry-run` shows the plan without sending a request.
 |---|---|
 | leftover `oprobe-run-*` prefixes | a run was killed hard (a second Ctrl-C, OOM, power loss): the next run against the same target deletes them (it says so), except under `--read-only`; or delete the prefix with your usual tools |
 | `client_bound` on a remote store | the profiling process is the bottleneck (CPU, tiny objects); the profile's `self` section says why. Larger objects or fewer workers |
+| `client_bound`: "cannot tell too few workers from a service at its capacity" | an open loop (`--rate`) fell behind with every worker busy: a steady overload shows one level of requests in flight. Vary the load (`--set shape=ramp:FROM..TO/D`): a service that queues is then `throttling`, one with room leaves the workers as the bound |
+| "N of M scheduled arrivals never completed" and a Critical verdict | the open loop stalled: more than 1 % of its arrivals never completed, so its p99 has no upper bound. Lower `--rate`, or see the finding beside it for who fell behind |
 | `oprobe` asks nothing in a script | it never prompts: pass an operator, and use `--non-interactive` to rule out redraws |
 | `cannot open a window` | no display (SSH, a server): the app opens in the terminal; Linux packages built with `--features gui` need GTK 4 |
 | `oprobe show FILE` fails on a file from `oprobe-trace` | the file is from a newer major version, or was cut short; write it again with `Handle::save` |

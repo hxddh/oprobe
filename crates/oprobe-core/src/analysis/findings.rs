@@ -5,7 +5,7 @@
 //!
 //! | code | remedy path |
 //! |---|---|
-//! | `throttling` | `layers.concurrent_limit.http` (sized) + `layers.retry.jitter`: the service rejects (429/503) above a number of requests in flight, or queues them without a rejection |
+//! | `throttling` | `layers.concurrent_limit.http` (sized) + `layers.retry.jitter`: the service rejects (429/503) above a number of requests in flight. When it queues them without a rejection, the cap is advice, not a layer to prove |
 //! | `rate_limit` | `layers.concurrent_limit.http` (sized from rate × latency) |
 //! | `key_limit` | the workload's key layout (advice, not a layer) |
 //! | `bandwidth_cap` | `layers.throttle.bandwidth` on writes (a capped uplink, or a capped link the workload also writes over); on reads not a layer |
@@ -18,15 +18,18 @@
 //! | `client_bound` | none (reported) |
 //!
 //! Plus `errors` (failures that are not throttling: `layers.retry.min_delay` (sized) +
-//! `layers.retry.jitter` when retries recovered every operation, else not a layer) and
-//! `invalid_run` (the run cannot be judged). One finding per code, most severe first.
+//! `layers.retry.jitter` when retries recovered the failures; `layers.throttle.burst`, named
+//! as a setting to correct, for writes the client's own ThrottleLayer refused; else not a
+//! layer) and `invalid_run` (the run cannot be judged). One finding per code, most severe
+//! first.
 
 use std::collections::{BTreeMap, HashMap};
 
 use super::capacity::{self, Confidence};
 use super::diagnosis::Severity;
-use super::hypothesis::{Hypothesis, HypothesisKind};
-use super::outliers::dominant_stage;
+use super::hypothesis::{Direction, Hypothesis, HypothesisKind};
+use super::limits::TtfbGrowth;
+use super::outliers::Stage;
 use super::simulate::{self, TailCutSetup};
 use super::stats::weighted_quantile_us_ms;
 use crate::model::{Evidence, Finding, Remedy, Report, ReqRow, Run, TimeWindow};
@@ -76,11 +79,11 @@ pub fn remedy(code: &str, variant: Option<&str>) -> Remedy {
     };
     match (code, variant) {
         ("throttling", Some("queueing")) => r(
-            Some("layers.concurrent_limit.http"),
-            &["layers.retry.jitter"],
-            "ConcurrentLimitLayer::with_http_concurrent_limit + RetryLayer::with_jitter",
-            true,
-            "cap the HTTP requests in flight at what the service serves at once: the requests beyond it only wait in its queue",
+            None,
+            &[],
+            "",
+            false,
+            "cap the HTTP requests in flight at what the service serves at once (`layers.concurrent_limit.http`): the requests beyond it only wait in its queue. This is advice, not a change to prove: the cap moves the wait from the service's queue to the client's and shortens no operation",
         ),
         ("throttling", _) => r(
             Some("layers.concurrent_limit.http"),
@@ -180,6 +183,13 @@ pub fn remedy(code: &str, variant: Option<&str>) -> Remedy {
             false,
             "none in storage: the workers, not the client's CPU, are the bound; raise the workers (`-c`) or lower `--rate`",
         ),
+        ("client_bound", Some("undecided")) => r(
+            None,
+            &[],
+            "",
+            false,
+            "none in storage yet: vary the load to tell the two apart (`--set shape=ramp:FROM..TO/D`), or lower `--rate` to what the run carried",
+        ),
         ("client_bound", _) => r(
             None,
             &[],
@@ -193,6 +203,13 @@ pub fn remedy(code: &str, variant: Option<&str>) -> Remedy {
             "RetryLayer::with_min_delay + RetryLayer::with_jitter",
             true,
             "retry transient failures after a short first backoff, with jitter: they do not follow the load, so a long backoff only adds latency",
+        ),
+        ("errors", Some("burst")) => r(
+            None,
+            &[],
+            "",
+            false,
+            "raise `layers.throttle.burst` to at least the largest write: OpenDAL's ThrottleLayer refuses a larger one before it sends a byte (a setting to correct, not a change to prove)",
         ),
         ("errors", _) => r(
             None,
@@ -267,9 +284,16 @@ fn slowest_ops(run: &Run, ids: impl IntoIterator<Item = u64>) -> Vec<u64> {
     v.into_iter().take(5).map(|x| x.0).collect()
 }
 
-/// Where the time of the slowest operations went (T4): the real stage split of the slowest
-/// 1 % of operations (at least 5), retry backoff included, as `(stage, share 0–1)` sorted by
-/// share. Stages: `queue`, `connect`, `send`, `ttfb`, `body`, `backoff`, `client`.
+/// Where the time of the slowest operations went (T4): the real split of the slowest 1 % of
+/// operations (at least 5), as `(stage, share 0–1)` sorted by share. Stages: `queue`,
+/// `connect`, `send`, `ttfb`, `body`, `backoff`, `client`.
+///
+/// It is the split of each operation's own wall time, as the run's stage shares are: the
+/// operation's breakdown gives its queue time (waiting for a permit, a connection or an
+/// open-loop slot), its retry backoff and its client time, and its time on the network is
+/// divided between the request stages in proportion to what its requests spent in each. 9.2
+/// summed the request rows instead, which have no row for an operation that waited before its
+/// first request: a run whose time was 97 % queue printed "slowest 1 %: server 99 %".
 pub fn tail_split(run: &Run) -> Vec<(&'static str, f64)> {
     let mut ops: Vec<&crate::model::OpRow> = run.ops.iter().filter(|o| o.t_us >= 0).collect();
     if ops.is_empty() {
@@ -278,17 +302,32 @@ pub fn tail_split(run: &Run) -> Vec<(&'static str, f64)> {
     ops.sort_by_key(|o| std::cmp::Reverse(o.latency_us));
     let n = (ops.len() / 100).max(5).min(ops.len());
     let slow: HashMap<u64, &crate::model::OpRow> = ops[..n].iter().map(|o| (o.op_id, *o)).collect();
-    let mut t: BTreeMap<&'static str, f64> = BTreeMap::new();
+    // The stages a request is on the network in (the wait before it and the consumer's stall
+    // after it are the operation's queue and client time).
+    const NETWORK: [Stage; 4] = [Stage::Connect, Stage::Send, Stage::Ttfb, Stage::Body];
+    let mut network: HashMap<u64, [f64; 4]> = HashMap::new();
     for q in run.reqs.iter().filter(|q| slow.contains_key(&q.op_id)) {
-        *t.entry("queue").or_default() += q.queue_us as f64;
-        *t.entry("connect").or_default() += q.connect_us() as f64;
-        *t.entry("send").or_default() += q.send_us as f64;
-        *t.entry("ttfb").or_default() += q.ttfb_us as f64;
-        *t.entry("body").or_default() += (q.body_us + q.stall_us) as f64;
+        let e = network.entry(q.op_id).or_default();
+        for (sum, stage) in e.iter_mut().zip(NETWORK) {
+            *sum += stage.us(q) as f64;
+        }
     }
+    let mut t: BTreeMap<&'static str, f64> = NETWORK.iter().map(|s| (s.name(), 0.0)).collect();
     for o in slow.values() {
-        *t.entry("backoff").or_default() += o.breakdown.retry_us as f64;
-        *t.entry("client").or_default() += (o.breakdown.client_us + o.breakdown.cache_us) as f64;
+        let b = &o.breakdown;
+        *t.entry(Stage::Queue.name()).or_default() += b.queue_us as f64;
+        *t.entry("backoff").or_default() += b.retry_us as f64;
+        *t.entry("client").or_default() += (b.client_us + b.cache_us) as f64;
+        let stages = network.get(&o.op_id).copied().unwrap_or_default();
+        let on_network: f64 = stages.iter().sum();
+        if on_network > 0.0 {
+            for (sum, stage) in stages.iter().zip(NETWORK) {
+                *t.entry(stage.name()).or_default() += b.backend_us as f64 * sum / on_network;
+            }
+        } else {
+            // No request row says where the backend time went: it is the service's.
+            *t.entry(Stage::Ttfb.name()).or_default() += b.backend_us as f64;
+        }
     }
     let total: f64 = t.values().sum();
     if total <= 0.0 {
@@ -377,28 +416,51 @@ pub fn client_busy_ratio(r: &Report) -> f64 {
         .unwrap_or(p.cpu_pct / 100.0 / p.cpu_cores.max(1) as f64)
 }
 
-/// Failed operations by error class, most common first, without `rate_limited`.
+/// Operations that failed as `rate_limited` in a run where the service throttled nothing.
+/// No 429/503 came back, so the refusal was the client's own: OpenDAL's `ThrottleLayer`
+/// fails a write larger than `layers.throttle.burst` with that kind before it sends a byte.
+/// These are failures like any other, not throttling (9.2 dropped them from both, and a run
+/// in which every write failed had no finding at all).
+pub fn refused_by_client(r: &Report) -> u64 {
+    if r.resilience.throttled_responses > 0 {
+        return 0;
+    }
+    rate_limited_failures(r)
+}
+
+fn rate_limited_failures(r: &Report) -> u64 {
+    r.resilience
+        .error_classes
+        .get("rate_limited")
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Operations that failed when their retries ran out against the service's throttling.
+fn throttled_out_of_retries(r: &Report) -> u64 {
+    rate_limited_failures(r) - refused_by_client(r)
+}
+
+/// Failed operations by error class, most common first, without those the service's
+/// throttling failed.
 fn failure_classes(r: &Report) -> Vec<(&str, u64)> {
+    let throttling = throttled_out_of_retries(r) > 0;
     let mut v: Vec<(&str, u64)> = r
         .resilience
         .error_classes
         .iter()
-        .filter(|(k, n)| k.as_str() != "rate_limited" && **n > 0)
+        .filter(|(k, n)| !(throttling && k.as_str() == "rate_limited") && **n > 0)
         .map(|(k, n)| (k.as_str(), *n))
         .collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
     v
 }
 
-/// Operations that failed for a reason other than throttling (T10).
+/// Operations that failed for a reason other than the service's throttling (T10).
 pub fn non_throttle_failures(r: &Report) -> u64 {
-    let rate_limited = r
-        .resilience
-        .error_classes
-        .get("rate_limited")
-        .copied()
-        .unwrap_or(0);
-    r.summary.failed_ops.saturating_sub(rate_limited)
+    r.summary
+        .failed_ops
+        .saturating_sub(throttled_out_of_retries(r))
 }
 
 /// Fewer than this many failures (or under [`MIN_ERROR_SHARE`] of their population) raise no
@@ -416,6 +478,7 @@ fn too_few_errors(n: u64, of: u64) -> bool {
 fn errors(c: &Ctx, random_throttle: bool) -> Option<Finding> {
     let r = c.r;
     let failed = non_throttle_failures(r);
+    let refused = refused_by_client(r);
     let server = r.resilience.server_errors;
     // Requests that got no response (connection resets, refused or dropped connections).
     let network = r.resilience.network_errors;
@@ -433,6 +496,22 @@ fn errors(c: &Ctx, random_throttle: bool) -> Option<Finding> {
     }
     let classes = failure_classes(r);
     let by_class: Vec<String> = classes.iter().map(|(k, n)| format!("{k} ×{n}")).collect();
+    // The failed operations are the transient failures the retries recovered everywhere else
+    // (a 5xx, a lost connection): a few ran out of attempts. They are the same finding with
+    // the same remedy; 9.2 switched to "fix credentials, permissions" for one such operation.
+    let attempts = c.spec().layers.retry.as_ref().map_or(0, |x| x.max_times) as u64 + 1;
+    let transient = |class: &str| match class {
+        "server_error" => server + random > 0,
+        "network" | "connect" => network > 0,
+        "rate_limited" => random > 0,
+        _ => false,
+    };
+    let recovered = failed == 0
+        || (retried > failed.saturating_mul(attempts)
+            && !classes.is_empty()
+            && classes.iter().all(|(k, _)| transient(k)));
+    // Most of the failures are writes the client's own ThrottleLayer refused.
+    let burst = refused > 0 && refused * 2 >= failed;
     let mut text = if failed > 0 {
         format!("{failed} of {} operations failed", r.summary.ops)
     } else {
@@ -440,6 +519,11 @@ fn errors(c: &Ctx, random_throttle: bool) -> Option<Finding> {
     };
     if !by_class.is_empty() {
         text += &format!(" ({})", by_class.join(", "));
+    }
+    if refused > 0 {
+        text += &format!(
+            "; {refused} were refused as rate-limited though the service throttled nothing (no 429/503 in {requests} requests)"
+        );
     }
     if server + random > 0 {
         text += &format!(
@@ -456,17 +540,46 @@ fn errors(c: &Ctx, random_throttle: bool) -> Option<Finding> {
         text +=
             &format!("; {network} of {requests} requests lost their connection before a response");
     }
-    if failed == 0 && retried > 0 {
+    if recovered && retried > 0 {
         text += &format!(
             "; {:.0}% of operation time in retry backoff",
             r.stages.shares.retry_pct
         );
     }
     let error_ratio = failed as f64 / r.summary.ops.max(1) as f64;
-    // Every operation succeeded after retries: the failures are transient, and what they cost
-    // is the retry backoff (OpenDAL waits 1 s first). The remedy is a shorter first backoff,
-    // with jitter, sized by prove (K1).
-    let rem = remedy("errors", (failed == 0).then_some("retried"));
+    let retried_pct = retried as f64 * 100.0 / requests as f64;
+    let cause = if burst {
+        format!(
+            "{:.2}% of operations failed: OpenDAL's ThrottleLayer refused {refused} writes larger than `layers.throttle.burst` (it sends none of them; the service throttled nothing).",
+            error_ratio * 100.0
+        )
+    } else if failed == 0 {
+        format!(
+            "{retried_pct:.2}% of requests failed with a server error or a lost connection and were retried: the time goes to the retry backoff."
+        )
+    } else if recovered {
+        format!(
+            "{retried_pct:.2}% of requests failed with a server error or a lost connection and were retried: the time goes to the retry backoff, and {failed} {} out of retries.",
+            if failed == 1 {
+                "operation ran"
+            } else {
+                "operations ran"
+            }
+        )
+    } else {
+        format!(
+            "{:.2}% of operations failed for reasons other than throttling.",
+            error_ratio * 100.0
+        )
+    };
+    // Failures the retries recover are transient, and what they cost is the retry backoff
+    // (OpenDAL waits 1 s first): the remedy is a shorter first backoff, with jitter, sized by
+    // prove (K1). A write the client's own ThrottleLayer refuses is fixed in the operator.
+    let variant = if burst {
+        Some("burst")
+    } else {
+        recovered.then_some("retried")
+    };
     Some(Finding {
         code: "errors".into(),
         severity: if error_ratio > r.sla.max_error_ratio {
@@ -475,17 +588,7 @@ fn errors(c: &Ctx, random_throttle: bool) -> Option<Finding> {
             Severity::Warning
         },
         confidence: Confidence::High,
-        cause: if failed > 0 {
-            format!(
-                "{:.2}% of operations failed for reasons other than throttling.",
-                error_ratio * 100.0
-            )
-        } else {
-            format!(
-                "{:.2}% of requests failed with a server error or a lost connection and were retried: the time goes to the retry backoff.",
-                retried as f64 * 100.0 / requests as f64
-            )
-        },
+        cause,
         evidence: Evidence {
             text,
             values: values(&[
@@ -499,7 +602,7 @@ fn errors(c: &Ctx, random_throttle: bool) -> Option<Finding> {
                 q.is_error() && q.status != 404 && (random_throttle || !q.is_throttle())
             }),
         },
-        remedy: rem,
+        remedy: remedy("errors", variant),
     })
 }
 
@@ -515,10 +618,15 @@ fn throttle_family(c: &Ctx) -> (Option<Finding>, bool) {
     let req_ratio = thr as f64 / requests as f64;
     let sel = r.capacity.selected().cloned();
     let kind = sel.as_ref().map(|h| h.kind);
+    // "Random" is a claim of its own and needs its own evidence: constant throttling
+    // selected with high confidence, which takes at least 20 throttled responses. With fewer,
+    // constant throttling wins on its smaller parameter count alone (macOS CI: a 1 s run
+    // whose six 503s all came in its first burst was reported as `errors`, with no
+    // `throttling` at all), and the 429/503 stay what they are: throttling, at low confidence.
     if kind == Some(HypothesisKind::None)
         && sel
             .as_ref()
-            .is_some_and(|h| h.confidence >= Confidence::Medium)
+            .is_some_and(|h| h.confidence == Confidence::High)
     {
         return (None, true);
     }
@@ -549,12 +657,7 @@ fn throttle_family(c: &Ctx) -> (Option<Finding>, bool) {
     ) {
         confidence = Confidence::Low;
     }
-    let out_of_retries = r
-        .resilience
-        .error_classes
-        .get("rate_limited")
-        .copied()
-        .unwrap_or(0);
+    let out_of_retries = throttled_out_of_retries(r);
     let mut text = format!(
         "{thr} throttled responses (429/503) in {requests} requests ({:.2}%); {:.0}% of operation time in retry backoff",
         req_ratio * 100.0,
@@ -705,16 +808,29 @@ pub fn rank(findings: &mut [Finding]) {
     });
 }
 
-/// The shortest mean wait in a service's queue (per answered request) that is a finding: 1 ms.
-/// Below it the growth of the time to first byte with the requests in flight cannot be told
-/// from the client's own scheduling.
-const MIN_QUEUE_WAIT_US: f64 = 1000.0;
+/// How many times the client's scheduling lag (p99) the wait in the service's queue at the
+/// busiest level must be for the queueing form of `throttling`: a p99 bounds what the client's
+/// own scheduling adds to nearly every request, and the wait is a mean, so twice clears it.
+const QUEUE_LAG_FACTOR: f64 = 2.0;
 
 /// `throttling` with no rejection: the selected limit model is queueing, asserted with medium
 /// confidence or more — the service serves a number of requests at once and the rest wait
-/// for their first byte. The limit is the same kind as a 429/503 in-flight limit, and so is
-/// its remedy; prove sizes the cap and says what it gains. 9.1 fitted the model and dropped
-/// it: such a run had no finding, or only the hung requests and stragglers the queue made.
+/// for their first byte.
+///
+/// It is the timing of the requests alone, so it holds only while that timing is the
+/// service's:
+/// - not on a client-bound run ([`derive`] asks for it only then);
+/// - the wait the model puts at the busiest populated level stands clear of the client's own
+///   scheduling lag (`self.sched_lag_p99_ms`), which also grows with the requests in flight.
+///   Windows CI: 0.5 ms at 1 in flight and 1.1 ms at 15 on `lab://clean` fitted "7 served at
+///   once" under a lag of the same size. 9.2 asked for a mean wait of 1 ms over all requests
+///   instead: a positive part of noise that any service of 8 ms or more passes, and that a
+///   fast store with a real queue fails.
+///
+/// The remedy is advice, like `key_limit`'s (K3-8): a cap on the requests in flight moves
+/// the wait from the service's queue to the client's. It frees nothing the service would
+/// serve, so no objective `prove` measures (goodput, p99, requests per second) can improve by
+/// it, and a `next` that proves it could only come back inconclusive.
 fn queueing(c: &Ctx) -> Option<Finding> {
     let h = c.r.capacity.asserted()?;
     if h.kind != HypothesisKind::Queueing || c.r.resilience.throttled_responses > 0 {
@@ -728,40 +844,50 @@ fn queueing(c: &Ctx) -> Option<Finding> {
     }
     let servers = h.params.servers_count?;
     let service_ms = h.params.service_ms?;
-    // What the queue costs: the wait for the first byte beyond the service time, as a share
-    // of all request time.
-    let service_us = service_ms * 1000.0;
-    let waited = |q: &ReqRow| (q.ttfb_us as f64 - service_us).max(0.0);
-    let wait: f64 = c.reqs().filter(|q| !q.is_error()).map(waited).sum();
-    let total: f64 = c.reqs().map(|q| q.total_us as f64).sum::<f64>().max(1.0);
-    // A wait this short is not a service's queue: it is what the client's own scheduling and
-    // the loopback add when more requests are in flight (Windows CI: a time to first byte of
-    // 0.5 ms at 1 in flight and 1.1 ms at 15 on `lab://clean` fitted "7 served at once").
-    let answered = c.reqs().filter(|q| !q.is_error()).count().max(1) as f64;
-    if wait / answered < MIN_QUEUE_WAIT_US {
+    let window = (0, (c.r.run.window_s * 1e6).ceil() as i64);
+    let q = super::limits::queue_wait(&c.run.reqs, window, servers)?;
+    let lag_ms = c.r.self_stats.sched_lag_p99_ms.unwrap_or(0.0);
+    if q.busiest_wait_ms <= QUEUE_LAG_FACTOR * lag_ms {
         return None;
     }
+    // What the queue costs: the model's wait, as a share of all request time.
+    let total: f64 = c.reqs().map(|q| q.total_us as f64).sum::<f64>().max(1.0);
+    let cost = (q.wait_us / total).clamp(0.0, 1.0);
     let mut text = h.evidence.first().cloned().unwrap_or_default();
-    text += "; no request was rejected (429/503)";
+    text += &format!(
+        "; at {} in flight a request waits {} in the queue, against a client scheduling lag (p99) of {}; no request was rejected (429/503)",
+        q.busiest_inflight_count,
+        fmt_ms(q.busiest_wait_ms),
+        fmt_ms(lag_ms)
+    );
+    let slow = (service_ms * 2000.0) as u64;
     Some(Finding {
         code: "throttling".into(),
         severity: Severity::Warning,
         confidence,
         cause: format!(
             "The service serves about {servers} requests at once and queues the rest: {:.0}% of request time waits in its queue (no request was rejected).",
-            wait * 100.0 / total
+            cost * 100.0
         ),
         evidence: Evidence {
             text,
             values: values(&[
                 ("fitted_inflight_count", servers as f64),
                 ("typical_ttfb_ms", service_ms),
+                (
+                    "busiest_inflight_count",
+                    f64::from(q.busiest_inflight_count),
+                ),
+                ("busiest_queue_wait_ms", q.busiest_wait_ms),
+                ("sched_lag_p99_ms", lag_ms),
                 ("explains_ratio", h.explains_ratio),
-                (COST_KEY, wait / total),
+                (COST_KEY, cost),
             ]),
             op_ids: slowest_ops(
                 c.run,
-                c.reqs().filter(|q| waited(q) > service_us).map(|q| q.op_id),
+                c.reqs()
+                    .filter(|q| !q.is_error() && q.ttfb_us > slow)
+                    .map(|q| q.op_id),
             ),
             windows: Vec::new(),
         },
@@ -769,14 +895,16 @@ fn queueing(c: &Ctx) -> Option<Finding> {
     })
 }
 
-fn bandwidth_cap(c: &Ctx) -> Option<Finding> {
+/// `bandwidth_cap`, and the direction of the bodies that share the cap.
+fn bandwidth_cap(c: &Ctx) -> Option<(Finding, Direction)> {
     let h = c.r.capacity.asserted()?;
     if h.kind != HypothesisKind::BandwidthCap {
         return None;
     }
     let bps = h.params.bytes_per_s.unwrap_or(0.0);
-    // The cap was fitted on the request bodies: the uplink is what is shared.
-    let upload = super::limits::is_upload_cap(h);
+    // Fitted on the request bodies, the uplink is what is shared.
+    let direction = h.params.direction.unwrap_or(Direction::Download);
+    let upload = direction == Direction::Upload;
     // ThrottleLayer shapes writes only (K16): on a workload that writes nothing it cannot
     // help, and the finding says the cap is not a layer. A capped uplink is always writes.
     let writes = upload
@@ -794,16 +922,16 @@ fn bandwidth_cap(c: &Ctx) -> Option<Finding> {
         (
             "Every upload stream shares one bandwidth cap: more streams only split it.",
             "sending the request body",
-            "upload_pct",
+            "upload_time_ratio",
         )
     } else {
         (
             "Every response stream shares one bandwidth cap: more streams only split it.",
             "the response body",
-            "body_pct",
+            "body_time_ratio",
         )
     };
-    Some(Finding {
+    let finding = Finding {
         code: "bandwidth_cap".into(),
         severity: Severity::Warning,
         confidence: limit_confidence(c, h),
@@ -819,7 +947,7 @@ fn bandwidth_cap(c: &Ctx) -> Option<Finding> {
                 }
             ),
             values: values(&[
-                (key, moving * 100.0 / total),
+                (key, moving / total),
                 ("fitted_bytes_per_s", bps),
                 ("explains_ratio", h.explains_ratio),
             ]),
@@ -827,7 +955,8 @@ fn bandwidth_cap(c: &Ctx) -> Option<Finding> {
             windows: Vec::new(),
         },
         remedy: remedy("bandwidth_cap", (!writes).then_some("reads")),
-    })
+    };
+    Some((finding, direction))
 }
 
 /// A tail-cut setup with the re-issue backoff the remedy uses (a short retry delay), so the
@@ -904,7 +1033,10 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
             .iter()
             .filter(|q| q.api == api && !q.is_error() && q.total_us > deadline)
             .collect();
-        let ttfb_bound = over.iter().filter(|q| dominant_stage(q) == "ttfb").count();
+        let ttfb_bound = over
+            .iter()
+            .filter(|q| Stage::dominant(q) == Stage::Ttfb)
+            .count();
         if over.len() < 3 || ttfb_bound * 2 < over.len() {
             continue;
         }
@@ -973,7 +1105,7 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
     let excess: f64 = affected
         .iter()
         .flat_map(|a| a.2.iter())
-        .filter(|q| dominant_stage(q) == "ttfb")
+        .filter(|q| Stage::dominant(q) == Stage::Ttfb)
         .map(|q| (q.total_us as f64 - typ_all_us).max(0.0))
         .sum();
     let total: f64 = run
@@ -1028,13 +1160,17 @@ fn join_and(items: &[String]) -> String {
     }
 }
 
-/// A request is hung when it takes this long and ≥ 20× the median request.
+/// A request is hung when it takes this long and ≥ [`HUNG_FACTOR`] × the median request.
 const HUNG_MIN_US: u64 = 2_000_000;
+/// How many times the median request a hung request takes (and how many times slower than a
+/// typical body a hung body moves).
+const HUNG_FACTOR: f64 = 20.0;
 
-/// `capped_uploads`: the uplink is at a shared cap (`bandwidth_cap` on the request bodies),
-/// so a request that spends its time sending its body is slow like every other stream, not
-/// hung: a timeout would only send the same bytes again.
-fn hung_requests(c: &Ctx, capped_uploads: bool) -> Option<Finding> {
+/// `capped`: the bodies in that direction share a bandwidth cap (`bandwidth_cap`), so a
+/// request that spends its time moving its body that way — sending it on a capped uplink,
+/// receiving it on a capped downlink — is slow like every other stream, not hung: a timeout
+/// would only move the same bytes again.
+fn hung_requests(c: &Ctx, capped: Option<Direction>) -> Option<Finding> {
     // Weighted: sampled rows over-weigh the slow requests.
     let w = c.run.op_weights();
     let mut totals: Vec<(u64, f64)> = c
@@ -1045,20 +1181,32 @@ fn hung_requests(c: &Ctx, capped_uploads: bool) -> Option<Finding> {
         return None;
     }
     let median_ms = weighted_quantile_us_ms(&mut totals, 0.5);
-    let bound = HUNG_MIN_US.max((median_ms * 1000.0 * 20.0) as u64);
+    let bound = HUNG_MIN_US.max((median_ms * 1000.0 * HUNG_FACTOR) as u64);
     let timeouts =
         c.r.resilience
             .error_classes
             .get("timeout")
             .copied()
             .unwrap_or(0);
+    // A long body is hung only when it also moved far slower than the bodies of the requests
+    // that were not slow: a large object among small requests takes long and is not stuck.
+    let body_rate = |q: &ReqRow| q.bytes_down as f64 / (q.body_us.max(1) as f64 / 1e6);
+    let rates: Vec<f64> = c
+        .reqs()
+        .filter(|q| q.total_us < bound && q.body_us > 0 && q.bytes_down > 0)
+        .map(body_rate)
+        .collect();
+    let typical_rate = (!rates.is_empty()).then(|| super::stats::median(&rates));
+    let stuck_body = |q: &ReqRow| typical_rate.is_none_or(|r| body_rate(q) * HUNG_FACTOR < r);
     let hung: Vec<&ReqRow> = c
         .reqs()
         .filter(|q| {
             q.total_us >= bound
-                && match dominant_stage(q) {
-                    "send" => !capped_uploads,
-                    stage => matches!(stage, "ttfb" | "body" | "stall"),
+                && match Stage::dominant(q) {
+                    Stage::Send => capped != Some(Direction::Upload),
+                    Stage::Body => capped != Some(Direction::Download) && stuck_body(q),
+                    Stage::Ttfb | Stage::Stall => true,
+                    Stage::Queue | Stage::Connect => false,
                 }
         })
         .collect();
@@ -1441,19 +1589,38 @@ fn cold_connections(c: &Ctx) -> Option<Finding> {
     })
 }
 
+/// The open loop fell behind: more than [`crate::model::SCHEDULE_BACKLOG_RATIO`] of its
+/// scheduled arrivals never started.
+fn backlog(r: &Report) -> Option<&crate::trace::OpenLoopStats> {
+    r.open_loop.as_ref().filter(|ol| {
+        ol.intended_count > 0
+            && ol.missed as f64 / ol.intended_count as f64 > crate::model::SCHEDULE_BACKLOG_RATIO
+    })
+}
+
+/// The client's CPU or its scheduler set the pace (A9, T7): its timing is not the service's.
+fn client_busy(r: &Report) -> bool {
+    client_busy_ratio(r) >= super::limits::CLIENT_BOUND_RATIO || r.self_stats.client_saturated
+}
+
 /// `client_bound`: the client's CPU or its scheduler set the pace (A9, T7), or an open-loop
-/// schedule fell behind.
-fn client_bound(c: &Ctx) -> Option<Finding> {
+/// schedule fell behind its workers.
+///
+/// In the second case the workers are blamed only with evidence (K2-2: 9.2 said "the workers
+/// set the pace, not the service: raise `-c`" of a lab that carried the same 400
+/// operations/s at 16 workers and at 64). An overloaded open loop keeps every worker busy,
+/// so a steady one shows a single level of requests in flight, and nothing in it tells too
+/// few workers from a service at its capacity: the finding then says so. Only a run that
+/// varied its load can tell — the service queues (the queueing form of `throttling`, and no
+/// `client_bound`: [`derive`]), or it answered as fast with every worker in flight as with
+/// half of them (`growth`, [`super::limits::ttfb_growth`]) and the workers are the bound.
+fn client_bound(c: &Ctx, growth: Option<&TtfbGrowth>) -> Option<Finding> {
     let r = c.r;
     let cpu = client_busy_ratio(r);
     let lag = r.self_stats.sched_lag_p99_ms.unwrap_or(0.0);
-    let saturated = r.self_stats.client_saturated;
-    let cpu_bound = cpu >= super::limits::CLIENT_BOUND_RATIO;
-    let backlog = r.open_loop.as_ref().filter(|ol| {
-        ol.intended_count > 0
-            && ol.missed as f64 / ol.intended_count as f64 > crate::model::SCHEDULE_BACKLOG_RATIO
-    });
-    if !cpu_bound && !saturated && backlog.is_none() {
+    let backlog = backlog(r);
+    let busy = client_busy(r);
+    if !busy && backlog.is_none() {
         return None;
     }
     let mut text = format!(
@@ -1468,15 +1635,45 @@ fn client_bound(c: &Ctx) -> Option<Finding> {
         );
     }
     // The arrivals queued behind the workers while the CPU had room (K15): `--rate` asks for
-    // more than `-c` workers carry at the operations' latency.
-    let workers = backlog.is_some() && !cpu_bound && !saturated;
+    // more than `-c` workers carried at the operations' latency.
     let conc = r.spec.profile.workload.concurrency.max(1);
-    if let (true, Some(ol)) = (workers, backlog) {
+    let queued = backlog.filter(|_| !busy);
+    if let Some(ol) = queued {
         text += &format!(
             "; the arrivals queued behind the {conc} workers: {:.0}/s scheduled, {:.0}/s carried",
             ol.target_rate, ol.achieved_rate
         );
     }
+    // The service answered as fast with every worker in flight as with half of them: it had
+    // room, and the workers are the bound.
+    let room = growth.filter(|g| queued.is_some() && g.flat());
+    if let Some(g) = room {
+        text += &format!(
+            "; time to first byte stayed at {} from half the requests in flight or fewer to {} in flight ({} there)",
+            fmt_ms(g.quiet_ttfb_ms),
+            g.busy_inflight_count,
+            fmt_ms(g.busy_ttfb_ms)
+        );
+    }
+    let (cause, variant) = match (queued, room) {
+        (Some(_), Some(_)) => (
+            format!(
+                "The {conc} workers set the pace, not the service: the arrivals queued behind them, the service answered as fast with all of them in flight, and the client's CPU had room."
+            ),
+            Some("workers"),
+        ),
+        (Some(_), None) => (
+            format!(
+                "The arrivals queued behind the {conc} workers, all busy for the whole run, while the client's CPU had room: this run cannot tell too few workers from a service at its capacity."
+            ),
+            Some("undecided"),
+        ),
+        (None, _) => (
+            "The client process, not the service, set the pace: its numbers understate the service."
+                .to_owned(),
+            None,
+        ),
+    };
     Some(Finding {
         code: "client_bound".into(),
         severity: Severity::Warning,
@@ -1485,14 +1682,7 @@ fn client_bound(c: &Ctx) -> Option<Finding> {
         } else {
             Confidence::Medium
         },
-        cause: if workers {
-            format!(
-                "The {conc} workers set the pace, not the service: the arrivals queued behind them, and the client's CPU had room."
-            )
-        } else {
-            "The client process, not the service, set the pace: its numbers understate the service."
-                .into()
-        },
+        cause,
         evidence: Evidence {
             text,
             values: values(&[
@@ -1505,7 +1695,7 @@ fn client_bound(c: &Ctx) -> Option<Finding> {
             ]),
             ..Default::default()
         },
-        remedy: remedy("client_bound", workers.then_some("workers")),
+        remedy: remedy("client_bound", variant),
     })
 }
 
@@ -1533,21 +1723,29 @@ pub fn derive(run: &Run) -> Vec<Finding> {
         network: r.target.scheme != "memory" && r.target.scheme != "fs",
     };
     let mut out: Vec<Finding> = Vec::new();
-    let client = client_bound(&c);
     let (thr, random) = throttle_family(&c);
     out.extend(errors(&c, random));
     out.extend(thr);
-    // One finding per code: the queueing form of `throttling` only when nothing was rejected.
-    if !out.iter().any(|f| f.code == "throttling") {
-        out.extend(queueing(&c));
-    }
-    let cap = bandwidth_cap(&c);
+    // The queueing form of `throttling` reads the requests' timing alone: only when nothing
+    // was rejected (one finding per code), and never on a run whose timing is the client's.
+    let queue = (!client_busy(r) && !out.iter().any(|f| f.code == "throttling"))
+        .then(|| queueing(&c))
+        .flatten();
+    // A service that queues is the bound, not the workers an open loop fell behind.
+    let client = if queue.is_some() {
+        None
+    } else {
+        let window = (0, (r.run.window_s * 1e6).ceil() as i64);
+        let growth = (backlog(r).is_some() && !client_busy(r))
+            .then(|| super::limits::ttfb_growth(&run.reqs, window))
+            .flatten();
+        client_bound(&c, growth.as_ref())
+    };
+    out.extend(queue);
+    let (cap, capped) = bandwidth_cap(&c).unzip();
     let have_cap = cap.is_some();
-    let capped_uploads = cap
-        .as_ref()
-        .is_some_and(|f| f.evidence.values.contains_key("upload_pct"));
     out.extend(cap);
-    out.extend(hung_requests(&c, capped_uploads));
+    out.extend(hung_requests(&c, capped));
     out.extend(tail_stragglers(&c));
     out.extend(small_ranges(&c, have_cap));
     out.extend(slow_multipart(&c));
@@ -1934,7 +2132,8 @@ pub(crate) mod tests {
     fn a_backoff_tail_is_not_stragglers() {
         let mut run = base();
         for o in run.ops.iter_mut().filter(|o| o.latency_us > 500_000) {
-            o.breakdown.retry_us = o.latency_us;
+            o.breakdown.retry_us = o.latency_us - 10_000;
+            o.breakdown.backend_us = 10_000;
         }
         for q in run.reqs.iter_mut().filter(|q| q.total_us > 500_000) {
             q.total_us = 10_000;
@@ -2029,13 +2228,333 @@ pub(crate) mod tests {
 
     #[test]
     fn random_throttling_is_errors_not_a_limit() {
-        let mut run = throttled(HypothesisKind::None, 0.0, Confidence::Medium);
+        let mut run = throttled(HypothesisKind::None, 0.0, Confidence::High);
         run.report.resilience.server_errors = 20;
         let f = derive(&run);
         assert!(!f.iter().any(|x| x.code == "throttling"), "{f:#?}");
         let e = f.iter().find(|x| x.code == "errors").unwrap();
         assert_eq!(e.remedy.path.as_deref(), Some("layers.retry.min_delay"));
         assert_eq!(e.remedy.with, ["layers.retry.jitter"]);
+        // Constant throttling selected without high confidence is no evidence of randomness
+        // (it has the fewest parameters, so it wins whenever nothing else is shown): the
+        // 429/503 stay `throttling`.
+        let run = throttled(HypothesisKind::None, 0.0, Confidence::Medium);
+        let f = derive(&run);
+        let t = f.iter().find(|x| x.code == "throttling").unwrap();
+        assert_eq!(t.confidence, Confidence::Low);
+        assert!(!f.iter().any(|x| x.code == "errors"), "{f:#?}");
+    }
+
+    /// macOS CI (9.2): a 1 s run of 8 workers against a limit of 2 in flight. The first burst
+    /// was rejected, the six rejected workers slept through the window in their 1 s backoff,
+    /// and two workers ran alone below the limit: a handful of 503s, all at once. The
+    /// findings were `client_bound` and `errors`, with no `throttling`.
+    #[test]
+    fn a_few_throttled_responses_in_one_burst_are_throttling_never_errors() {
+        let (mut reqs, mut ops) = (Vec::new(), Vec::new());
+        let mut id = 0u64;
+        let mut push = |t_us: i64, status: u16, reqs: &mut Vec<ReqRow>, ops: &mut Vec<_>| {
+            id += 1;
+            let mut q = crate::analysis::outliers::test_req(t_us, 5_000);
+            q.op_id = id;
+            q.status = status;
+            if status == 503 {
+                (q.ttfb_us, q.total_us) = (300, 310);
+            }
+            let mut o = crate::analysis::simulate::tests::op(id, t_us, q.total_us);
+            o.throttled = status == 503;
+            reqs.push(q);
+            ops.push(o);
+        };
+        // The burst: 8 arrivals within 70 µs, the limit admits two.
+        for w in 0..8i64 {
+            push(w * 10, if w < 2 { 200 } else { 503 }, &mut reqs, &mut ops);
+        }
+        // Two workers alone for the rest of the second.
+        for i in 1..190i64 {
+            for w in 0..2i64 {
+                push(i * 5_100 + w * 10, 200, &mut reqs, &mut ops);
+            }
+        }
+        for saturated in [false, true] {
+            let mut run = with_capacity(base(), reqs.clone(), ops.clone());
+            run.report.resilience.throttled_responses = 6;
+            run.report.resilience.status_503 = 6;
+            // Their retries ran out past the window's end.
+            run.report.summary.failed_ops = 6;
+            run.report
+                .resilience
+                .error_classes
+                .insert("rate_limited".into(), 6);
+            run.report.self_stats.client_saturated = saturated;
+            let f = derive(&run);
+            let codes: Vec<&str> = f.iter().map(|x| x.code.as_str()).collect();
+            assert!(
+                codes.contains(&"throttling"),
+                "{codes:?}\n{:#?}",
+                run.report.capacity.hypotheses
+            );
+            assert!(!codes.contains(&"errors"), "{codes:?}");
+            assert!(!codes.contains(&"invalid_run"), "{codes:?}");
+            assert_eq!(codes.contains(&"client_bound"), saturated, "{codes:?}");
+        }
+    }
+
+    /// K2-1: `layers.throttle.burst` below the write size makes OpenDAL's ThrottleLayer
+    /// refuse every write as `RateLimited` before a byte is sent. 9.2 dropped that class from
+    /// `errors` and found no 429/503 for `throttling`: a run in which 30 % of the operations
+    /// failed had `client_bound` on top and exited 0.
+    #[test]
+    fn writes_the_throttle_layer_refuses_are_errors_that_name_the_burst() {
+        let mut run = base();
+        run.report.summary.ops = 1000;
+        run.report.summary.failed_ops = 300;
+        run.report.summary.error_rate = 0.3;
+        run.report
+            .resilience
+            .error_classes
+            .insert("rate_limited".into(), 300);
+        assert_eq!(refused_by_client(&run.report), 300);
+        assert_eq!(non_throttle_failures(&run.report), 300);
+        let f = derive(&run);
+        // More failed than a run may: it is invalid, and the errors say why.
+        assert_eq!(f[0].code, "invalid_run", "{f:#?}");
+        let e = f
+            .iter()
+            .find(|x| x.code == "errors")
+            .unwrap_or_else(|| panic!("{f:#?}"));
+        assert_eq!(e.severity, Severity::Critical);
+        assert!(e.cause.contains("`layers.throttle.burst`"), "{}", e.cause);
+        assert!(e.cause.contains("refused 300 writes"), "{}", e.cause);
+        assert!(e.evidence.text.contains("rate_limited ×300"), "{e:#?}");
+        assert!(
+            e.remedy.text.contains("`layers.throttle.burst`") && e.remedy.path.is_none(),
+            "{e:#?}"
+        );
+        assert!(!f.iter().any(|x| x.code == "throttling"), "{f:#?}");
+        // With 429/503 in the run, the same class is the service's throttling, as before.
+        run.report.resilience.throttled_responses = 900;
+        assert_eq!(refused_by_client(&run.report), 0);
+        assert_eq!(non_throttle_failures(&run.report), 0);
+    }
+
+    /// K2-4: 1 of 4 default `lab://flaky` runs had one operation run out of retries, and the
+    /// remedy flipped from the retry backoff to "fix credentials, permissions".
+    #[test]
+    fn an_operation_out_of_retries_keeps_the_retry_remedy_of_its_transient_class() {
+        let mut run = base();
+        run.report.spec.profile.operator.layers.retry = Some(crate::operator::Retry::default());
+        run.report.summary.ops = 1000;
+        run.report.resilience.server_errors = 40;
+        run.report.resilience.network_errors = 20;
+        run.report.summary.failed_ops = 1;
+        run.report
+            .resilience
+            .error_classes
+            .insert("server_error".into(), 1);
+        let f = derive(&run);
+        let e = f.iter().find(|x| x.code == "errors").unwrap();
+        assert_eq!(e.remedy.path.as_deref(), Some("layers.retry.min_delay"));
+        assert_eq!(e.remedy.with, ["layers.retry.jitter"]);
+        assert!(
+            e.cause.contains("1 operation ran out of retries"),
+            "{}",
+            e.cause
+        );
+        assert_eq!(e.evidence.values["failed_ops_count"], 1.0);
+        // A failure of another kind is not what the retries recovered: not a layer.
+        run.report.resilience.error_classes.clear();
+        run.report
+            .resilience
+            .error_classes
+            .insert("permission_denied".into(), 1);
+        let f = derive(&run);
+        let e = f.iter().find(|x| x.code == "errors").unwrap();
+        assert!(e.remedy.path.is_none(), "{e:#?}");
+        // Nor are failures that no retry recovered: every failed request is one of theirs.
+        run.report.resilience.error_classes.clear();
+        run.report
+            .resilience
+            .error_classes
+            .insert("server_error".into(), 15);
+        run.report.summary.failed_ops = 15;
+        run.report.resilience.network_errors = 0;
+        let f = derive(&run);
+        let e = f.iter().find(|x| x.code == "errors").unwrap();
+        assert!(e.remedy.path.is_none(), "{e:#?}");
+    }
+
+    /// K2-3: `hung_requests` matched the stage `body` while the dominant stage of such a
+    /// request was called `transfer`: a body that stalled was never hung.
+    #[test]
+    fn a_stalled_body_is_hung_and_a_large_or_capped_one_is_not() {
+        let stall = |run: &mut Run, bytes: u64| {
+            for q in run.reqs.iter_mut().filter(|q| q.op_id % 300 == 1) {
+                (q.ttfb_us, q.body_us, q.total_us) = (5_000, 6_000_000, 6_005_010);
+                q.bytes_down = bytes;
+            }
+        };
+        // Every request receives 64 KiB in 2 ms; four receive theirs over 6 s.
+        let mut run = base();
+        for q in &mut run.reqs {
+            (q.body_us, q.bytes_down) = (2_000, 64 << 10);
+            q.ttfb_us = q.ttfb_us.saturating_sub(2_000);
+        }
+        let mut stalled = run.clone();
+        stall(&mut stalled, 64 << 10);
+        assert_eq!(Stage::dominant(&stalled.reqs[0]), Stage::Body);
+        let f = derive(&stalled);
+        let h = f
+            .iter()
+            .find(|x| x.code == "hung_requests")
+            .unwrap_or_else(|| panic!("{f:#?}"));
+        assert_eq!(h.evidence.values["hung_requests_count"], 4.0);
+        assert_eq!(h.remedy.path.as_deref(), Some("layers.timeout.io"));
+        // The same 6 s moving 1 GiB at the pace of every other body: large, not stuck.
+        let mut large = run.clone();
+        stall(&mut large, 1 << 30);
+        let f = derive(&large);
+        assert!(!f.iter().any(|x| x.code == "hung_requests"), "{f:#?}");
+    }
+
+    /// The mirror of the capped uplink: under a bandwidth cap on the response bodies, a
+    /// request that spends seconds receiving its body shares the cap, and is not hung.
+    #[test]
+    fn downloads_under_a_bandwidth_cap_are_not_hung_requests() {
+        let (mut reqs, mut ops) = crate::analysis::limits::tests::capped_link(false);
+        // Downloads of 4 MiB: up to 4 s when eight share the link.
+        for q in &mut reqs {
+            q.t_us *= 4;
+            q.body_us *= 4;
+            q.bytes_down *= 4;
+            q.total_us = q.send_us + q.ttfb_us + q.body_us;
+        }
+        // Quick small reads all along: the median request is fast, and so is its body.
+        let end = reqs.iter().map(|q| q.t_us).max().unwrap();
+        for i in 0..600u64 {
+            let id = 10_000 + i;
+            let t = end / 600 * i as i64;
+            let mut q = crate::analysis::outliers::test_req(t, 8_000);
+            q.op_id = id;
+            (q.ttfb_us, q.body_us, q.bytes_down) = (7_000, 990, 1 << 20);
+            reqs.push(q);
+            ops.push(crate::analysis::simulate::tests::op(id, t, 8_000));
+        }
+        let run = with_capacity(base(), reqs, ops);
+        let slow = run
+            .reqs
+            .iter()
+            .filter(|q| q.total_us >= HUNG_MIN_US && Stage::dominant(q) == Stage::Body)
+            .count();
+        assert!(slow >= 20, "bodies slow enough to read as hung: {slow}");
+        let f = derive(&run);
+        let cap = f
+            .iter()
+            .find(|x| x.code == "bandwidth_cap")
+            .unwrap_or_else(|| panic!("{f:#?}\n{:#?}", run.report.capacity.hypotheses));
+        assert!(cap.evidence.values["body_time_ratio"] > 0.5, "{cap:#?}");
+        assert!(!cap.evidence.values.contains_key("body_pct"));
+        assert!(!f.iter().any(|x| x.code == "hung_requests"), "{f:#?}");
+    }
+
+    /// K2-8: operations that waited 990 ms for a slot and then ran 10 ms printed "queue 97 %"
+    /// beside "slowest 1 %: server 99 %": the request rows know nothing of the wait before
+    /// the first request.
+    #[test]
+    fn the_tail_split_counts_the_operations_own_queue_time() {
+        let mut run = base();
+        for o in &mut run.ops {
+            o.latency_us = 1_000_000;
+            o.breakdown = crate::model::OpBreakdownUs {
+                queue_us: 990_000,
+                backend_us: 10_000,
+                ..Default::default()
+            };
+        }
+        for q in &mut run.reqs {
+            (q.ttfb_us, q.total_us) = (9_990, 10_000);
+        }
+        let split = tail_split(&run);
+        assert_eq!(split[0].0, "queue", "{split:?}");
+        assert!((split[0].1 - 0.99).abs() < 1e-6, "{split:?}");
+        assert_eq!(split[1].0, "ttfb", "{split:?}");
+        assert!((split.iter().map(|x| x.1).sum::<f64>() - 1.0).abs() < 1e-9);
+    }
+
+    /// An open loop of 1 000 arrivals/s that carried 400/s with CPU to spare.
+    fn fell_behind(reqs: Vec<ReqRow>, ops: Vec<crate::model::OpRow>) -> Run {
+        let mut run = with_capacity(base(), reqs, ops);
+        run.report.self_stats.cpu_ratio = Some(0.08);
+        run.report.self_stats.sched_lag_p99_ms = Some(1.5);
+        run.report.spec.profile.workload.concurrency = 16;
+        run.report.open_loop = Some(crate::trace::OpenLoopStats {
+            target_rate: 1000.0,
+            achieved_rate: 400.0,
+            missed: 1800,
+            censored_count: 1800,
+            intended_count: 3000,
+            ..Default::default()
+        });
+        run
+    }
+
+    /// K2-2: `lab://queueing --rate 1000` carried the lab's 400 operations/s at 16 workers
+    /// and at 64, and 9.2 said of both "the workers set the pace, not the service: raise
+    /// `-c`". Every worker of an overloaded open loop is busy for the whole window: a steady
+    /// one cannot tell a service at its capacity from too few workers, and a run that varied
+    /// its load can.
+    #[test]
+    fn an_open_loop_that_fell_behind_blames_the_workers_only_with_evidence() {
+        use crate::analysis::limits::tests::{queueing_bursts, queueing_closed_loops};
+        // Steady: 16 workers always in flight, 40 ms each behind four servers of 10 ms. The
+        // window's first rows only seem to arrive at 1 to 15 in flight, at the same 40 ms.
+        let (reqs, ops) = queueing_closed_loops(&[16]);
+        let run = fell_behind(reqs, ops);
+        let f = derive(&run);
+        assert!(!f.iter().any(|x| x.code == "throttling"), "{f:#?}");
+        let c = f.iter().find(|x| x.code == "client_bound").unwrap();
+        assert!(c.cause.contains("cannot tell"), "{}", c.cause);
+        assert!(c.cause.contains("16 workers"), "{}", c.cause);
+        assert!(!c.remedy.text.contains("`-c`"), "{}", c.remedy.text);
+        assert!(c.remedy.text.contains("shape=ramp"), "{}", c.remedy.text);
+        // The load varied, and the time to first byte grew with it: the service queues. It
+        // is the bound, not the workers.
+        let (reqs, ops) = queueing_bursts(|b| 2 + b % 14);
+        let run = fell_behind(reqs, ops);
+        let f = derive(&run);
+        assert!(!f.iter().any(|x| x.code == "client_bound"), "{f:#?}");
+        let t = f
+            .iter()
+            .find(|x| x.code == "throttling")
+            .unwrap_or_else(|| panic!("{f:#?}"));
+        assert!(t.cause.contains("queues the rest"), "{}", t.cause);
+        assert!(t.remedy.path.is_none() && !t.remedy.text.contains("`-c`"));
+        assert_eq!(t.remedy.next.as_deref(), Some("oprobe show r1 --detail"));
+        // The load varied, and the service answered in 10 ms whatever was in flight: it had
+        // room. The workers are the bound, and the finding says what shows it.
+        let (mut reqs, ops) = queueing_bursts(|b| 2 + b % 14);
+        for (i, q) in reqs.iter_mut().enumerate() {
+            q.ttfb_us = 9_500 + (i as u64 % 11) * 100;
+            q.total_us = q.ttfb_us + 10;
+        }
+        let run = fell_behind(reqs, ops);
+        let f = derive(&run);
+        assert!(!f.iter().any(|x| x.code == "throttling"), "{f:#?}");
+        let c = f.iter().find(|x| x.code == "client_bound").unwrap();
+        assert!(c.cause.contains("16 workers set the pace"), "{}", c.cause);
+        assert!(c.remedy.text.contains("`-c`"), "{}", c.remedy.text);
+        assert!(
+            c.evidence.text.contains("time to first byte stayed at"),
+            "{}",
+            c.evidence.text
+        );
+        // A client that is itself saturated stays client-bound whatever its timing says.
+        let (reqs, ops) = queueing_bursts(|b| 2 + b % 14);
+        let mut run = fell_behind(reqs, ops);
+        run.report.self_stats.client_saturated = true;
+        let f = derive(&run);
+        assert_eq!(f[0].code, "client_bound", "{f:#?}");
+        assert!(!f.iter().any(|x| x.code == "throttling"), "{f:#?}");
     }
 
     #[test]
@@ -2207,7 +2726,8 @@ pub(crate) mod tests {
     }
 
     /// An open-loop run whose arrivals queue behind the workers names the workers, not the
-    /// CPU (K15).
+    /// CPU (K15). That more workers would help is said only with evidence
+    /// (`an_open_loop_that_fell_behind_blames_the_workers_only_with_evidence`).
     #[test]
     fn a_rate_above_the_workers_names_the_workers() {
         let mut run = base();
@@ -2231,7 +2751,14 @@ pub(crate) mod tests {
             !c.cause.contains("CPU, not") && !c.remedy.text.contains("more cores"),
             "{c:#?}"
         );
+        // The rows show the service answering as fast at many requests in flight as at few
+        // (K2-2): that is what lets the finding say more workers would help.
         assert!(c.remedy.text.contains("`-c`"), "{}", c.remedy.text);
+        assert!(
+            c.evidence.text.contains("time to first byte stayed at"),
+            "{}",
+            c.evidence.text
+        );
         assert!(
             c.evidence.text.contains("1000/s scheduled, 200/s carried"),
             "{}",
@@ -2286,7 +2813,7 @@ pub(crate) mod tests {
         let slow = run
             .reqs
             .iter()
-            .filter(|q| q.total_us >= HUNG_MIN_US && dominant_stage(q) == "send")
+            .filter(|q| q.total_us >= HUNG_MIN_US && Stage::dominant(q) == Stage::Send)
             .count();
         assert!(
             slow >= 20,
@@ -2306,7 +2833,7 @@ pub(crate) mod tests {
             Some("oprobe prove r1 bandwidth_cap")
         );
         assert!(cap.cause.contains("upload"), "{}", cap.cause);
-        assert!(cap.evidence.values["upload_pct"] > 50.0, "{cap:#?}");
+        assert!(cap.evidence.values["upload_time_ratio"] > 0.5, "{cap:#?}");
         let mib_s = cap.evidence.values["fitted_bytes_per_s"] / (1u64 << 20) as f64;
         assert!((7.0..9.0).contains(&mib_s), "{mib_s}");
         assert!(!f.iter().any(|x| x.code == "hung_requests"), "{f:#?}");
@@ -2323,11 +2850,13 @@ pub(crate) mod tests {
     }
 
     /// A service that queues instead of rejecting: 9.1 fitted the queueing model and no
-    /// finding read it. It is the in-flight limit of `throttling`, with the same remedy.
+    /// finding read it. It is `throttling` without a 429/503, reported as advice (K3-8: a cap
+    /// moves the queue, and no objective prove measures improves by it).
     #[test]
-    fn queueing_is_an_inflight_limit_without_rejections() {
+    fn queueing_is_throttling_without_rejections_and_its_remedy_is_advice() {
         let (reqs, ops) = crate::analysis::limits::tests::queueing_bursts(|b| 2 + b % 14);
-        let run = with_capacity(base(), reqs, ops);
+        let mut run = with_capacity(base(), reqs, ops);
+        run.report.self_stats.sched_lag_p99_ms = Some(1.0);
         let sel = run.report.capacity.asserted().expect("asserted");
         assert_eq!(sel.kind, HypothesisKind::Queueing);
         let f = derive(&run);
@@ -2337,36 +2866,44 @@ pub(crate) mod tests {
             .unwrap_or_else(|| panic!("{f:#?}"));
         assert_eq!(q.severity, Severity::Warning);
         assert!(q.confidence >= Confidence::Medium);
-        assert_eq!(
-            q.remedy.path.as_deref(),
-            Some("layers.concurrent_limit.http")
+        // Advice: no path, nothing sized, and a `next` that shows the evidence.
+        assert!(q.remedy.path.is_none() && !q.remedy.sized, "{q:#?}");
+        assert!(!q.remedy.provable());
+        assert!(
+            q.remedy.text.contains("queue") && q.remedy.text.contains("advice"),
+            "{}",
+            q.remedy.text
         );
-        assert!(q.remedy.sized);
-        assert!(q.remedy.text.contains("queue"), "{}", q.remedy.text);
-        assert_eq!(
-            q.remedy.next.as_deref(),
-            Some("oprobe prove r1 throttling --objective p99")
+        assert!(
+            q.remedy.text.contains("`layers.concurrent_limit.http`"),
+            "{}",
+            q.remedy.text
         );
+        assert_eq!(q.remedy.next.as_deref(), Some("oprobe show r1 --detail"));
         let servers = q.evidence.values["fitted_inflight_count"];
         assert!((3.0..=5.0).contains(&servers), "{servers}");
         assert!(q.evidence.values[COST_KEY] > 0.2, "{q:#?}");
+        // The wait is the model's: 10 ms × (15 / 4 − 1) at the busiest level.
+        assert_eq!(q.evidence.values["busiest_inflight_count"], 15.0);
+        let wait = q.evidence.values["busiest_queue_wait_ms"];
+        assert!((22.0..=33.0).contains(&wait), "{wait}");
         assert!(q.cause.contains("queues the rest") && q.cause.contains("no request was rejected"));
-        // No sizing advice in words (N2): the limit is evidence, prove sizes the cap.
+        // No sizing advice in words (N2): the limit is evidence.
         assert!(!q.cause.contains("concurrency") && !q.cause.contains("run at"));
         assert!(!q.evidence.op_ids.is_empty());
         assert_eq!(f.iter().filter(|x| x.code == "throttling").count(), 1);
-        // The same curve at a twentieth of the time (0.5 ms of service, waits of a fraction of
-        // a millisecond) is the client's own scheduling, not a service's queue: no finding.
-        let (reqs, ops) = crate::analysis::limits::tests::queueing_bursts_of(0.5, |b| 2 + b % 14);
-        let tiny = with_capacity(base(), reqs, ops);
-        let f = derive(&tiny);
-        assert!(!f.iter().any(|x| x.code == "throttling"), "{f:#?}");
         // The same service under a load that never varied asserts nothing: no finding.
         let (reqs, ops) = crate::analysis::limits::tests::queueing_closed_loops(&[12, 14, 16, 19]);
         let steady = with_capacity(base(), reqs, ops);
         let sel = steady.report.capacity.selected().expect("selected");
         assert_eq!(sel.kind, HypothesisKind::Queueing);
         let f = derive(&steady);
+        assert!(!f.iter().any(|x| x.code == "throttling"), "{f:#?}");
+        // A timing-based finding is not kept on a client-bound run.
+        let mut bound = run.clone();
+        bound.report.self_stats.client_saturated = true;
+        let f = derive(&bound);
+        assert_eq!(f[0].code, "client_bound", "{f:#?}");
         assert!(!f.iter().any(|x| x.code == "throttling"), "{f:#?}");
         // And real rejections keep the one `throttling` finding they always made.
         let mut thr = run;
@@ -2375,6 +2912,42 @@ pub(crate) mod tests {
         let t: Vec<&Finding> = f.iter().filter(|x| x.code == "throttling").collect();
         assert_eq!(t.len(), 1);
         assert!(t[0].evidence.text.contains("throttled responses"), "{t:#?}");
+        assert_eq!(
+            t[0].remedy.next.as_deref(),
+            Some("oprobe prove r1 throttling --objective p99")
+        );
+    }
+
+    /// K2-6: the growth must stand clear of the client's own scheduling lag, whatever its
+    /// size. 9.2 asked for a mean wait of 1 ms instead, which hid a real queue in front of a
+    /// fast store and let pass anything slower than about 8 ms.
+    #[test]
+    fn the_queueing_form_is_judged_against_the_clients_scheduling_lag() {
+        // 0.5 ms of service behind 4 servers: a request at 15 in flight waits ≈ 1.4 ms.
+        let fast = |lag_ms: f64| {
+            let (reqs, ops) =
+                crate::analysis::limits::tests::queueing_bursts_of(0.5, |b| 2 + b % 14);
+            let mut run = with_capacity(base(), reqs, ops);
+            run.report.self_stats.sched_lag_p99_ms = Some(lag_ms);
+            derive(&run)
+        };
+        // A client whose own scheduling adds as much (Windows CI): not a service's queue.
+        let f = fast(1.0);
+        assert!(!f.iter().any(|x| x.code == "throttling"), "{f:#?}");
+        // A client that schedules within 50 µs sees the queue of a fast store.
+        let f = fast(0.05);
+        let q = f
+            .iter()
+            .find(|x| x.code == "throttling")
+            .unwrap_or_else(|| panic!("{f:#?}"));
+        let wait = q.evidence.values["busiest_queue_wait_ms"];
+        assert!((1.0..=1.8).contains(&wait), "{wait}");
+        // And a lag of 20 ms hides a wait of 27 ms behind a 10 ms service, which the 1 ms
+        // rule let through.
+        let (reqs, ops) = crate::analysis::limits::tests::queueing_bursts(|b| 2 + b % 14);
+        let mut run = with_capacity(base(), reqs, ops);
+        run.report.self_stats.sched_lag_p99_ms = Some(20.0);
+        assert!(!derive(&run).iter().any(|x| x.code == "throttling"));
     }
 
     /// A bandwidth cap names ThrottleLayer only where it applies: on writes (K16).

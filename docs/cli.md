@@ -76,7 +76,7 @@ oprobe run prod --existing data/2026/ --max-requests 50000
 
 `oprobe run lab://demo`, with the same workload and safety flags as `run`. Every 40th request
 of the lab is a straggler that waits 250 ms, and it throttles above 40 requests in flight. Its default
-workload is small files (64 × 64 KiB) with 28 workers for 8 s; `oprobe prove last` then proves
+workload is small files (64 × 64 KiB) with 16 workers for 8 s; `oprobe prove last` then proves
 the top finding's remedy in about a minute.
 
 ## `oprobe prove RUN [FINDING]`
@@ -97,8 +97,17 @@ block is drawn from the run's seed (`notes` says so). When the
 budget allows fewer, the verdict is `inconclusive` (exit 0) with a note. When no pair ran at all,
 the text says `not measured` and prints no diff; `-o json` still prints a valid result
 (`verdict: "inconclusive"`, `pairs_count: 0`, a note). When the changed operator's trials
-throttle more than `--max-throttle` allows, and more than the current operator's, the verdict is
-`inconclusive` too, with a note: the service's limit, not the change, set what was measured.
+throttle more than `--max-throttle` allows, and more than the current operator's by more than
+that allowance (beyond chance), the verdict is `inconclusive` too, with a note: the service's
+limit, not the change, set what was measured. Throttling the change did not cause passes: a
+service that answers 503 whatever the operator does (`lab://noisy`) throttles both alike.
+
+Sizing follows the same bound. A remedy for throttling (`throttling`, `rate_limit`) is sized
+among the values whose trials stay within `--max-throttle`; any other remedy among the values
+that add no more than `--max-throttle` to what the run already had. When no value qualifies,
+the least throttled one is tested and a note says so ("no value met --max-throttle"); the rule
+above still decides the verdict.
+
 The same holds for failures, on either objective: a changed operator whose operations fail more
 than the run allows (1 %), and more than the current operator's, is `inconclusive` with a note
 (a timeout that fails the slow operations lowers the p99 and improves nothing). A pair in which

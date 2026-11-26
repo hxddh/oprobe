@@ -2635,7 +2635,8 @@ pub struct TrustView {
     /// Objects read back and verified, and those that came back corrupted.
     pub verified_count: u64,
     pub corrupted_count: u64,
-    /// The run's checks that failed (a corrupted object, too many failed operations).
+    /// The run's checks that failed (a corrupted object, too many failed operations, an open
+    /// loop that stalled).
     pub breaches: Vec<String>,
 }
 

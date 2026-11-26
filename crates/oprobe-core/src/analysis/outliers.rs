@@ -93,21 +93,79 @@ const MIN_SELECTED_RATIO: f64 = 0.05;
 /// One-sided significance: z of the two-proportion test (≈ p < 0.05).
 const MIN_Z: f64 = 1.65;
 
-/// The stage that dominated a request's time.
-pub fn dominant_stage(r: &ReqRow) -> &'static str {
-    let connect = r.dns_us + r.tcp_us + r.proxy_us + r.tls_us;
-    [
-        ("queue", r.queue_us),
-        ("connect", connect),
-        ("send", r.send_us),
-        ("ttfb", r.ttfb_us),
-        ("transfer", r.body_us),
-        ("stall", r.stall_us),
-    ]
-    .into_iter()
-    .max_by_key(|(_, v)| *v)
-    .map(|(n, _)| n)
-    .unwrap_or("ttfb")
+/// A stage of one backend request, in the order a request goes through them
+/// (docs/concepts.md). Every consumer names a stage through this type: the findings, the
+/// attribution, `show --by stage` and the tail split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Stage {
+    /// Waiting for an in-flight permit or a connection.
+    Queue,
+    /// DNS, TCP, proxy CONNECT and TLS of a new connection.
+    Connect,
+    /// Sending the request (its body included).
+    Send,
+    /// Waiting for the first byte of the response.
+    Ttfb,
+    /// Receiving the response body.
+    Body,
+    /// The body waiting for the caller to consume it.
+    Stall,
+}
+
+impl Stage {
+    pub const ALL: [Stage; 6] = [
+        Stage::Queue,
+        Stage::Connect,
+        Stage::Send,
+        Stage::Ttfb,
+        Stage::Body,
+        Stage::Stall,
+    ];
+
+    /// The stage's one name: a `--by stage` group, a `stage` attribution value, a tail-split
+    /// key. It is the name of the stage's field in the report (`stages.body`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Stage::Queue => "queue",
+            Stage::Connect => "connect",
+            Stage::Send => "send",
+            Stage::Ttfb => "ttfb",
+            Stage::Body => "body",
+            Stage::Stall => "stall",
+        }
+    }
+
+    /// The stage `name` names. `transfer` is what 9.2 and earlier called `body` in
+    /// `--by stage` and in the attribution; it is still understood.
+    pub fn parse(name: &str) -> Option<Stage> {
+        let name = name.trim().to_ascii_lowercase();
+        if name == "transfer" {
+            return Some(Stage::Body);
+        }
+        Stage::ALL.into_iter().find(|s| s.name() == name)
+    }
+
+    /// The time `r` spent in this stage (µs).
+    pub fn us(self, r: &ReqRow) -> u64 {
+        match self {
+            Stage::Queue => r.queue_us,
+            Stage::Connect => r.connect_us(),
+            Stage::Send => r.send_us,
+            Stage::Ttfb => r.ttfb_us,
+            Stage::Body => r.body_us,
+            Stage::Stall => r.stall_us,
+        }
+    }
+
+    /// The stage that dominated a request's time (the later stage of equals; the time to
+    /// first byte for a request that recorded no stage).
+    pub fn dominant(r: &ReqRow) -> Stage {
+        Stage::ALL
+            .into_iter()
+            .filter(|s| s.us(r) > 0)
+            .max_by_key(|s| s.us(r))
+            .unwrap_or(Stage::Ttfb)
+    }
 }
 
 /// Log-scale size bin of the bytes a request moved.
@@ -272,7 +330,7 @@ fn attributes(r: &ReqRow, bins: &TimeBins, rtt: bool) -> [(&'static str, String)
                 .map(|c| c.as_str().to_owned())
                 .unwrap_or_else(|| "none".into()),
         ),
-        ("stage", dominant_stage(r).to_owned()),
+        ("stage", Stage::dominant(r).name().to_owned()),
         ("size", size_bin(r.bytes_up + r.bytes_down).to_owned()),
         (
             "rtt",
@@ -553,5 +611,30 @@ mod tests {
         }
         assert!(!rtt_tracks_server(&reqs));
         assert!(rank_correlation(&[(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]) > 0.99);
+    }
+
+    /// K2-3: one name per stage for every consumer. 9.2 called the body stage `transfer` here
+    /// and `body` in the findings, the tail split and the report's fields.
+    #[test]
+    fn a_stage_has_one_name_and_the_old_one_is_still_understood() {
+        let names: Vec<&str> = Stage::ALL.iter().map(|s| s.name()).collect();
+        assert_eq!(names, ["queue", "connect", "send", "ttfb", "body", "stall"]);
+        for s in Stage::ALL {
+            assert_eq!(Stage::parse(s.name()), Some(s));
+        }
+        assert_eq!(Stage::parse("transfer"), Some(Stage::Body));
+        assert_eq!(Stage::parse(" TTFB "), Some(Stage::Ttfb));
+        assert_eq!(Stage::parse("server"), None);
+        let mut r = test_req(0, 9_000);
+        assert_eq!(Stage::dominant(&r), Stage::Ttfb);
+        (r.ttfb_us, r.body_us) = (1_000, 7_990);
+        assert_eq!(Stage::dominant(&r), Stage::Body);
+        assert_eq!(Stage::Body.us(&r), 7_990);
+        (r.tcp_us, r.tls_us) = (5_000, 4_000);
+        assert_eq!(Stage::dominant(&r), Stage::Connect);
+        // A request that recorded no stage waited for its answer.
+        let mut none = test_req(0, 0);
+        (none.send_us, none.ttfb_us) = (0, 0);
+        assert_eq!(Stage::dominant(&none), Stage::Ttfb);
     }
 }

@@ -122,17 +122,27 @@ hung I/O, cold connections, small ranges, slow multipart, repeated reads, a busy
 
 Every finding has a confidence: **high** only when the model explains most of the effect and
 agrees across repeats. Throttling that made operations fail is reported as throttling, never as
-an invalid run. The codes and their remedies are in the [README](../README.md#findings-and-their-remedy);
-besides those, `errors` reports failures that are not throttling (when retries recovered every
-operation, its remedy is a shorter first retry backoff with jitter, `layers.retry.min_delay`) and
-`invalid_run` a run whose numbers cannot be trusted (too short, nothing measured).
+an invalid run, and a handful of 429/503 that no limit model explains is still `throttling`, at
+low confidence, never `errors`. The codes and their remedies are in the
+[README](../README.md#findings-and-their-remedy); besides those, `errors` reports failures that
+are not throttling and `invalid_run` a run whose numbers cannot be trusted (too short, nothing
+measured). The remedy of `errors` follows what failed:
+
+- transient failures the retries recovered (5xx, lost connections), a few operations that ran
+  out of retries included: a shorter first retry backoff with jitter (`layers.retry.min_delay`);
+- writes that OpenDAL's `ThrottleLayer` refused because they are larger than
+  `layers.throttle.burst` (they fail as rate-limited with no 429/503 from the service): raise
+  the burst to at least the largest write;
+- anything else (credentials, permissions, the endpoint): not a layer.
 
 ## Remedy
 
 Each finding names exactly **one** remedy, as an `op.toml` path: `layers.concurrent_limit.http`,
 `layers.tail_cut`, `read.gap`, `http.keep_alive`, … A remedy that is not a layer (spreading keys
-over prefixes for `key_limit`) is reported as advice, and `client_bound` has no storage remedy:
-their `next` says where to look (`oprobe show RUN --detail`), and `prove` refuses them.
+over prefixes for `key_limit`), or that no A/B test can measure (capping the requests in flight
+in front of a service that queues without rejecting: the cap moves the wait, it shortens
+nothing), is reported as advice, and `client_bound` has no storage remedy: their `next` says
+where to look (`oprobe show RUN --detail`), and `prove` refuses them.
 
 `run` gives the remedy and **no number**. A single run varies no load, so it cannot say how
 large a limit should be or how much it would help; claiming so would be a guess.

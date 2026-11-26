@@ -1,83 +1,64 @@
-//! Latency quantiles of an open-loop run with right-censored arrivals.
+//! A stalled open loop: scheduled arrivals that never completed, and what they leave known of
+//! the p99.
 //!
 //! An open-loop arrival that never completed (it never got a slot before the window ended, or
 //! was dropped behind schedule) has no latency: all that is known is a lower bound, the time
-//! it had already waited. Its latency is *at least* that, and nothing says how much more: a
-//! stalled target never answers at all.
+//! it had already waited. The recorder keeps every arrival in one distribution, a censored one
+//! at its lower bound (design v6, T3: no coordinated omission), so a quantile read off that
+//! distribution is bounded from below only.
 //!
-//! The recorder keeps every arrival in one distribution, a censored one at its lower bound
-//! (design v6, T3: no coordinated omission). Reading a quantile off that distribution treats a
-//! censored arrival as if it had completed at its bound, which only bounds the quantile from
-//! below. This module gives both sides:
-//!
-//! - **from below**, each censored arrival at its bound (the least it can be);
-//! - **from above**, each censored arrival slower than everything measured (the worst it can
-//!   be): the quantile of `N` arrivals with `m` censored then sits `m` ranks higher among the
-//!   values recorded, and when that rank does not exist (more than `1 − q` of the arrivals
-//!   were censored) nothing bounds the quantile from above.
-//!
-//! A limit on a quantile is met only when the bound from above meets it.
+//! From above, a censored arrival may have been slower than everything measured: the p99 of
+//! `N` arrivals with `m` censored then sits `m` ranks higher. When that rank does not exist —
+//! `⌈0.99·N⌉ + m > N`, more than 1 % of the arrivals never completed — nothing bounds the p99
+//! from above, whatever the operations that did complete measured. Such a run is stalled, and
+//! it is judged so with no limit to compare against.
 
-use crate::trace::LatencyHistogram;
+use crate::trace::OpenLoopStats;
 
-/// What is known of a latency quantile when some arrivals are right-censored.
+/// An open-loop run whose p99 has no upper bound: its rank falls among the arrivals that
+/// never completed.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum CensoredQuantile {
-    /// The quantile is at most this (ms), however slow the censored arrivals would have been.
-    AtMost(f64),
-    /// The quantile's rank falls among the censored arrivals: it is at least this (ms), and
-    /// nothing bounds it from above.
-    AtLeast(f64),
+pub struct StalledOpenLoop {
+    /// Scheduled arrivals that never completed.
+    pub censored_count: u64,
+    /// Every scheduled arrival of the window.
+    pub arrivals_count: u64,
+    /// The p99 over every arrival, each censored one at the time it had waited: the least
+    /// the p99 can be. It is the run's own p99 (`summary.latency.p99_ms`), the same estimator.
+    pub p99_at_least_ms: f64,
 }
 
-impl CensoredQuantile {
-    /// The quantile is known to be within `limit_ms`.
-    pub fn meets(&self, limit_ms: f64) -> bool {
-        matches!(self, Self::AtMost(v) if *v <= limit_ms)
+impl StalledOpenLoop {
+    /// The stall of an open-loop run with the p99 `p99_ms` over all its arrivals; `None` for
+    /// a closed loop, and while the p99 is still bounded from above (at most 1 % censored).
+    pub fn of(open_loop: Option<&OpenLoopStats>, p99_ms: f64) -> Option<Self> {
+        let o = open_loop?;
+        let censored = o.censored_count.max(o.missed);
+        // A report from before the schedule counted its arrivals cannot say what share.
+        let arrivals = o.intended_count;
+        // The rank of the p99 with every censored arrival taken as slower than any value.
+        let rank = (arrivals as f64 * 0.99).ceil() as u64;
+        (arrivals > 0 && rank.saturating_add(censored) > arrivals).then_some(Self {
+            censored_count: censored,
+            arrivals_count: arrivals,
+            p99_at_least_ms: p99_ms,
+        })
     }
 
-    /// The bound itself (ms).
-    pub fn bound_ms(&self) -> f64 {
-        match self {
-            Self::AtMost(v) | Self::AtLeast(v) => *v,
-        }
+    /// Share of the scheduled arrivals that never completed (0–1).
+    pub fn censored_ratio(&self) -> f64 {
+        self.censored_count as f64 / self.arrivals_count.max(1) as f64
     }
-}
 
-/// The bin holding the `rank`-th smallest value (1-based) of `h`.
-fn bin_of_rank(h: &LatencyHistogram, rank: u64) -> Option<usize> {
-    let mut seen = 0u64;
-    h.counts.iter().position(|n| {
-        seen += n;
-        seen >= rank
-    })
-}
-
-/// Quantile `q` (0–1) of the arrivals in `all`, `censored` of which are recorded at their
-/// lower bound instead of a latency. `None` for an empty distribution.
-///
-/// The values are a histogram's: a bound from above is the upper edge of its bin (never above
-/// the slowest value), a bound from below the lower edge.
-pub fn censored_quantile(
-    all: &LatencyHistogram,
-    censored: u64,
-    q: f64,
-) -> Option<CensoredQuantile> {
-    let total = all.total();
-    if total == 0 {
-        return None;
-    }
-    let rank = ((total as f64 * q.clamp(0.0, 1.0)).ceil() as u64).clamp(1, total);
-    // Censored arrivals taken as slower than every value: the quantile moves up by their number.
-    match rank
-        .checked_add(censored)
-        .filter(|r| *r <= total)
-        .and_then(|r| bin_of_rank(all, r))
-    {
-        Some(i) => Some(CensoredQuantile::AtMost(
-            all.upper_ms[i].min(all.max_ms).max(all.lower_ms[i]),
-        )),
-        None => bin_of_rank(all, rank).map(|i| CensoredQuantile::AtLeast(all.lower_ms[i])),
+    /// The stall in one sentence, with its arithmetic.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} of {} scheduled arrivals never completed ({:.1}%): the p99 is at least {} and has no upper bound",
+            self.censored_count,
+            self.arrivals_count,
+            self.censored_ratio() * 100.0,
+            crate::util::fmt_ms(self.p99_at_least_ms)
+        )
     }
 }
 
@@ -85,78 +66,48 @@ pub fn censored_quantile(
 mod tests {
     use super::*;
 
-    /// A synthetic open-loop run: one arrival every `gap_ms` over `window_ms`; the target
-    /// answers in `service_ms` until it stalls at `stall_ms`, and every later arrival is
-    /// censored at the window end. Returns the distribution as the recorder keeps it, and
-    /// the number censored.
-    fn stalled(
-        window_ms: u64,
-        gap_ms: u64,
-        service_ms: u64,
-        stall_ms: u64,
-    ) -> (LatencyHistogram, u64) {
-        let mut values = Vec::new();
-        let mut censored = 0;
-        for at in (0..window_ms).step_by(gap_ms as usize) {
-            if at < stall_ms {
-                values.push((service_ms * 1000, 1));
-            } else {
-                // Its latency is at least the time left in the window: recorded at that.
-                values.push(((window_ms - at) * 1000, 1));
-                censored += 1;
-            }
+    fn open_loop(censored: u64, arrivals: u64) -> OpenLoopStats {
+        OpenLoopStats {
+            missed: censored,
+            censored_count: censored,
+            intended_count: arrivals,
+            ..Default::default()
         }
-        (LatencyHistogram::from_counts(values), censored)
     }
 
+    /// The p99 of 1 000 arrivals is the 990th: with 10 censored the 1 000th still bounds it,
+    /// with 11 nothing does.
     #[test]
-    fn a_quantile_among_the_censored_is_only_bounded_from_below() {
-        // 1 000 arrivals; the target stalls after 2 s of 10: 800 never complete.
-        let (h, censored) = stalled(10_000, 10, 5, 2_000);
-        assert_eq!((h.total(), censored), (1000, 800));
-        let p99 = censored_quantile(&h, censored, 0.99).unwrap();
-        // The 990th smallest of 200 × 5 ms and bounds of 10 ms to 8 s is the bound of the
-        // arrival that had waited ≈ 7.9 s: the p99 is at least that, not the 5 ms measured.
-        let CensoredQuantile::AtLeast(ms) = p99 else {
-            panic!("{p99:?}");
-        };
-        assert!((7_000.0..=7_900.0).contains(&ms), "{ms}");
-        assert!(
-            !p99.meets(60_000.0),
-            "no limit is met by an unbounded quantile"
+    fn a_run_is_stalled_when_the_p99_rank_falls_among_the_censored() {
+        assert_eq!(StalledOpenLoop::of(None, 5.0), None);
+        assert_eq!(StalledOpenLoop::of(Some(&open_loop(0, 1000)), 5.0), None);
+        assert_eq!(StalledOpenLoop::of(Some(&open_loop(10, 1000)), 5.0), None);
+        let s = StalledOpenLoop::of(Some(&open_loop(11, 1000)), 5.0).unwrap();
+        assert_eq!((s.censored_count, s.arrivals_count), (11, 1000));
+        let s = StalledOpenLoop::of(Some(&open_loop(800, 1000)), 7_900.0).unwrap();
+        assert!((s.censored_ratio() - 0.8).abs() < 1e-12);
+        assert_eq!(
+            s.describe(),
+            "800 of 1000 scheduled arrivals never completed (80.0%): the p99 is at least 7.90s and has no upper bound"
         );
-        // The median is among the censored too (80 % are); the p10 is not: 100 + 800 ≤ 1 000.
-        assert!(matches!(
-            censored_quantile(&h, censored, 0.5),
-            Some(CensoredQuantile::AtLeast(_))
-        ));
-        let p10 = censored_quantile(&h, censored, 0.10).unwrap();
-        assert!(matches!(p10, CensoredQuantile::AtMost(_)), "{p10:?}");
     }
 
+    /// W2 (9.2): the bound was read off the lower edge of a histogram bin, so the check said
+    /// "at least 7.08 s" beside a summary p99 of 7.9 s. The bound is the summary's p99 itself.
     #[test]
-    fn a_few_censored_arrivals_move_the_quantile_up_by_their_rank() {
-        // 988 arrivals of 10 ms, 10 of 500 ms, 2 censored after waiting 1 ms.
-        let h = LatencyHistogram::from_counts([(10_000, 988), (500_000, 10), (1_000, 2)]);
-        // Read as if the two had completed in 1 ms, the p99 is 10 ms.
-        let naive = h.quantile_ms(0.99).unwrap();
-        assert!(naive < 12.0, "{naive}");
-        // They may have been the slowest: the 990th of 1 000 is then one of the 500 ms.
-        let p99 = censored_quantile(&h, 2, 0.99).unwrap();
-        let CensoredQuantile::AtMost(ms) = p99 else {
-            panic!("{p99:?}");
+    fn the_lower_bound_is_the_runs_own_p99() {
+        let s = StalledOpenLoop::of(Some(&open_loop(800, 1000)), 7_912.3).unwrap();
+        assert_eq!(s.p99_at_least_ms, 7_912.3);
+    }
+
+    /// A report written before the schedule counted its arrivals cannot say what share of
+    /// them was missed: it is not judged.
+    #[test]
+    fn a_report_without_an_intended_count_is_not_judged() {
+        let o = OpenLoopStats {
+            missed: 40,
+            ..Default::default()
         };
-        assert!((500.0..=562.0).contains(&ms), "{ms}");
-        assert!(ms >= naive, "never below what the arrivals imply");
-        assert!(p99.meets(600.0) && !p99.meets(400.0));
-        // Nothing censored: the histogram's own quantile.
-        assert_eq!(
-            censored_quantile(&h, 0, 0.99),
-            Some(CensoredQuantile::AtMost(naive))
-        );
-        assert_eq!(
-            censored_quantile(&LatencyHistogram::default(), 0, 0.99),
-            None
-        );
+        assert_eq!(StalledOpenLoop::of(Some(&o), 100.0), None);
     }
 }

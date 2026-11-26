@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::outliers::dominant_stage;
+use super::outliers::Stage;
 use crate::model::ReqRow;
 
 /// How to group request rows.
@@ -58,7 +58,7 @@ impl By {
                 .remote
                 .map(|a| a.ip().to_string())
                 .unwrap_or_else(|| NO_CONNECTION.into()),
-            Self::Stage => dominant_stage(r).to_owned(),
+            Self::Stage => Stage::dominant(r).name().to_owned(),
             Self::Second => (r.t_us.div_euclid(1_000_000)).to_string(),
             Self::Status => r.status.to_string(),
         }
@@ -156,7 +156,8 @@ impl Filter {
                     .remote
                     .is_some_and(|a| eq(&a.ip().to_string()) || eq(&a.to_string())),
                 "conn" => eq(&r.conn_id.to_string()),
-                "stage" => eq(dominant_stage(r)),
+                // `transfer` (9.2 and earlier) still selects the body stage.
+                "stage" => Stage::parse(v) == Some(Stage::dominant(r)),
                 "connection" => eq(if r.reused { "warm" } else { "cold" }),
                 "attempt" => {
                     eq(if r.attempt > 1 { "retry" } else { "first" }) || eq(&r.attempt.to_string())
@@ -450,5 +451,29 @@ mod tests {
         let mut w = Filter::default();
         w.parse_where("status=503").unwrap();
         assert_eq!(w.apply(&reqs).len(), 10);
+    }
+
+    /// K2-3: `--by stage` grouped a request that spent its time receiving its body under
+    /// `transfer`, and `stage=body` selected nothing.
+    #[test]
+    fn the_body_stage_is_named_body_and_transfer_still_selects_it() {
+        let mut reqs: Vec<ReqRow> = (0..10).map(|i| test_req(i * 1_000, 1_000)).collect();
+        for r in reqs.iter_mut().take(4) {
+            (r.ttfb_us, r.body_us) = (100, 890);
+        }
+        let g = group(&reqs.iter().collect::<Vec<_>>(), By::Stage);
+        let keys: Vec<(&str, u64)> = g
+            .iter()
+            .map(|r| (r.key.as_str(), r.requests_count))
+            .collect();
+        assert_eq!(keys, [("ttfb", 6), ("body", 4)]);
+        for name in ["body", "transfer", "Body"] {
+            let mut f = Filter::default();
+            f.parse_where(&format!("stage={name}")).unwrap();
+            assert_eq!(f.apply(&reqs).len(), 4, "{name}");
+        }
+        let mut f = Filter::default();
+        f.parse_where("stage=ttfb").unwrap();
+        assert_eq!(f.apply(&reqs).len(), 6);
     }
 }

@@ -152,7 +152,7 @@ The options of `read_with` / `reader_with` and `writer_with`; unset means OpenDA
 | `read.chunk` | read in chunks of this size |
 | `read.concurrent` | chunks fetched at once |
 | `read.gap` | merge ranges closer than this into one request |
-| `write.chunk` | multipart part size (OpenDAL clamps it to the service's limits; the profile shows the effective value) |
+| `write.chunk` | multipart part size (OpenDAL clamps it to the service's limits; the profile shows the effective value). Unset, OpenDAL fixes no part size: it buffers up to the service's minimum and sends each write as it comes, so the parts are as large as the caller's writes, and the profile shows the parts that were uploaded |
 | `write.concurrent` | parts uploaded at once |
 
 ## `[http]`
@@ -180,8 +180,10 @@ takes the same paths. The paths: `url`, `options.KEY`, `layers.NAME` (`on`/`off`
 `--set` also takes the workload's keys, the ones without a flag of their own included:
 `concurrency`, `preset`, `duration`, `warmup` (e.g. `--set warmup=2s`), `max_ops`, `rate`,
 `arrivals`, `shape`, `access`, `objects`, `object_size`, `partitions`, `existing`, `persist`,
-`verify`, `cleanup`, `seed` and `mix`; the SLA's `max_error_rate`, `max_throttle_rate`, `p99_ms`
-and `sla`; and the run's `label`.
+`verify`, `cleanup`, `seed` and `mix`; and the run's `label`. There are no limits to set: the
+findings judge a run, an open loop that stalled fails its checks by itself (see
+[reading the profile](reading-the-profile.md#how-it-is-measured)), and `prove --max-throttle`
+bounds the throttling a sized change may cause.
 
 ```bash
 oprobe run op.toml --set layers.concurrent_limit.http=32 --set read.gap=1MiB
