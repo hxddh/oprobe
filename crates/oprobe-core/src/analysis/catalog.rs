@@ -39,10 +39,11 @@ const ENTRIES: &[Entry] = &[
         code: "throttling",
         title: "The service throttles above a number of requests in flight",
         severity: Severity::Critical,
-        meaning: "The service answered 429/503 and the rejections follow the requests in flight (the limit model is in the report's capacity section). OpenDAL's default retry then waits a full second per rejection.",
+        meaning: "The service answered 429/503 and the rejections follow the requests in flight (the limit model is in the report's capacity section). OpenDAL's default retry then waits a full second per rejection. A service that rejects nothing but serves only so many requests at once and queues the rest is the same limit: the time to first byte grows with the requests in flight (a warning, and only when the run varied its load enough to show it).",
         causes: &[
             "more concurrent requests than a bucket, prefix or gateway accepts",
             "several operators or processes sharing one limit",
+            "a service or gateway that queues requests beyond its workers instead of rejecting them",
         ],
     },
     Entry {
@@ -69,9 +70,10 @@ const ENTRIES: &[Entry] = &[
         code: "bandwidth_cap",
         title: "Every stream shares one bandwidth cap",
         severity: Severity::Warning,
-        meaning: "The aggregate throughput is flat while a stream's rate falls as more streams run beside it: a shared cap (a NIC, proxy, endpoint or bucket limit). OpenDAL's ThrottleLayer shapes writes only: the remedy is `layers.throttle.bandwidth` (sized by prove) where the workload writes; on reads the cap is not a layer.",
+        meaning: "The aggregate throughput is flat while a stream's rate falls as more streams run beside it: a shared cap (a NIC, proxy, endpoint or bucket limit), on the response bodies or on the request bodies (a saturated uplink: its slow uploads are the cap's doing, not hung requests). OpenDAL's ThrottleLayer shapes writes only: the remedy is `layers.throttle.bandwidth` (sized by prove) where the workload writes; on reads the cap is not a layer.",
         causes: &[
             "a network link, NAT gateway or proxy at its capacity",
+            "an uplink narrower than the downlink (uploads from an office, a home or a metered egress)",
             "a provider's per-bucket or per-connection bandwidth limit",
         ],
     },
