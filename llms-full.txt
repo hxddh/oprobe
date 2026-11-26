@@ -1603,8 +1603,9 @@ is lost in the noise.
 
 ## Stability
 
-Within 9.x the API documented on docs.rs, the `oprobe.trace/9` file format and the meaning of
-every field are stable: changes are additive. Public structs and enums are `#[non_exhaustive]`,
+Within 9.x the API documented on docs.rs is stable: changes are additive. A trace file is read
+by the oprobe of the version that wrote it; reading the files of another version is not
+promised. Public structs and enums are `#[non_exhaustive]`,
 so read fields freely but build `Config` with its methods. The `__internal` feature exists for the
 oprobe binary and has no semver promise; do not enable it.
 
