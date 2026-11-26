@@ -767,9 +767,6 @@ pub struct Sla {
     /// Turn a breach into exit code 3. Corrupted data (CRC mismatch) is always a breach.
     #[serde(default = "default_true")]
     pub enforce: bool,
-    /// Max acceptable p99 per operation verb (ms); unset = no latency constraint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub p99_ms: Option<f64>,
     /// Max fraction of failed operations (default 0.01 = 1%).
     #[serde(default = "default_error_rate")]
     pub max_error_rate: f64,
@@ -788,7 +785,6 @@ impl Default for Sla {
     fn default() -> Self {
         Self {
             enforce: true,
-            p99_ms: None,
             max_error_rate: default_error_rate(),
             max_throttle_rate: None,
         }
@@ -811,11 +807,6 @@ impl Sla {
             && !(0.0..=1.0).contains(&t)
         {
             return Err(invalid("sla.max_throttle_rate must be within 0..1"));
-        }
-        if let Some(p) = self.p99_ms
-            && !(p.is_finite() && p > 0.0)
-        {
-            return Err(invalid("sla.p99_ms must be > 0"));
         }
         Ok(())
     }

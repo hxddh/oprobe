@@ -700,14 +700,6 @@ mod tests {
         );
     }
 
-    /// 9.1.0's order: one independent coin per pair.
-    fn coin_9_1(seed: u64, pair: u64) -> bool {
-        let mut z = seed.wrapping_add((pair + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        (z ^ (z >> 31)) >> 63 == 1
-    }
-
     #[test]
     fn the_ab_order_is_balanced_in_blocks_drawn_from_the_seed() {
         let orders = |seed: u64| {
@@ -737,11 +729,6 @@ mod tests {
         );
         assert!((0..100u64).any(|s| candidate_first(s, 0) != candidate_first(s, 2)));
         assert_ne!(orders(1), orders(2));
-        // 9.1's coin ran the first three pairs in one order for about a seed in four.
-        let same = (0..1000u64)
-            .filter(|s| coin_9_1(*s, 0) == coin_9_1(*s, 1) && coin_9_1(*s, 1) == coin_9_1(*s, 2))
-            .count();
-        assert!((200..=300).contains(&same), "{same}");
     }
 
     #[test]
@@ -1003,71 +990,6 @@ mod tests {
                     w.verdict_rate(77_000 + 10 * max_pairs as u64 + i as u64, 2000, max_pairs);
                 assert!(rate <= 0.05, "{max_pairs} pairs, carry {k} σ: {rate}");
             }
-        }
-    }
-
-    /// 9.1.0's rule on pairs drawn by `next(pair index)` (signed log ratios aside, the same
-    /// floor): an SPRT with the whole alpha on each side, its effect and spread plugged in
-    /// anew at each look; a stop as soon as it agrees with a fixed-sample Student interval; and
-    /// that interval deciding alone when the SPRT did not. Returns whether a change was called.
-    fn rule_9_1(max_pairs: usize, mut next: impl FnMut(u64) -> AbPair) -> bool {
-        let (mut a, mut b, mut d) = (Vec::new(), Vec::new(), Vec::new());
-        loop {
-            let p = next(a.len() as u64);
-            a.push(p.baseline);
-            b.push(p.candidate);
-            d.push((p.candidate / p.baseline).ln());
-            let n = d.len();
-            let floor = noise_floor_ab(&a, &b, 0.0);
-            let (mean, var) = mean_var(&d);
-            let sd = var.sqrt().max(floor);
-            let sprt = if n >= MIN_DECISIVE_PAIRS {
-                Sprt::new((2.0 * floor).max(MIN_EFFECT), 0.10, 0.10).decision(
-                    1.0 / n as f64,
-                    mean,
-                    sd,
-                )
-            } else {
-                SprtDecision::Continue
-            };
-            let half = t975(n as f64 - 1.0) * sd / (n as f64).sqrt();
-            let excludes_zero = n >= MIN_DECISIVE_PAIRS && mean.abs() > half;
-            let agrees = match sprt {
-                SprtDecision::Better | SprtDecision::Worse => excludes_zero,
-                SprtDecision::Same => true,
-                SprtDecision::Continue => false,
-            };
-            if agrees || n >= max_pairs {
-                let decided = matches!(sprt, SprtDecision::Better | SprtDecision::Worse);
-                return excludes_zero && (decided || mean.abs() > floor);
-            }
-        }
-    }
-
-    #[test]
-    fn the_9_1_rule_called_an_order_effect_a_change() {
-        // No change; the second trial of a pair runs 4 σ better (a warm cache, a refilled
-        // bucket). 9.1's independent coins put most pairs of a short proof in one order often
-        // enough, and its unadjusted interval then calls the order effect a change, in 15 to
-        // 25 % of proofs; the balanced schedule and the crossover estimate do not.
-        let w = World {
-            sigma: 0.05,
-            effect: 0.0,
-            carry: 0.20,
-        };
-        let proofs = 4000;
-        for max_pairs in [3, 6, 12] {
-            let mut rng = SmallRng::seed_from_u64(9100 + max_pairs as u64);
-            let old = (0..proofs)
-                .filter(|_| {
-                    let seed = rng.r#gen::<u64>();
-                    rule_9_1(max_pairs, |i| w.pair(&mut rng, coin_9_1(seed, i)))
-                })
-                .count() as f64
-                / proofs as f64;
-            assert!(old > 0.10, "{max_pairs} pairs: 9.1 called {old}");
-            let new = w.verdict_rate(9100 + max_pairs as u64, proofs, max_pairs);
-            assert!(new <= 0.05, "{max_pairs} pairs: {new}");
         }
     }
 

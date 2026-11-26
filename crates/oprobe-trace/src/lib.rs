@@ -73,8 +73,8 @@
 //!
 //! # Stability
 //!
-//! The items documented here, the `.oprobe` format and the meaning of every field are stable
-//! across 9.x: changes are additive, and public structs and enums are `#[non_exhaustive]`. The
+//! The items documented here are stable across 9.x: changes are additive, and public structs
+//! and enums are `#[non_exhaustive]`. A trace file is read by the version that wrote it. The
 //! `__internal` feature exists for the oprobe binary only and carries no semver promise.
 
 // Half of the recorder (operation scopes, the whole-operation sampler, key dimensions, the

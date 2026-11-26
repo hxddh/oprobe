@@ -259,22 +259,11 @@ mod tests {
         .unwrap()
     }
 
-    /// The `service` of every 9.x file reads: 9.0 to 9.2 always wrote the instrumented
-    /// client's `http_version` and `keep_alive`; 9.3 leaves them out, and says
-    /// `http_transport`, when the operator's own transport carried the requests. A 9.2 reader
-    /// takes its defaults for what is left out.
+    /// The `service` of an operator that kept its own transport says `http_transport` and
+    /// leaves out the instrumented client's `http_version` and `keep_alive`.
     #[test]
-    fn the_service_of_every_9x_file_reads() {
+    fn the_service_of_a_kept_transport_round_trips() {
         let read = |json: &str| serde_json::from_str::<ServiceRecord>(json).unwrap();
-        let old = read(
-            r#"{"scheme":"s3","name":"b","root":"/","http_version":"h2","keep_alive":false,"max_inflight_count":8}"#,
-        );
-        assert_eq!(old.http_version, Some(crate::HttpVersion::H2));
-        assert_eq!((old.keep_alive, old.max_inflight_count), (Some(false), Some(8)));
-        assert!(!old.keeps_http_transport());
-        let bare = read(r#"{"scheme":"memory"}"#);
-        assert_eq!((bare.http_version, bare.keep_alive), (None, None));
-
         let kept = ServiceRecord {
             scheme: "s3".into(),
             name: "b".into(),

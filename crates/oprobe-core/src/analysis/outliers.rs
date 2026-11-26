@@ -135,16 +135,6 @@ impl Stage {
         }
     }
 
-    /// The stage `name` names. `transfer` is what 9.2 and earlier called `body` in
-    /// `--by stage` and in the attribution; it is still understood.
-    pub fn parse(name: &str) -> Option<Stage> {
-        let name = name.trim().to_ascii_lowercase();
-        if name == "transfer" {
-            return Some(Stage::Body);
-        }
-        Stage::ALL.into_iter().find(|s| s.name() == name)
-    }
-
     /// The time `r` spent in this stage (µs).
     pub fn us(self, r: &ReqRow) -> u64 {
         match self {
@@ -613,18 +603,11 @@ mod tests {
         assert!(rank_correlation(&[(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]) > 0.99);
     }
 
-    /// K2-3: one name per stage for every consumer. 9.2 called the body stage `transfer` here
-    /// and `body` in the findings, the tail split and the report's fields.
+    /// K2-3: one name per stage for every consumer.
     #[test]
-    fn a_stage_has_one_name_and_the_old_one_is_still_understood() {
+    fn a_stage_has_one_name() {
         let names: Vec<&str> = Stage::ALL.iter().map(|s| s.name()).collect();
         assert_eq!(names, ["queue", "connect", "send", "ttfb", "body", "stall"]);
-        for s in Stage::ALL {
-            assert_eq!(Stage::parse(s.name()), Some(s));
-        }
-        assert_eq!(Stage::parse("transfer"), Some(Stage::Body));
-        assert_eq!(Stage::parse(" TTFB "), Some(Stage::Ttfb));
-        assert_eq!(Stage::parse("server"), None);
         let mut r = test_req(0, 9_000);
         assert_eq!(Stage::dominant(&r), Stage::Ttfb);
         (r.ttfb_us, r.body_us) = (1_000, 7_990);

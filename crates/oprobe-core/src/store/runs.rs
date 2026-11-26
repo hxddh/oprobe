@@ -811,30 +811,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// A run file written by oprobe 9.1.0 itself (`oprobe run lab://throttle -d 400ms -c 4
-    /// --objects 8 --object-size 4KiB --set warmup=0s`): later versions read it as it is,
-    /// within the limits of what a run file may decode to.
-    #[test]
-    fn a_run_file_written_by_9_1_0_still_loads() {
-        let bytes = include_bytes!("testdata/run-9.1.0.oprobe");
-        let run = decode_run(&bytes[..]).unwrap();
-        assert_eq!(run.report.run.id, "20261126-013555-ab60");
-        assert_eq!(run.report.run.oprobe_version, "9.1.0");
-        assert_eq!(run.report.spec.operator_ref, "lab://throttle");
-        assert_eq!((run.ops.len(), run.reqs.len()), (229, 229));
-        assert_eq!(run.report.summary.ops, 229);
-        assert!(
-            run.ops
-                .iter()
-                .all(|o| !o.key.is_empty() && o.latency_us > 0)
-        );
-        assert!(
-            run.reqs
-                .iter()
-                .all(|q| matches!(q.method.as_ref(), "GET" | "HEAD" | "PUT"))
-        );
-    }
-
     use crate::model::*;
 
     pub(crate) fn sample_run(id: &str, label: Option<&str>) -> Run {

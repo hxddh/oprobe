@@ -514,10 +514,6 @@ pub struct SlaInfo {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_throttle_ratio: Option<f64>,
-    /// A p99 limit of a 9.2 report. Nothing sets or checks one since 9.3 (an open loop that
-    /// stalled fails its checks without a limit); the field stays so that those reports read.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub p99_ms: Option<f64>,
 }
 
 impl From<&crate::config::Sla> for SlaInfo {
@@ -526,7 +522,6 @@ impl From<&crate::config::Sla> for SlaInfo {
             enforced: s.enforce,
             max_error_ratio: s.max_error_rate,
             max_throttle_ratio: s.max_throttle_rate,
-            p99_ms: None,
         }
     }
 }
@@ -893,7 +888,6 @@ pub fn evidence_label(key: &str, v: f64) -> (String, String) {
         "typical_ttfb_ms" => Some("Typical time to first byte"),
         "median_request_ms" => Some("Median request"),
         "slowest_request_ms" => Some("Slowest request"),
-        // `_pct`: reports of 9.2 and earlier.
         "body_pct" | "body_time_ratio" => Some("Time receiving the body"),
         "upload_pct" | "upload_time_ratio" => Some("Time uploading"),
         "busiest_inflight_count" => Some("Busiest level (in flight)"),

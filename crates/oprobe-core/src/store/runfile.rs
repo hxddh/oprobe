@@ -217,12 +217,7 @@ impl IntervalBlock {
         Self {
             t_s: p.t_s,
             len_s: len,
-            // Exact since 6.3; earlier timelines only carry the rate.
-            ops_count: if p.ops_count > 0 {
-                p.ops_count
-            } else {
-                (p.ops_per_s * len).round().max(0.0) as u64
-            },
+            ops_count: p.ops_count,
             errors_count: p.errors,
             throttled_count: p.throttled,
             transferred_bytes: (p.mib_per_s * len * 1024.0 * 1024.0).round().max(0.0) as u64,

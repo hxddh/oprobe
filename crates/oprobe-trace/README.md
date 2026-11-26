@@ -48,8 +48,8 @@ handle.save("prod.oprobe")?; // then: oprobe show prod.oprobe
   month-long timeline keeps under 2 000 intervals.
 - **Cheap:** `cargo bench -p oprobe-trace --bench overhead` compares the same operations with
   and without the layer; the budget is 2 µs per operation.
-- **Stable:** the documented API, the file format and the meaning of every field are stable
-  across 9.x; public structs and enums are `#[non_exhaustive]`.
+- **Stable:** the documented API is stable across 9.x; public structs and enums are
+  `#[non_exhaustive]`. A trace file is read by the version that wrote it.
 - **Requires:** OpenDAL 0.59, Tokio, Rust 1.91 (OpenDAL 0.59's own minimum).
 
 Features: `otel` (OpenTelemetry metrics), `schemars` (`JsonSchema` for the snapshot types).

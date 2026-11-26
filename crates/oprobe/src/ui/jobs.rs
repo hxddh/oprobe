@@ -48,9 +48,6 @@ pub struct Proved {
     pub ab: Vec<AbPair>,
     /// The A/B pairs the prove planned at most (the boundary of its interval).
     pub max_pairs: usize,
-    /// The result says what it planned: `delta` is the sequential interval of that plan. A
-    /// result of 9.1 or earlier does not: its `delta` is a fixed-sample interval.
-    pub sequential: bool,
     /// Last completed A/B pair's stored `(baseline_run_id, candidate_run_id)`, for Compare.
     pub trial_ids: Option<(String, String)>,
     /// The other metrics (shown, never decisive).
@@ -87,7 +84,6 @@ impl Proved {
         });
         let max_pairs = p.planned_pairs();
         Self {
-            sequential: p.pairs_max_count.is_some(),
             prove_id: p.prove_id,
             run_id: p.run_id,
             objective: p.objective,
