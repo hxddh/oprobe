@@ -1126,6 +1126,13 @@ impl Source {
 /// Arrivals that fell behind a constant pace go out at most this many at once.
 const CATCH_UP_BURST: u32 = 4;
 
+/// How late a timer may wake, with margin (Tokio's timer ticks in milliseconds, and a busy
+/// runtime wakes later). A pace faster than this dispatches every arrival due at each wake:
+/// held to [`CATCH_UP_BURST`], 9.3.3 reached about 4 000 of `--rate 20000`, and reported the
+/// shortfall as latency and missed arrivals. (At 2 ms the schedule still lagged 15 ms behind
+/// at 20 000/s; at 5 ms a constant pace keeps up as well as Poisson arrivals do.)
+const TIMER_RESOLUTION: Duration = Duration::from_millis(5);
+
 /// The dispatch shaper of a constant pace (GCRA): the next dispatch may happen at the
 /// theoretical arrival time less `CATCH_UP_BURST − 1` gaps. On-time arrivals (one per gap) are
 /// never held; a backlog left by a late timer or a stall leaves in a burst of at most
@@ -1133,17 +1140,25 @@ const CATCH_UP_BURST: u32 = 4;
 #[derive(Clone, Copy, Debug)]
 struct Pacer {
     gap: Duration,
+    /// Dispatches that may leave at once: [`CATCH_UP_BURST`], or the arrivals due in one
+    /// [`TIMER_RESOLUTION`] when the pace is faster than the timer can wake for each.
+    burst: u32,
     tat: Option<Instant>,
 }
 
 impl Pacer {
     fn new(gap: Duration) -> Self {
-        Self { gap, tat: None }
+        let per_wake = (TIMER_RESOLUTION.as_secs_f64() / gap.as_secs_f64().max(1e-9)).ceil();
+        Self {
+            gap,
+            burst: CATCH_UP_BURST.max(per_wake.min(f64::from(u32::MAX)) as u32),
+            tat: None,
+        }
     }
 
     /// The earliest time the next dispatch may happen (`None`: now).
     fn earliest(&self) -> Option<Instant> {
-        let tolerance = self.gap * (CATCH_UP_BURST - 1);
+        let tolerance = self.gap.saturating_mul(self.burst - 1);
         self.tat.map(|t| t.checked_sub(tolerance).unwrap_or(t))
     }
 
@@ -1178,6 +1193,25 @@ mod tests {
         for w in at[4..].windows(2) {
             assert_eq!(w[1] - w[0], gap);
         }
+    }
+    /// E1: a pace faster than the timer keeps up: each wake dispatches what is due.
+    #[test]
+    fn a_pace_faster_than_the_timer_keeps_up() {
+        let gap = Duration::from_micros(50); // 20 000/s
+        let mut p = Pacer::new(gap);
+        let t = Instant::now();
+        let mut sent = 0u32;
+        // The timer wakes once a millisecond: 20 arrivals are due at each wake.
+        for ms in 0..100u32 {
+            let now = t + Duration::from_millis(u64::from(ms));
+            while p.earliest().is_none_or(|e| e <= now) && sent < (ms + 1) * 20 {
+                p.dispatched(now);
+                sent += 1;
+            }
+        }
+        assert_eq!(sent, 2_000, "every arrival due went out");
+        // A slow pace keeps the small catch-up burst.
+        assert_eq!(Pacer::new(Duration::from_millis(4)).burst, CATCH_UP_BURST);
     }
     use crate::config::Arrivals;
 

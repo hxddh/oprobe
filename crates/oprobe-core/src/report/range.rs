@@ -213,7 +213,11 @@ impl RangeView {
         let hi = if window > 0.0 { hi.min(window) } else { hi };
         let span = (hi - lo).max(1e-3);
         let (lo_us, hi_us) = ((lo * 1e6) as i64, (hi * 1e6) as i64);
-        let inside = |t: i64| t >= lo_us && t < hi_us;
+        // A range to the end of the window keeps what was sent after it (the retries of its
+        // operations, as they drain), as the whole run does and its timeline's last interval:
+        // 9.3.3 dropped them, and `--since 0s` disagreed with the run it is all of.
+        let to_end = window > 0.0 && hi >= window;
+        let inside = |t: i64| t >= lo_us && (t < hi_us || to_end);
         let w = run.op_weights();
         let weight = |id: u64| w.get(&id).copied().unwrap_or(1.0);
         let s = &run.report.sampling;
@@ -619,6 +623,22 @@ mod tests {
         // The whole window, and an empty range.
         assert_eq!(RangeView::of(&run, 0.0, 10.0).ops_count, 100);
         assert!(RangeView::of(&run, 20.0, 30.0).is_empty());
+    }
+
+    /// A2: a range to the end of the window keeps the requests sent after it (an operation
+    /// of the window retried as it drained), as the whole run does: 9.3.3 dropped them.
+    #[test]
+    fn a_range_to_the_end_keeps_what_drained_after_the_window() {
+        let mut run = run();
+        run.report.run.window_s = 10.0;
+        // The last operation's retry went out 0.2 s after the window closed.
+        let mut late = fixture::req(100, 10_200_000, 200, true);
+        late.attempt = 2;
+        run.reqs.push(late);
+        assert_eq!(RangeView::of(&run, 0.0, 10.0).requests_count, 121);
+        assert_eq!(RangeView::of(&run, 9.0, f64::INFINITY).requests_count, 13);
+        // A range that ends inside the window does not.
+        assert_eq!(RangeView::of(&run, 9.0, 9.95).requests_count, 12);
     }
 
     /// K2-11. A range of an open-loop run read its percentiles from the operations that
