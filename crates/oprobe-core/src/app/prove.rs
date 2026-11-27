@@ -3700,7 +3700,10 @@ mod tests {
         let sec = secondary(ProveObjective::Goodput, &a, &b);
         let p99 = sec.iter().find(|m| m.metric == "p99_ms").unwrap();
         let width = |i: &Interval| i.high.ln_1p() - i.low.ln_1p();
-        assert!(width(&p99.change) > width(&goodput.change), "{p99:?} {goodput:?}");
+        assert!(
+            width(&p99.change) > width(&goodput.change),
+            "{p99:?} {goodput:?}"
+        );
         assert!(p99.change.high < 0.0, "{p99:?}");
     }
 
