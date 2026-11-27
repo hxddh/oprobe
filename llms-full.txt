@@ -900,7 +900,7 @@ from the config file's `[operators.NAME]` also works.
 | `-d, --duration DURATION` | the measurement window (`30s`, `2m`) |
 | `--objects N` | dataset objects to generate |
 | `--object-size SIZE` | size of each generated object (`16MiB`) |
-| `--rate OPS` | open-loop arrival rate (operations per second); latency counts from the intended start |
+| `--rate OPS` | open-loop arrival rate (operations per second, 0.001 to 1 000 000); latency counts from the intended start |
 | `--existing PREFIX` | profile the objects already under `PREFIX`; writes nothing (implies `--read-only`) |
 | `--seed N` | seed of the workload's random choices |
 | `--set PATH=VALUE` | change one value of the operator or the workload, repeatable (`--set layers.retry.max_times=5`, `--set read.gap=1MiB`, `--set layers.cache=off`; [paths](operator.md#--set)) |
@@ -911,8 +911,8 @@ from the config file's `[operators.NAME]` also works.
 |---|---|
 | `--dry-run` | print the plan (requests, bytes, objects written and deleted, ETA, budgets; a warning when it would spend one) and exit (`-o json`: `schemas/plan.json`) |
 | `--read-only` | refuse every write and delete (exit 5) |
-| `--max-requests N` | send at most this many HTTP requests to the target, retries and the dataset upload included; the next one is not sent (exit 4) |
-| `--max-bytes SIZE` | transfer at most this many body bytes, up and down, e.g. `10GiB`; a request body that does not fit is not sent, a download is cut where it crosses the budget (exit 4) |
+| `--max-requests N` | send at most this many HTTP requests to the target (calls, for `fs://` and `memory://`), retries and the dataset upload included; the next one is not sent (exit 4) |
+| `--max-bytes SIZE` | transfer at most this many body bytes, up and down, e.g. `10GiB`; a request body that does not fit is not sent, a download is cut where it crosses the budget, and a dataset larger than the budget is refused before it is uploaded (exit 4) |
 | `--max-duration DURATION` | stop after this much wall time, e.g. `5m` (exit 4) |
 
 A budget that stops a run cuts what is in flight, aborts the multipart uploads it interrupted,
@@ -2155,6 +2155,11 @@ change with `oprobe prove`.
 An operator file or the config file does not parse, or has an invalid value (an unknown key, a
 size that does not parse). The message names the key.
 
+"`op.toml` now names …, not the operator the run used": `prove` replays a stored run with the
+secrets of the operator it was run with, and the operator file or configured operator it names
+now has another URL or endpoint. Its keys are not sent to the run's endpoint. Put the file back
+as the run had it, or start a new run with the operator you mean.
+
 <a id="config-unknown_option"></a>
 ### `config.unknown_option` (exit 2)
 
@@ -2241,13 +2246,15 @@ preset.
 A budget (`--max-requests`, `--max-bytes`, `--max-duration`, or `[defaults.budgets]`) stopped the
 command. Budgets cover the whole command: every operator of `run`, every trial of `prove`, and
 every HTTP request sent to the target before cleanup (the preflight, the dataset upload and
-retries included). The request the budget had no room for was not sent, the operations in flight
+retries included; for `fs://` and `memory://`, every call of the service). The request the budget had no room for was not sent, the operations in flight
 were cut, their multipart uploads aborted, the partial run saved and the test data cleaned up.
 When the budget runs out during the preflight or the dataset upload there is no run to save (and
 nothing is left on the target: the preflight's probe object is deleted outside the budget).
 "the next request (8.0 MiB) does not fit the byte budget: 1 B of 4.0 MiB used" means
 `--max-bytes` is smaller than one request body (a multipart part, an object): raise it above
-that size. Raise the budget or shorten the run; `--dry-run` shows the estimates.
+that size. "the dataset alone (…) does not fit the byte budget" means the objects to upload are
+larger than `--max-bytes`: nothing was uploaded. Lower `--objects` or `--object-size`, or raise
+the budget. Raise the budget or shorten the run; `--dry-run` shows the estimates.
 
 <a id="safety-read_only"></a>
 ### `safety.read_only` (exit 5)

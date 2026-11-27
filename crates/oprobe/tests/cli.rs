@@ -478,8 +478,9 @@ fn safety_rails_refuse_or_stop_runs() {
         "5s",
         "--warmup",
         "0s",
+        // The dataset's upload (about 260 requests) is charged too: the window gets the rest.
         "--max-requests",
-        "50",
+        "400",
         "-o",
         "json",
     ]);
@@ -488,7 +489,7 @@ fn safety_rails_refuse_or_stop_runs() {
     // It stops at the limit, not one past it.
     let msg = json(&o)["error"]["message"].as_str().unwrap().to_owned();
     assert!(
-        msg.contains("(limit 50)") && !msg.contains("51 requests"),
+        msg.contains("(limit 400)") && !msg.contains("401 requests"),
         "{msg}"
     );
     // The partial run is Review (not Critical), leads with why it cannot be judged, and
@@ -1255,8 +1256,9 @@ fn a_budget_stop_prints_the_runs_it_let_finish() {
         "5s",
         "--warmup",
         "0s",
+        // Enough for the first operator's dataset upload (about 260 requests) and a window.
         "--max-requests",
-        "50",
+        "400",
     ];
     let o = env.run(&args);
     assert_eq!(code(&o), 4, "{}", stderr(&o));

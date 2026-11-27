@@ -163,9 +163,12 @@ pub fn spec_profile(ctx: &Ctx, spec: crate::model::RunSpec) -> Result<Profile> {
     // Secrets were redacted: take them from where the operator came from when that still
     // resolves (a configured operator, an operator file), else drop them (the environment's
     // credentials apply).
-    let known = crate::operator::resolve::resolve(&spec.operator_ref, &*ctx.config()?)
-        .ok()
-        .map(|(o, _)| o.options);
+    let known = crate::operator::resolve::replayed_operator(
+        &spec.operator_ref,
+        &spec.profile.operator,
+        &*ctx.config()?,
+    )?
+    .map(|o| o.options);
     p.operator.options = p
         .operator
         .options

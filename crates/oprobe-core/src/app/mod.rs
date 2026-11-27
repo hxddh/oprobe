@@ -409,18 +409,26 @@ impl App {
     /// default operator of a URL: [`RunSpec::replay_on`]), under the same label. Secrets are
     /// not in a spec: they come from where the operator does (its file, the config file, the
     /// environment), as for any run. A reference that no longer resolves is kept as it is
-    /// (running it says so), its values those that differ from its URL's defaults.
+    /// (running it says so), its values those that differ from its URL's defaults. One that
+    /// now names another operator (another URL or endpoint) is replaced by the run's own URL:
+    /// that operator's credentials are never sent to the run's endpoint.
     pub fn replaying(&self, spec: &RunSpec) -> RunRequest {
-        let given = self
-            .config()
-            .ok()
-            .and_then(|cfg| crate::operator::resolve::resolve(&spec.operator_ref, &cfg).ok());
-        let (workload, set) = match &given {
-            Some((operator, _)) => spec.replay_on(operator),
-            None => spec.replay(),
+        let given = self.config().ok().map(|cfg| {
+            crate::operator::resolve::replayed_operator(
+                &spec.operator_ref,
+                &spec.profile.operator,
+                &cfg,
+            )
+        });
+        let (operator, (workload, set)) = match &given {
+            Some(Ok(Some(operator))) => (spec.operator_ref.clone(), spec.replay_on(operator)),
+            // The reference names another operator now: run the run's own URL, with its
+            // values, and none of that operator's credentials.
+            Some(Err(_)) => (spec.profile.operator.url.clone(), spec.replay()),
+            _ => (spec.operator_ref.clone(), spec.replay()),
         };
         RunRequest {
-            operators: vec![spec.operator_ref.clone()],
+            operators: vec![operator],
             workload,
             set,
             label: spec.label.clone(),
@@ -444,7 +452,7 @@ impl App {
                 Ok(Resolved {
                     profile,
                     target_name: source.name(),
-                    operator_ref: op.clone(),
+                    operator_ref: crate::operator::resolve::stored_ref(op),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -648,6 +656,61 @@ mod tests {
             data_dir: d.join("data"),
         });
         (app, file.display().to_string())
+    }
+
+    /// S1: a replay never sends the credentials of an operator other than the run's. 9.3.3
+    /// stored an operator file as typed and took every redacted secret from whatever file the
+    /// reference named at replay time (another directory's `op.toml`, or the file edited to
+    /// another bucket), and sent it to the run's endpoint.
+    #[test]
+    fn a_replay_takes_secrets_only_from_the_operator_the_run_used() {
+        let d = tempfile::tempdir().unwrap();
+        let (app, _) = app_with_operators(d.path());
+        let file = d.path().join("keys.toml");
+        let write = |url: &str, key: &str| {
+            std::fs::write(
+                &file,
+                format!(
+                    "url = \"{url}\"\n\n[options]\nendpoint = \"http://127.0.0.1:9000\"\n\
+                     access_key_id = \"{key}\"\nsecret_access_key = \"{key}-secret\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        write("s3://mine/data", "MYKEY");
+        // A relative reference is stored as the file's canonical path.
+        let rel = d.path().join("sub/../keys.toml").display().to_string();
+        std::fs::create_dir_all(d.path().join("sub")).unwrap();
+        let run = app.resolve(&RunRequest::new([rel])).unwrap().remove(0);
+        let spec = run.spec();
+        assert_eq!(
+            spec.operator_ref,
+            std::fs::canonicalize(&file).unwrap().display().to_string()
+        );
+        let ctx = app.ctx(&EventSink::silent());
+        // The same operator: its secrets come back.
+        let p = profile::spec_profile(&ctx, spec.clone()).unwrap();
+        assert_eq!(p.operator.options.get("access_key_id").unwrap(), "MYKEY");
+        // The file now names another bucket with other keys: they are not taken.
+        write("s3://theirs/data", "OTHERPROJECTKEY");
+        let e = profile::spec_profile(&ctx, spec.clone()).unwrap_err();
+        assert!(
+            e.to_string().contains("not the operator the run used"),
+            "{e}"
+        );
+        let again = app.replaying(&spec);
+        assert_eq!(again.operators, vec!["s3://mine/data".to_owned()]);
+        let replayed = app.resolve(&again).unwrap().remove(0);
+        assert!(
+            replayed
+                .profile
+                .operator
+                .options
+                .values()
+                .all(|v| !v.contains("OTHERPROJECTKEY")),
+            "{:?}",
+            replayed.profile.operator.options
+        );
     }
 
     /// Every leaf of `v` as `(path, value)`.

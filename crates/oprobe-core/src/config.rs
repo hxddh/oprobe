@@ -777,6 +777,15 @@ pub struct Sla {
     pub max_throttle_rate: Option<f64>,
 }
 
+/// The lowest open-loop rate (operations per second): one arrival in under 17 minutes. Below
+/// it the gap between arrivals no longer fits a run (9.3.3 panicked on `--rate 1e-20`, after
+/// the dataset was uploaded, and left it on the target).
+pub const MIN_RATE: f64 = 1e-3;
+/// The highest open-loop rate (operations per second): one arrival a microsecond. Far above
+/// what one client sends, and far from the nanosecond at which the arrival clock could no
+/// longer advance (9.3.3 spun for ever on `--rate 1e9`, deaf to Ctrl-C and SIGTERM).
+pub const MAX_RATE: f64 = 1e6;
+
 fn default_error_rate() -> f64 {
     0.01
 }
@@ -1454,9 +1463,18 @@ impl Profile {
             ));
         }
         if let Some(r) = w.rate
-            && !(r.is_finite() && r > 0.0)
+            && !(r.is_finite() && (MIN_RATE..=MAX_RATE).contains(&r))
         {
-            return Err(invalid("workload.rate must be > 0"));
+            return Err(invalid(format!(
+                "workload.rate must be between {MIN_RATE} and {MAX_RATE:.0} operations per second"
+            )));
+        }
+        if let Some(peak) = w.peak_rate()
+            && !(peak.is_finite() && peak <= MAX_RATE)
+        {
+            return Err(invalid(format!(
+                "the rate shape peaks at {peak} operations per second: at most {MAX_RATE:.0}"
+            )));
         }
         let ds = w.effective_dataset();
         let mix = w.effective_mix();
@@ -1499,6 +1517,39 @@ impl Profile {
 
 #[cfg(test)]
 mod tests {
+    /// S2/S3: an open-loop rate the arrival clock cannot represent is refused when the run is
+    /// planned, before any dataset is uploaded (9.3.3: `1e9` spun past every stop signal,
+    /// `1e-20` panicked after the upload and left the dataset behind).
+    #[test]
+    fn an_open_loop_rate_is_bounded() {
+        let mut p = Profile::from_operator(crate::operator::OperatorSpec::from_url("memory://"));
+        for bad in [
+            1e9,
+            MAX_RATE * 1.01,
+            1e-20,
+            MIN_RATE / 2.0,
+            0.0,
+            f64::INFINITY,
+        ] {
+            p.workload.rate = Some(bad);
+            assert!(p.validate().is_err(), "rate {bad} was accepted");
+        }
+        for good in [MIN_RATE, 1.0, 250.0, MAX_RATE] {
+            p.workload.rate = Some(good);
+            p.validate().unwrap_or_else(|e| panic!("rate {good}: {e}"));
+        }
+        p.workload.rate = Some(10.0);
+        p.workload.shape = Some(crate::engine::schedule::RateShape::Ramp {
+            from: 1.0,
+            to: 5e6,
+            over: std::time::Duration::from_secs(1),
+        });
+        assert!(
+            p.validate().is_err(),
+            "a shape peaking past MAX_RATE was accepted"
+        );
+    }
+
     use super::*;
 
     #[test]

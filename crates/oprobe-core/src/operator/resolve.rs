@@ -34,6 +34,64 @@ pub fn operator_file_path(arg: &str) -> Option<PathBuf> {
     ((arg.ends_with(".toml") || path.is_file()) && path.is_file()).then(|| path.to_path_buf())
 }
 
+/// Whether `given`, what a run's operator reference resolves to now, is `used`, the operator
+/// the run used (as its spec stores it): the same service URL, and the same endpoint when
+/// `given` names one (a run may have set the endpoint of a reference that names none). A
+/// replay takes the redacted secrets back from `given` only when it is, so a reference that
+/// now names another operator (an operator file edited since, or a relative path resolved
+/// from another directory) never sends that operator's keys to the run's endpoint.
+pub fn same_operator(given: &OperatorSpec, used: &OperatorSpec) -> bool {
+    crate::util::redact_url(&given.url) == crate::util::redact_url(&used.url)
+        && given
+            .options
+            .get("endpoint")
+            .is_none_or(|e| used.options.get("endpoint") == Some(e))
+}
+
+/// The reference a run stores for `arg`: an operator file by its canonical absolute path (a
+/// relative path would name another file from another directory), anything else as given.
+pub fn stored_ref(arg: &str) -> String {
+    operator_file_path(arg)
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| arg.to_owned())
+}
+
+/// What a stored run's `operator_ref` names now, for replaying the run that used `used`: the
+/// operator, when the reference resolves to `used` ([`same_operator`]); `None` when it no
+/// longer resolves; an error when it resolves to another operator.
+pub fn replayed_operator(
+    operator_ref: &str,
+    used: &OperatorSpec,
+    cfg: &ConfigFile,
+) -> Result<Option<OperatorSpec>, OprobeError> {
+    let Ok((given, _)) = resolve(operator_ref, cfg) else {
+        return Ok(None);
+    };
+    if operator_ref.contains("://") || same_operator(&given, used) {
+        return Ok(Some(given));
+    }
+    let endpoint = |o: &OperatorSpec| {
+        o.options
+            .get("endpoint")
+            .map(|e| format!(" at {e}"))
+            .unwrap_or_default()
+    };
+    Err(OprobeError::new(
+        ErrorCode::ConfigInvalid,
+        format!(
+            "`{operator_ref}` now names {}{}, not the operator the run used ({}{}): its credentials are not sent to the run's endpoint",
+            crate::util::redact_url(&given.url),
+            endpoint(&given),
+            crate::util::redact_url(&used.url),
+            endpoint(used),
+        ),
+    )
+    .with_hint(format!(
+        "restore `{operator_ref}` to the operator the run used, or start a new run with the operator you mean"
+    )))
+}
+
 /// Resolve `arg` to an operator spec.
 pub fn resolve(arg: &str, cfg: &ConfigFile) -> Result<(OperatorSpec, OperatorSource), OprobeError> {
     let arg = arg.trim();

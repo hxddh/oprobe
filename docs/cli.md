@@ -45,7 +45,7 @@ from the config file's `[operators.NAME]` also works.
 | `-d, --duration DURATION` | the measurement window (`30s`, `2m`) |
 | `--objects N` | dataset objects to generate |
 | `--object-size SIZE` | size of each generated object (`16MiB`) |
-| `--rate OPS` | open-loop arrival rate (operations per second); latency counts from the intended start |
+| `--rate OPS` | open-loop arrival rate (operations per second, 0.001 to 1 000 000); latency counts from the intended start |
 | `--existing PREFIX` | profile the objects already under `PREFIX`; writes nothing (implies `--read-only`) |
 | `--seed N` | seed of the workload's random choices |
 | `--set PATH=VALUE` | change one value of the operator or the workload, repeatable (`--set layers.retry.max_times=5`, `--set read.gap=1MiB`, `--set layers.cache=off`; [paths](operator.md#--set)) |
@@ -56,8 +56,8 @@ from the config file's `[operators.NAME]` also works.
 |---|---|
 | `--dry-run` | print the plan (requests, bytes, objects written and deleted, ETA, budgets; a warning when it would spend one) and exit (`-o json`: `schemas/plan.json`) |
 | `--read-only` | refuse every write and delete (exit 5) |
-| `--max-requests N` | send at most this many HTTP requests to the target, retries and the dataset upload included; the next one is not sent (exit 4) |
-| `--max-bytes SIZE` | transfer at most this many body bytes, up and down, e.g. `10GiB`; a request body that does not fit is not sent, a download is cut where it crosses the budget (exit 4) |
+| `--max-requests N` | send at most this many HTTP requests to the target (calls, for `fs://` and `memory://`), retries and the dataset upload included; the next one is not sent (exit 4) |
+| `--max-bytes SIZE` | transfer at most this many body bytes, up and down, e.g. `10GiB`; a request body that does not fit is not sent, a download is cut where it crosses the budget, and a dataset larger than the budget is refused before it is uploaded (exit 4) |
 | `--max-duration DURATION` | stop after this much wall time, e.g. `5m` (exit 4) |
 
 A budget that stops a run cuts what is in flight, aborts the multipart uploads it interrupted,

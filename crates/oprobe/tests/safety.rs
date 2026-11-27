@@ -858,3 +858,97 @@ fn sigterm_stops_the_terminal_app() {
     assert_eq!(status.code(), Some(130), "{status:?}");
     drop(drawn);
 }
+
+/// S4: a service without an HTTP transport (`fs://`, `memory://`) has no gate in its
+/// transport. In 9.3.3 its dataset upload was charged nowhere: with `--max-requests 10` and
+/// cleanup off, a run wrote all 50 objects, measured and exited 0 with 57 files left. Every
+/// call is charged now: the budget stops the upload before it writes past it.
+#[test]
+fn a_budget_covers_the_dataset_upload_of_a_local_service() {
+    let home = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oprobe"))
+        .env("OPROBE_DATA_DIR", home.path().join("data"))
+        .env("OPROBE_CONFIG", home.path().join("config.toml"))
+        .args(["run", &format!("fs://{}", target.path().display())])
+        .args([
+            "--max-requests",
+            "10",
+            "--objects",
+            "50",
+            "--object-size",
+            "4KiB",
+        ])
+        .args(["-d", "1s", "-q", "--set", "cleanup=false"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(exit::BUDGET.into()),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fn files(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .map(|e| {
+                        let p = e.path();
+                        if p.is_dir() { files(&p) } else { 1 }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+    let written = files(target.path());
+    assert!(
+        written <= 10,
+        "{written} files written under a budget of 10 requests"
+    );
+}
+
+/// A dataset larger than the byte budget is refused before anything is written. 9.3.3 began
+/// the upload, and generated each object whole in memory first: `--object-size 64GiB` aborted
+/// the process before the budget could stop it.
+#[test]
+fn a_dataset_larger_than_the_byte_budget_is_refused_up_front() {
+    let home = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oprobe"))
+        .env("OPROBE_DATA_DIR", home.path().join("data"))
+        .env("OPROBE_CONFIG", home.path().join("config.toml"))
+        .args(["run", &format!("fs://{}", target.path().display())])
+        .args([
+            "--objects",
+            "1",
+            "--object-size",
+            "64GiB",
+            "--max-bytes",
+            "1MiB",
+        ])
+        .args(["-d", "1s", "-q", "--set", "cleanup=false"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(exit::BUDGET.into()), "{stderr}");
+    assert!(stderr.contains("does not fit the byte budget"), "{stderr}");
+    let left = walk(target.path());
+    assert!(
+        left.iter()
+            .all(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) == 0),
+        "{left:?}"
+    );
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .flat_map(|e| {
+                    let p = e.path();
+                    if p.is_dir() { walk(&p) } else { vec![p] }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}

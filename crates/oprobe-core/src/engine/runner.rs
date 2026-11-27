@@ -309,6 +309,31 @@ impl Session {
                 .await
                 .map_err(|e| super::operator::explain_preflight(e, &target))?;
         }
+        // A dataset that cannot fit the byte budget is refused before anything is uploaded
+        // (9.3.3 started uploading it, and a large enough object aborted the process first).
+        if needs_objects
+            && spec.existing_prefix.is_none()
+            && let Some(max) = opts.guard.as_ref().and_then(|g| g.max_bytes())
+        {
+            let planned: u64 = (0..spec.objects.max(1))
+                .map(|i| match &spec.size_dist {
+                    Some(d) => d.size_of(profile.workload.seed, i),
+                    None => spec.object_size.0,
+                })
+                .fold(0u64, u64::saturating_add);
+            if planned > max {
+                return Err(crate::errors::OprobeError::new(
+                    crate::errors::ErrorCode::SafetyBudgetExceeded,
+                    format!(
+                        "the dataset alone ({}) does not fit the byte budget ({})",
+                        crate::util::fmt_bytes(planned),
+                        crate::util::fmt_bytes(max)
+                    ),
+                )
+                .with_hint("lower --objects or --object-size, or raise --max-bytes")
+                .into());
+            }
+        }
         let p2 = progress.clone();
         let dataset = Dataset::prepare(
             super::dataset::Via {
@@ -701,7 +726,9 @@ impl Session {
                     && wl.shape.is_none()
                     && rate.is_finite()
                     && rate > 0.0)
-                    .then(|| Pacer::new(Duration::from_secs_f64(1.0 / rate)));
+                    .then(|| Duration::try_from_secs_f64(1.0 / rate).ok())
+                    .flatten()
+                    .map(Pacer::new);
                 let mut rng = SmallRng::seed_from_u64(seed);
                 let mut missed = 0u64;
                 let mut issued = 0u64;
@@ -785,6 +812,14 @@ impl Session {
                     // as the lower bound of its latency.
                     let now = Instant::now();
                     while now.saturating_duration_since(next) > max_queue_delay {
+                        // However many arrivals a stall left behind, a stop is heard here
+                        // (9.3.3 counted them without awaiting, deaf to Ctrl-C).
+                        if self.cancel.is_cancelled() {
+                            break 'arrivals;
+                        }
+                        if missed % 4096 == 4095 {
+                            tokio::task::yield_now().await;
+                        }
                         missed += 1;
                         missed_arrival(next, now);
                         match src.next(horizon) {

@@ -138,6 +138,11 @@ fn take_room(counter: &AtomicU64, room: impl Fn(u64) -> Option<u64>) -> Result<u
 }
 
 impl Guard {
+    /// The byte budget, if any.
+    pub fn max_bytes(&self) -> Option<u64> {
+        self.budgets.max_bytes
+    }
+
     pub fn new(budgets: Budgets) -> Arc<Self> {
         Arc::new(Self {
             budgets,

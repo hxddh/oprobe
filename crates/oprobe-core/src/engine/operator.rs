@@ -835,6 +835,10 @@ pub fn preflight_operator(
         .layer(trace_layer(target, &HttpOptions::default(), None, gate)?);
     if let Some(g) = gate {
         op = op.layer(g.shield_layer());
+        // A service without an HTTP transport has no gate in it: its calls are charged here.
+        if !target.is_network() {
+            op = op.layer(g.charge_layer());
+        }
     }
     Ok(op
         .layer(
@@ -870,6 +874,10 @@ pub fn admin_operator_with(
         .layer(trace_layer(target, &HttpOptions::default(), None, gate)?);
     if let Some(g) = gate {
         op = op.layer(g.shield_layer());
+        // A service without an HTTP transport has no gate in it: its calls are charged here.
+        if !target.is_network() {
+            op = op.layer(g.charge_layer());
+        }
     }
     Ok(op
         .layer(

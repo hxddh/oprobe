@@ -16,17 +16,74 @@ use crate::errors::OprobeError;
 
 /// Incompressible, de-duplication-proof payload with a CRC32C digest.
 pub fn generate_payload(seed: u64, size: usize) -> (Bytes, u32) {
-    let mut rng = SmallRng::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15);
-    let mut buf = BytesMut::zeroed(size);
-    rng.fill_bytes(&mut buf);
-    if size >= 16 {
-        buf[..8].copy_from_slice(&seed.to_le_bytes());
-        buf[size - 8..].copy_from_slice(&(!seed).to_le_bytes());
+    let mut g = PayloadGen::new(seed, size);
+    let mut buf = BytesMut::with_capacity(size);
+    while let Some(piece) = g.next_piece(size.max(8)) {
+        buf.extend_from_slice(&piece);
     }
-    let b = buf.freeze();
-    let crc = crate::util::crc32c(&b);
-    (b, crc)
+    (buf.freeze(), g.crc())
 }
+
+/// The payload of [`generate_payload`], made a piece at a time: an object of any size is
+/// written without ever being whole in memory (9.3.3 allocated each dataset object whole, and
+/// `--object-size 64GiB` aborted the process before any budget applied). The bytes are the
+/// same as [`generate_payload`]'s: the random stream is drawn in multiples of 8 bytes, which is
+/// how the generator consumes it.
+pub struct PayloadGen {
+    rng: SmallRng,
+    seed: u64,
+    size: usize,
+    pos: usize,
+    crc: u32,
+}
+
+impl PayloadGen {
+    pub fn new(seed: u64, size: usize) -> Self {
+        Self {
+            rng: SmallRng::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15),
+            seed,
+            size,
+            pos: 0,
+            crc: 0,
+        }
+    }
+
+    /// The next piece, of at most `max` bytes (rounded down to a multiple of 8, at least 8);
+    /// `None` at the end.
+    pub fn next_piece(&mut self, max: usize) -> Option<Bytes> {
+        if self.pos >= self.size {
+            return None;
+        }
+        let len = (max / 8 * 8).max(8).min(self.size - self.pos);
+        let mut buf = BytesMut::zeroed(len);
+        self.rng.fill_bytes(&mut buf);
+        // The seed at the start and its complement at the end (objects of 16 bytes or more).
+        if self.size >= 16 {
+            let (start, end) = (self.pos, self.pos + len);
+            let head = self.seed.to_le_bytes();
+            let tail = (!self.seed).to_le_bytes();
+            for (i, b) in buf.iter_mut().enumerate() {
+                let at = start + i;
+                if at < 8 {
+                    *b = head[at];
+                } else if at >= self.size - 8 && at < end {
+                    *b = tail[at - (self.size - 8)];
+                }
+            }
+        }
+        self.pos += len;
+        self.crc = crate::util::crc32c_append(self.crc, &buf);
+        Some(buf.freeze())
+    }
+
+    /// The CRC-32C of what was generated so far (the whole payload at the end).
+    pub fn crc(&self) -> u32 {
+        self.crc
+    }
+}
+
+/// The piece a dataset object is generated and written in.
+const PAYLOAD_PIECE: usize = 8 << 20;
 
 /// Pre-generated random pool that write operations slice from (zero-copy), so that
 /// measured writes don't spend client CPU generating data.
@@ -243,11 +300,6 @@ impl Dataset {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .push(path.clone());
-                    let (data, crc) = tokio::task::spawn_blocking(move || {
-                        generate_payload(seed.wrapping_add(i as u64 * 7919), size)
-                    })
-                    .await
-                    .context("payload generation task failed")?;
                     let failed = || format!("cannot upload dataset object `{path}`");
                     let w = admin
                         .writer_with(&path)
@@ -256,7 +308,19 @@ impl Dataset {
                         .await
                         .with_context(failed)?;
                     let mut upload = super::upload::Upload::new(&admin, w, &path, aborts);
-                    upload.write(data).await.with_context(failed)?;
+                    let mut g = PayloadGen::new(seed.wrapping_add(i as u64 * 7919), size);
+                    loop {
+                        let piece = tokio::task::spawn_blocking(move || {
+                            let piece = g.next_piece(PAYLOAD_PIECE);
+                            (g, piece)
+                        })
+                        .await
+                        .context("payload generation task failed")?;
+                        g = piece.0;
+                        let Some(piece) = piece.1 else { break };
+                        upload.write(piece).await.with_context(failed)?;
+                    }
+                    let crc = g.crc();
                     upload.close().await.with_context(failed)?;
                     Ok::<_, anyhow::Error>(DataObject {
                         path,
@@ -432,6 +496,25 @@ impl Picker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S5: an object is generated a piece at a time, and its bytes and CRC are the same as
+    /// when it was generated whole (persisted datasets keep their checksums).
+    #[test]
+    fn a_payload_made_in_pieces_is_the_whole_payload() {
+        for size in [0, 7, 15, 16, 17, 4096, 1_000_003] {
+            let (whole, crc) = generate_payload(42, size);
+            for piece in [8, 24, 4096, 1 << 20] {
+                let mut g = PayloadGen::new(42, size);
+                let mut joined = Vec::new();
+                while let Some(p) = g.next_piece(piece) {
+                    assert!(p.len() <= piece.max(8));
+                    joined.extend_from_slice(&p);
+                }
+                assert_eq!(joined, whole.to_vec(), "size {size}, pieces of {piece}");
+                assert_eq!(g.crc(), crc, "size {size}, pieces of {piece}");
+            }
+        }
+    }
 
     #[test]
     fn payloads_are_unique_and_checksummed() {

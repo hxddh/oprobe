@@ -1,5 +1,6 @@
 //! Workload engine: operators, dataset, operations, sessions and cleanup.
 
+pub mod charge;
 pub mod cleanup;
 pub mod dataset;
 pub mod gate;
