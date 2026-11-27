@@ -58,6 +58,9 @@ pub struct OpScopeData {
     pub throttled: bool,
     /// Set by [`OpScope::take`]: the operation is complete and its data handed over.
     pub closed: bool,
+    /// Requests already handed to the exporter as they were captured (the first ones of
+    /// `requests`): its completion exports only the others.
+    pub exported_requests: usize,
 }
 
 /// Collects everything that happened underneath one logical operation.
@@ -128,6 +131,12 @@ impl OpScope {
         let late = self.with(|d| {
             if d.closed {
                 return Some(rec);
+            }
+            // The exporter sees each request as it is captured, not when its operation
+            // completes (a failed call may wait for a retry that never comes).
+            if let Some(r) = &self.late {
+                r.export_request(&rec);
+                d.exported_requests += 1;
             }
             if rec.is_throttle() {
                 d.throttled = true;

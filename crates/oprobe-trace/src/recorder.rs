@@ -1165,6 +1165,13 @@ impl Recorder {
         }
     }
 
+    /// Hand a request of an operation in progress to the exporter, as it is captured.
+    pub fn export_request(&self, r: &RequestRecord) {
+        if let Some(e) = self.exporter.get() {
+            e.on_request(r);
+        }
+    }
+
     /// Request issued outside any operation scope (rare: background OpenDAL work).
     pub fn record_unscoped_request(&self, r: &RequestRecord) {
         crate::scope::note_backend_request();
@@ -1325,7 +1332,8 @@ impl Recorder {
     fn complete_op_inner(&self, measured: bool, c: OpCompletion) {
         self.inflight_ops.fetch_sub(1, Ordering::Relaxed);
         if let Some(e) = self.exporter.get() {
-            for r in &c.data.requests {
+            let first = c.data.exported_requests.min(c.data.requests.len());
+            for r in &c.data.requests[first..] {
                 e.on_request(r);
             }
             if c.data.cache_lookups > 0 {
