@@ -422,7 +422,13 @@ jobs:
         env:
           REF: ${{ needs.plan.outputs.ref }}
         run: |
-          if remote=$(git ls-remote --exit-code --tags origin "refs/tags/$TAG^{}" | cut -f1); then
+          # The commit an existing tag names: the peeled line of an annotated tag, else the
+          # tag's own line (a lightweight tag). Read into variables first: the status of
+          # `if x=$(a | b)` is `b`'s: v9.3.3's first run took a missing tag for one on "".
+          peeled=$(git ls-remote --tags origin "refs/tags/$TAG^{}" | cut -f1)
+          plain=$(git ls-remote --tags origin "refs/tags/$TAG" | grep -v '\^{}' | cut -f1)
+          remote=${peeled:-$plain}
+          if [ -n "$remote" ]; then
             if [ "$remote" != "$REF" ]; then
               echo "::error::$TAG already exists on $remote, not on $REF"; exit 1
             fi

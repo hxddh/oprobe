@@ -106,6 +106,10 @@ changed (`oprobe.trace/9`, `oprobe.run/7`, `oprobe.report/7`, `oprobe.prove/9`,
 - **A version is tagged only after its tests and every build passed.** The `plan` job created and
   pushed the tag before anything was tested (what burned `v9.3.1`); the tag is now created in the
   `publish` job, after every asset is built and attested, and a failed run leaves no tag.
+  (The first run of this release stopped at that step: its check for an existing tag tested a
+  pipeline's status, always true, and read a missing tag as one on another commit. Every test
+  and build had passed, and no tag or release was left behind; the step was fixed and the
+  release run again.)
 - **No green crates.io job that published nothing.** Without `CARGO_REGISTRY_TOKEN` the publish
   steps show as skipped, with a warning and a line in the run summary.
 - **The `oprobe-trace` dependency line works when pasted.** `oprobe-trace` is not on crates.io
