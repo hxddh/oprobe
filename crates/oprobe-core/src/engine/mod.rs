@@ -10,6 +10,7 @@ pub mod procstat;
 pub mod runner;
 pub mod schedule;
 pub mod selfobs;
+pub mod shield;
 pub mod stack;
 pub mod upload;
 pub mod workloads;

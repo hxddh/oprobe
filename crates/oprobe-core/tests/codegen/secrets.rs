@@ -3,6 +3,7 @@ use opendal::Operator;
 
 /// The operator as oprobe measured it.
 pub fn build_operator() -> Result<Operator, Box<dyn std::error::Error + Send + Sync>> {
+    opendal::init_default_registry();
     let op = Operator::via_iter(
         "s3",
         [

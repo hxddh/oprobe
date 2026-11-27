@@ -49,6 +49,10 @@ const BIC_HIGH: f64 = 10.0;
 const BIC_MEDIUM: f64 = 4.0;
 /// The smallest token-bucket burst tried, as a share of its rate (per second).
 const MIN_BURST_FACTOR: f64 = 0.02;
+/// The largest token-bucket burst tried, in seconds of its rate.
+const MAX_BURST_FACTOR: f64 = 10.0;
+/// The token-bucket bursts tried, in seconds of its rate.
+const BURST_FACTORS: [f64; 7] = [MIN_BURST_FACTOR, 0.05, 0.1, 0.3, 1.0, 3.0, MAX_BURST_FACTOR];
 /// Throttled requests below this count are never fitted (a handful of 503s is noise).
 const MIN_THROTTLED: u64 = 5;
 /// CPU busy share at which the client is the bottleneck.
@@ -383,10 +387,16 @@ fn best_rate(
         (x, _) => *x,
     };
     // The rate is pinned near what the service served while it throttled; the likelihood
-    // picks the burst and the exact rate.
+    // picks the burst and the exact rate. A bucket that allows spikes (a burst of seconds of
+    // its rate) refills during each lull and drains in the next throttled stretch, so what
+    // the service served then runs above its rate: the grid reaches down to 0.7 of it, and
+    // bursts up to [`MAX_BURST_FACTOR`] seconds of it. 9.3.2 tried bursts up to 0.3 s and
+    // rates from 0.85 of what was served: a bucket of 50/s with a burst of 200 read as 64/s,
+    // one of 200/s with a burst of 1 000 as 276/s. (Lower than 0.7, a short-burst bucket
+    // trades its rate for a burst it does not have.)
     let mut best = None;
-    for r in log_grid(base * 0.85, base * 1.15, 9) {
-        for bf in [MIN_BURST_FACTOR, 0.05, 0.1, 0.3] {
+    for r in log_grid(base * 0.7, base * 1.15, 11) {
+        for bf in BURST_FACTORS {
             best = better(&best, eval(r, (r * bf).max(1.0)));
         }
     }
@@ -1664,6 +1674,41 @@ pub(crate) mod tests {
         assert_eq!(s.kind, HypothesisKind::RateLimit, "{hs:#?}");
         let rps = s.params.requests_per_s.unwrap();
         assert!((rps - 300.0).abs() < 45.0, "{rps}");
+    }
+
+    /// A genuine bucket of a low rate and a large burst (50/s, burst 200: a quota that allows
+    /// four seconds' spike) is a rate limit of its own rate, under a quick-retrying client and
+    /// under OpenDAL's default one-second retry alike. 9.3.2 searched bursts up to 0.3 s of
+    /// the rate and rates from 0.85 of what was served: the bucket that could not hold the
+    /// burst took a higher rate instead, 64/s and 66/s here (over 64 buckets of 20 to 200/s
+    /// with bursts of 2.5 to 5 s, 8 to 64 workers: a median error of 11.6 %, 23 within 10 %
+    /// and one not found; now 4.5 %, 54 within 10 %, all found).
+    #[test]
+    fn a_low_rate_large_burst_bucket_is_a_rate_limit_of_its_rate() {
+        for (late, backoff) in [(0.3, 40.0), (1.0, 1000.0)] {
+            let (mut tokens, mut last) = (200.0f64, 0.0f64);
+            let (reqs, ops) = closed_loop(16, 5.0, late, backoff, 8000.0, |t, _| {
+                tokens = (tokens + (t - last) / 1000.0 * 50.0).min(200.0);
+                last = t;
+                if tokens >= 1.0 {
+                    tokens -= 1.0;
+                    true
+                } else {
+                    false
+                }
+            });
+            let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
+            let s = selected(&hs);
+            assert!(
+                matches!(
+                    s.kind,
+                    HypothesisKind::RateLimit | HypothesisKind::TimeVarying
+                ),
+                "late {late}, backoff {backoff}: {hs:#?}"
+            );
+            let rps = s.params.requests_per_s.unwrap();
+            assert!((rps - 50.0).abs() < 7.5, "late {late}: {rps}");
+        }
     }
 
     /// Request-rate evidence: a cap never serves much more than `c / S`, however blurred the

@@ -33,7 +33,7 @@ use super::input::{OutputOptions, Safety};
 use crate::analysis::stats::Interval;
 use crate::analysis::verdict::{
     AbDecision, AbTest, AbVerdict, P99_CLIFF_RATIO, candidate_first, count_resolution, log_ratio,
-    noise_floor_ab, p99_on_a_cliff, p99_rank_band, p99_spread, ratio_difference,
+    noise_floor_of_pairs, p99_on_a_cliff, p99_rank_band, p99_spread, ratio_difference,
 };
 pub use crate::analysis::verdict::{AbPair, MAX_PAIRS, MIN_DECISIVE_PAIRS};
 use crate::config::Profile;
@@ -2135,7 +2135,7 @@ pub struct Converged {
 }
 
 /// The secondary metrics of the A/B trials. Each interval is on the metric's own spread
-/// (K3-5): its own trial-to-trial noise floor ([`noise_floor_ab`]) over its own resolution
+/// (K3-5): its own paired noise floor ([`noise_floor_of_pairs`]) over its own resolution
 /// (a count's, or a p99's order-statistic spread). 9.2 gave every metric the objective's
 /// floor: a goodput steady at 300/s printed "[−17 %, +20 %]" beside a noisy p99.
 fn secondary(obj: ProveObjective, a: &[&ProveTrial], b: &[&ProveTrial]) -> Vec<SecondaryMetric> {
@@ -2147,7 +2147,7 @@ fn secondary(obj: ProveObjective, a: &[&ProveTrial], b: &[&ProveTrial]) -> Vec<S
             metric: metric.to_owned(),
             baseline: mean(a, f),
             candidate: mean(b, f),
-            change: log_ratio(&va, &vb, true, noise_floor_ab(&va, &vb, resolution)),
+            change: log_ratio(&va, &vb, true, noise_floor_of_pairs(&va, &vb, resolution)),
         }
     };
     match obj {
@@ -3680,9 +3680,9 @@ mod tests {
             mk(Candidate, 3, 300.0, 55.0),
         ];
         let (a, b): (Vec<&ProveTrial>, Vec<&ProveTrial>) = (a.iter().collect(), b.iter().collect());
-        // The objective's floor is tens of percent.
+        // The objective's floor is many times the goodput's.
         let p99 = |ts: &[&ProveTrial]| ts.iter().map(|t| t.p99_ms).collect::<Vec<_>>();
-        assert!(noise_floor_ab(&p99(&a), &p99(&b), 0.0) > 0.3);
+        assert!(noise_floor_of_pairs(&p99(&a), &p99(&b), 0.0) > 0.05);
         let sec = secondary(ProveObjective::P99, &a, &b);
         let goodput = sec
             .iter()
@@ -3693,10 +3693,17 @@ mod tests {
             "{goodput:?}"
         );
         assert!(goodput.change.low < 0.0 && goodput.change.high > 0.0);
-        // And the other way round: a p99 keeps its own (wide) spread beside a steady goodput.
+        // And the other way round: a p99 keeps its own spread beside a steady goodput. Its
+        // pairs' ratios are steady (every candidate ≈ 96 % faster) although each arm swings
+        // by half: paired, the interval is narrow, and still wider than the goodput's (on the
+        // log ratio: near −96 % the relative scale compresses every width).
         let sec = secondary(ProveObjective::Goodput, &a, &b);
         let p99 = sec.iter().find(|m| m.metric == "p99_ms").unwrap();
-        assert!(p99.change.high - p99.change.low > 0.05, "{p99:?}");
+        let width = |i: &Interval| i.high.ln_1p() - i.low.ln_1p();
+        assert!(
+            width(&p99.change) > width(&goodput.change),
+            "{p99:?} {goodput:?}"
+        );
         assert!(p99.change.high < 0.0, "{p99:?}");
     }
 

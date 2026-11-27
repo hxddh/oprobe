@@ -252,3 +252,69 @@ fn release_notes_name_only_the_release_assets() {
         "{published:?}"
     );
 }
+
+/// The release workflow tags a version only after its tests and builds passed: `plan` (which
+/// runs first) never creates or pushes a tag, and the job that does needs every build. 9.3.1
+/// was tagged by `plan` before its tests failed, and the version could not be released again.
+#[test]
+fn the_release_is_tagged_only_after_it_was_built() {
+    let yml = std::fs::read_to_string(root().join(".github/workflows/release.yml")).unwrap();
+    // A job runs from its `  name:` line to the next line indented by exactly two spaces.
+    let job = |name: &str| -> String {
+        let head = format!("  {name}:");
+        let mut lines = yml.lines().skip_while(|l| *l != head);
+        let first = lines.next().unwrap_or_else(|| panic!("no job {name}"));
+        let body = lines
+            .take_while(|l| !(l.starts_with("  ") && !l.starts_with("   ") && l.ends_with(':')));
+        std::iter::once(first)
+            .chain(body)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let tags = |text: &str| text.contains("git tag") || text.contains("git push");
+    for early in ["plan", "meta", "build", "macos-universal", "linux-desktop"] {
+        assert!(
+            !tags(&job(early)),
+            "the `{early}` job creates or pushes a tag"
+        );
+    }
+    let publish = job("publish");
+    assert!(tags(&publish), "the `publish` job tags the release");
+    let needs = publish.lines().find(|l| l.contains("needs:")).unwrap();
+    for build in ["meta", "build", "macos-universal", "linux-desktop"] {
+        assert!(
+            needs.contains(build),
+            "publish does not need `{build}`: {needs}"
+        );
+    }
+    // The tag comes before the GitHub release that names it, after every asset step.
+    let tag_at = publish.find("git tag").unwrap();
+    assert!(tag_at < publish.find("softprops/action-gh-release").unwrap());
+    assert!(tag_at > publish.find("attest-build-provenance").unwrap());
+    // Without its token the crates.io publish is skipped as a step, never a green no-op.
+    let crates = job("crates-io");
+    let publish_step = crates.split("- name: cargo publish").nth(1).unwrap();
+    assert!(
+        publish_step.contains("if: env.CARGO_REGISTRY_TOKEN != ''"),
+        "{publish_step}"
+    );
+}
+
+/// The `Cargo.toml` line that adds `oprobe-trace` works when pasted: it is not on crates.io,
+/// so the first uncommented one is the git dependency on this version's tag.
+#[test]
+fn the_oprobe_trace_dependency_line_resolves_when_pasted() {
+    let version = env!("CARGO_PKG_VERSION");
+    for page in ["README.md", "README.zh-CN.md", "docs/embedding.md"] {
+        let text = std::fs::read_to_string(root().join(page)).unwrap();
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("oprobe-trace ="))
+            .unwrap_or_else(|| panic!("{page} has no oprobe-trace dependency line"));
+        assert!(
+            line.contains(r#"git = "https://github.com/hxddh/oprobe""#)
+                && line.contains(&format!(r#"tag = "v{version}""#)),
+            "{page}: `{line}` does not resolve today (want the git dependency on v{version})"
+        );
+    }
+}

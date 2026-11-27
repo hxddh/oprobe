@@ -8,7 +8,7 @@
 //! | `throttling` | `layers.concurrent_limit.http` (sized) + `layers.retry.jitter`: the service rejects (429/503) above a number of requests in flight. When it queues them without a rejection, the cap is advice, not a layer to prove |
 //! | `rate_limit` | `layers.concurrent_limit.http` (sized from rate × latency) |
 //! | `key_limit` | the workload's key layout (advice, not a layer) |
-//! | `bandwidth_cap` | `layers.throttle.bandwidth` on writes (a capped uplink, or a capped link the workload also writes over); on reads not a layer |
+//! | `bandwidth_cap` | `layers.throttle.bandwidth` on a capped uplink (writes); on a capped downlink not a layer, whatever else the workload does |
 //! | `tail_stragglers` | `layers.tail_cut` |
 //! | `hung_requests` | `layers.timeout.io` |
 //! | `small_ranges` | `read.gap` / `read.concurrent` |
@@ -912,14 +912,10 @@ fn bandwidth_cap(c: &Ctx) -> Option<(Finding, Direction)> {
     // Fitted on the request bodies, the uplink is what is shared.
     let direction = h.params.direction.unwrap_or(Direction::Download);
     let upload = direction == Direction::Upload;
-    // ThrottleLayer shapes writes only (K16): on a workload that writes nothing it cannot
-    // help, and the finding says the cap is not a layer. A capped uplink is always writes.
-    let writes = upload
-        || c.r
-            .workload
-            .mix
-            .iter()
-            .any(|m| m.weight > 0 && m.op.contains("write"));
+    // ThrottleLayer shapes writes only (K16): it is the remedy of a capped uplink, and of
+    // nothing else. On a capped downlink the cap is not a layer, whether or not the workload
+    // also writes: 9.3.2 offered the throttle whenever the mix held a write, and shaping the
+    // uploads does nothing for the response bodies that share the cap.
     let moving: f64 = c
         .reqs()
         .map(|q| if upload { q.send_us } else { q.body_us } as f64)
@@ -974,7 +970,7 @@ fn bandwidth_cap(c: &Ctx) -> Option<(Finding, Direction)> {
             op_ids: slowest_ops(c.run, c.reqs().map(|q| q.op_id)),
             windows: Vec::new(),
         },
-        remedy: remedy("bandwidth_cap", (!writes).then_some("reads")),
+        remedy: remedy("bandwidth_cap", (!upload).then_some("reads")),
     };
     Some((finding, direction))
 }
@@ -999,6 +995,14 @@ fn remedy_setup(r: &Report) -> TailCutSetup {
 /// The retry backoff prove pairs with `layers.tail_cut` (µs): a cut request is re-issued at
 /// once, not after OpenDAL's default 1 s.
 pub const TAIL_CUT_REISSUE_US: u64 = 20_000;
+
+/// Whether request `q` spent most of its time waiting for its first byte from the server.
+/// Through a transport the layer only wraps (`keep_http_transport`), connecting and sending
+/// the body are part of the time to first byte: an upload there is not known to wait on the
+/// server, and is neither a straggler nor a hang.
+fn waits_for_first_byte(q: &ReqRow) -> bool {
+    Stage::dominant(q) == Stage::Ttfb && !(q.connection_unobserved() && q.bytes_up > 0)
+}
 
 fn tail_stragglers(c: &Ctx) -> Option<Finding> {
     let run = c.run;
@@ -1053,10 +1057,7 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
             .iter()
             .filter(|q| q.api == api && !q.is_error() && q.total_us > deadline)
             .collect();
-        let ttfb_bound = over
-            .iter()
-            .filter(|q| Stage::dominant(q) == Stage::Ttfb)
-            .count();
+        let ttfb_bound = over.iter().filter(|q| waits_for_first_byte(q)).count();
         if over.len() < 3 || ttfb_bound * 2 < over.len() {
             continue;
         }
@@ -1125,7 +1126,7 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
     let excess: f64 = affected
         .iter()
         .flat_map(|a| a.2.iter())
-        .filter(|q| Stage::dominant(q) == Stage::Ttfb)
+        .filter(|q| waits_for_first_byte(q))
         .map(|q| (q.total_us as f64 - typ_all_us).max(0.0))
         .sum();
     let total: f64 = run
@@ -1225,9 +1226,7 @@ fn hung_requests(c: &Ctx, capped: Option<Direction>) -> Option<Finding> {
                 && match Stage::dominant(q) {
                     Stage::Send => capped != Some(Direction::Upload),
                     Stage::Body => capped != Some(Direction::Download) && stuck_body(q),
-                    // Through a transport the layer only wraps, connecting and sending the
-                    // body are part of the time to first byte: a slow upload is not a hang.
-                    Stage::Ttfb => !(q.connection_unobserved() && q.bytes_up > 0),
+                    Stage::Ttfb => waits_for_first_byte(q),
                     Stage::Stall => true,
                     Stage::Queue | Stage::Connect => false,
                 }
@@ -2062,6 +2061,26 @@ pub(crate) mod tests {
         assert!(!t.remedy.text.chars().any(|c| c.is_ascii_digit()), "{t:#?}");
     }
 
+    /// Through a transport the layer only wraps, an upload's slow "first byte" includes its
+    /// own connect and send: as `hung_requests` does, `tail_stragglers` does not read it as
+    /// the server's straggling, while the same tail of requests without a body still is.
+    #[test]
+    fn slow_uploads_through_a_kept_transport_are_not_stragglers() {
+        let kept = |run: &mut Run, bytes_up: u64| {
+            for q in run.reqs.iter_mut() {
+                (q.conn_id, q.status, q.bytes_up) = (0, 200, bytes_up);
+            }
+        };
+        let mut upload = base();
+        kept(&mut upload, 8 << 20);
+        let f = derive(&upload);
+        assert!(!f.iter().any(|x| x.code == "tail_stragglers"), "{f:#?}");
+        let mut reads = base();
+        kept(&mut reads, 0);
+        let f = derive(&reads);
+        assert!(f.iter().any(|x| x.code == "tail_stragglers"), "{f:#?}");
+    }
+
     #[test]
     fn stragglers_name_every_affected_api() {
         let mut run = base();
@@ -2531,6 +2550,22 @@ pub(crate) mod tests {
         assert!(cap.evidence.values["body_time_ratio"] > 0.5, "{cap:#?}");
         assert!(!cap.evidence.values.contains_key("body_pct"));
         assert!(!f.iter().any(|x| x.code == "hung_requests"), "{f:#?}");
+        // The response bodies are capped: ThrottleLayer (writes only) is no remedy, also
+        // when the workload writes beside its reads (9.3.2 offered it then).
+        assert_eq!(cap.remedy.path, None, "{cap:#?}");
+        let mut mixed = run.clone();
+        let write = crate::model::MixEntry {
+            weight: 1,
+            op: "write".into(),
+            ..Default::default()
+        };
+        mixed.report.workload.mix.push(write);
+        let f = derive(&mixed);
+        let cap = f
+            .iter()
+            .find(|x| x.code == "bandwidth_cap")
+            .expect("the cap");
+        assert_eq!(cap.remedy.path, None, "{cap:#?}");
     }
 
     /// K2-8: operations that waited 990 ms for a slot and then ran 10 ms printed "queue 97 %"

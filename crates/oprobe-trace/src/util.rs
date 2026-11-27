@@ -250,12 +250,18 @@ fn spaces(s: &str) -> usize {
     s.len() - s.trim_start_matches(' ').len()
 }
 
+/// The quote `s` starts with, as written: `"`, `'`, or one escaped inside a JSON or Rust
+/// string (`\"`, `\'`).
+fn opening_quote(s: &str) -> Option<&str> {
+    ["\\\"", "\\'", "\"", "'"].into_iter().find(|q| s.starts_with(q))
+}
+
 /// Replace the value of every `Authorization` header quoted in `s` (`Authorization: Bearer …`,
-/// `"authorization": "AWS4-HMAC-SHA256 Credential=…"`): up to the closing quote when the value
-/// or the whole header is quoted, else to the end of the line.
+/// `"authorization": "AWS4-HMAC-SHA256 Credential=…"`, and the same escaped inside a JSON
+/// string: `{\"Authorization\": \"Bearer …\"}`): up to the closing quote when the value or
+/// the whole header is quoted, else to the end of the line.
 fn strip_authorization(s: &str) -> Option<String> {
     const NAME: &[u8] = b"authorization";
-    let quote = |c: Option<char>| c.filter(|c| matches!(c, '"' | '\''));
     let mut w = Rewrite::new(s);
     let mut from = 0;
     while let Some(i) = s.as_bytes()[from..]
@@ -265,24 +271,29 @@ fn strip_authorization(s: &str) -> Option<String> {
         let at = from + i;
         let mut rest = at + NAME.len();
         from = rest;
-        let before = s[..name_start(s, w.copied, at)].chars().next_back();
+        let start = name_start(s, w.copied, at);
+        let before = s[..start].chars().next_back();
         // A query parameter is the parameters' to remove, with its separator.
         if matches!(before, Some('?' | '&' | '#')) {
             continue;
         }
-        let name_quote = quote(s[rest..].chars().next());
-        rest += name_quote.map_or(0, char::len_utf8);
+        // The quote before the name, escaped or not.
+        let before_quote = ["\\\"", "\\'", "\"", "'"]
+            .into_iter()
+            .find(|q| s[..start].ends_with(q));
+        let name_quote = opening_quote(&s[rest..]);
+        rest += name_quote.map_or(0, str::len);
         rest += spaces(&s[rest..]);
         if !s[rest..].starts_with([':', '=']) {
             continue;
         }
         rest += 1;
         rest += spaces(&s[rest..]);
-        let value_quote = quote(s[rest..].chars().next());
-        rest += value_quote.map_or(0, char::len_utf8);
+        let value_quote = opening_quote(&s[rest..]);
+        rest += value_quote.map_or(0, str::len);
         let value = &s[rest..];
         // The quote that ends the value: its own, else the one around the whole header.
-        let closing = value_quote.or(quote(before).filter(|_| name_quote.is_none()));
+        let closing = value_quote.or(before_quote.filter(|_| name_quote.is_none()));
         let len = match closing {
             Some(q) => value.find(q),
             None => value.find(['\n', '\r']),
@@ -389,6 +400,12 @@ fn strip_parameters(s: &str, depth: u8) -> Option<String> {
         // `GET http://h/k?sig=x: refused`) is not part of its last value.
         let list = s[list_start..word_end].trim_end_matches([',', ';', '.', ':']);
         let list_end = (list_start + list.len()).max(eq + 1);
+        // A `name=value` segment of a path (`s3://b/dt=2026-11-27/session_id=abc/part-0.parquet`,
+        // a Hive partition) names a place, and its value runs on into the rest of the key: it
+        // is no parameter. A parameter list starts at `?`, `#`, a space or a quote, never `/`.
+        if lead.is_none() && s[..start].ends_with('/') {
+            continue;
+        }
         if lead.is_none() && !list.contains('&') {
             // A lone `name=value` in prose: the name stays and the value goes (up to its
             // closing quote when it is quoted). `key=…` there is the key of an object
@@ -570,6 +587,53 @@ mod tests {
 
     /// The presigning and token parameters of every provider OpenDAL signs for are secret;
     /// the parameters that only describe a request or a grant are not.
+    /// A Hive-partitioned key names a place: its `name=value` segments stay whole, whatever
+    /// their names, while the query, prose and headers around it are still redacted.
+    #[test]
+    fn hive_partitions_in_a_path_are_not_parameters() {
+        for path in [
+            "s3://bucket/dt=2026-11-27/session_id=abc123/part-0.parquet",
+            "s3://bucket/t/upload_id=u-17/token=x/part-1.parquet",
+            "dt=2026-11-27/session_id=abc123/part-0.parquet not found",
+            "read gs://b/warehouse/tbl/session_token=9/f.orc: NotFound",
+        ] {
+            assert_eq!(strip_url_credentials(path), path);
+        }
+        assert_eq!(
+            strip_url_credentials(
+                "https://h/b/session_id=abc/part-0.parquet?partNumber=2&X-Amz-Signature=ab"
+            ),
+            "https://h/b/session_id=abc/part-0.parquet?partNumber=2"
+        );
+        assert_eq!(
+            strip_url_credentials("retry with session_id=abc123 failed"),
+            "retry with session_id=<redacted> failed"
+        );
+        assert_eq!(
+            strip_url_credentials("upload_id=ADPycd/2 expired"),
+            "upload_id=<redacted> expired"
+        );
+    }
+
+    /// An `Authorization` header quoted inside a JSON string (a logged request, an error
+    /// that embeds its headers as JSON) loses its value like an unescaped one.
+    #[test]
+    fn a_json_escaped_authorization_header_is_redacted() {
+        assert_eq!(
+            strip_url_credentials(r#"{"headers":"{\"Authorization\": \"Bearer eyJhbGc.x.y\", \"Host\": \"h\"}"}"#),
+            r#"{"headers":"{\"Authorization\": \"<redacted>\", \"Host\": \"h\"}"}"#
+        );
+        assert_eq!(
+            strip_url_credentials(r#"headers: {\'authorization\': \'AWS4-HMAC-SHA256 Credential=AKIA/x\'}"#),
+            r#"headers: {\'authorization\': \'<redacted>\'}"#
+        );
+        // The plain forms are unchanged.
+        assert_eq!(
+            strip_url_credentials(r#"{"Authorization": "Bearer abc", "x": 1}"#),
+            r#"{"Authorization": "<redacted>", "x": 1}"#
+        );
+    }
+
     #[test]
     fn signature_and_token_parameters_are_secret_whatever_their_case() {
         for k in [

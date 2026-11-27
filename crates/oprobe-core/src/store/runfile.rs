@@ -778,10 +778,17 @@ impl Segment {
                 weight: 1.0,
             });
         }
+        // A weight says how many operations a kept row stands for: a positive whole stride
+        // no writer exceeds. A file with any other (zero, negative, NaN, infinite, or one
+        // whose sum overflows the weighted quantiles) is refused, not averaged in.
         for &(i, w) in &o.weights {
-            if let Some(row) = ops.get_mut(i as usize) {
-                row.weight = w;
+            if !(w.is_finite() && (1.0..=MAX_ROW_WEIGHT).contains(&w)) {
+                bail!("corrupt run file: an operation weight of {w}");
             }
+            let Some(row) = ops.get_mut(i as usize) else {
+                bail!("corrupt run file: a weight for operation {i} of {n}");
+            };
+            row.weight = w;
         }
         let r = &self.reqs;
         let m = r.t_us.len();
@@ -1249,6 +1256,15 @@ impl<R: Read> RunFileReader<R> {
             // Straight into its type: a `Value` of the block first would take many times its
             // bytes.
             _ => {
+                // Counted before it is built: a report whose JSON holds a few bytes per value
+                // (`[0,0,…]`, `[{},{},…]` in a field whose items default) would take tens of
+                // times its bytes as structs.
+                let values = json_values(payload);
+                if values > MAX_REPORT_VALUES {
+                    bail!(
+                        "corrupt run file: a report of {values} values (at most {MAX_REPORT_VALUES})"
+                    );
+                }
                 let report: Report =
                     serde_json::from_slice(payload).map_err(|e| bad("report", e))?;
                 if report.schema != crate::model::REPORT_SCHEMA {
@@ -1262,6 +1278,36 @@ impl<R: Read> RunFileReader<R> {
             }
         }))
     }
+}
+
+/// The most JSON values a report block may hold ([`json_values`]). A report counts some
+/// 60 values per timeline interval and 20 per heatmap column: a long run's 2 000 intervals
+/// make about 200 000. At most a few hundred bytes of structs each, this bounds what a
+/// crafted report takes as structs, whatever few bytes per value its JSON spends.
+pub const MAX_REPORT_VALUES: usize = 1 << 20;
+
+/// How many values the JSON text `b` holds at most: its `,`, `[` and `{` outside strings
+/// (each value but the first in an array or object follows a comma; each container opens
+/// one). Cheap and linear: it runs before the text is parsed.
+fn json_values(b: &[u8]) -> usize {
+    let (mut n, mut in_str, mut esc) = (0usize, false, false);
+    for &c in b {
+        if in_str {
+            match (esc, c) {
+                (true, _) => esc = false,
+                (false, b'\\') => esc = true,
+                (false, b'"') => in_str = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b',' | b'[' | b'{' => n += 1,
+                _ => {}
+            }
+        }
+    }
+    n
 }
 
 /// `read_exact`, but `Ok(false)` on a clean end of stream before the first byte.
@@ -1324,13 +1370,21 @@ struct Thinning {
 impl Thinning {
     /// Whether operation `op_id` (`rows` rows) is kept, and the operations it then stands
     /// for.
+    ///
+    /// A level keeps an eighth of the cap; the stride doubles once a level is full, after
+    /// the operation that filled it was kept. One operation with more rows than a level holds
+    /// (a multipart upload of thousands of parts) fills its level alone and doubles the
+    /// stride once: 9.3.2 tested the level before the operation, and such an operation then
+    /// raised the level at every call, kept or not, up to a stride of 2^62 that every later
+    /// kept row stood for. A level now rises only when a kept operation fills it, and
+    /// reaching level `n` takes about 2^n operations.
     fn pick(&mut self, op_id: u64, rows: u64, max_rows: u64) -> Option<f64> {
         let budget = (max_rows / 8).max(1);
-        if self.level_rows + rows > budget {
-            self.level += 1;
+        if self.level_rows >= budget {
+            self.level = (self.level + 1).min(MAX_THIN_LEVEL);
             self.level_rows = 0;
         }
-        let stride = 1u64 << self.level.min(62);
+        let stride = 1u64 << self.level;
         let pick = op_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40 & (stride - 1) == 0;
         pick.then(|| {
             self.level_rows += rows;
@@ -1338,6 +1392,16 @@ impl Thinning {
         })
     }
 }
+
+/// The highest thinning level: the hash an operation is picked by has 24 bits, so a stride
+/// past 2^24 would keep no operation at all.
+const MAX_THIN_LEVEL: u32 = 24;
+
+/// The most operations one kept row may stand for: 2^53, past every stride a writer uses (a
+/// thinning stride, a reservoir's seen-over-kept) and the last whole number an `f64` holds,
+/// so no sum of a file's weights overflows. A decoded weight beyond it, below one, or not a
+/// number, is a damaged file.
+const MAX_ROW_WEIGHT: f64 = (1u64 << 53) as f64;
 
 #[derive(Debug, Default)]
 struct StreamState {
@@ -2486,7 +2550,8 @@ mod tests {
                 retry_us: u64::MAX,
                 client_us: u64::MAX,
             },
-            weight: -1.234_567_890_123_456_7e-300,
+            // The longest a weight a reader accepts can be written.
+            weight: 16_777_215.123_456_78,
             ..full_ops[0].clone()
         };
         let extreme_reqs: Vec<ReqRow> = crate::trace::Api::ALL
@@ -2694,6 +2759,88 @@ mod tests {
             back.op_weights().len(),
             back.ops.iter().filter(|o| o.weight != 1.0).count()
         );
+    }
+
+    /// Operations with more rows than a thinning level holds (multipart uploads of many
+    /// parts) raise the level once per level filled, not at every operation: 9.3.2 ran the
+    /// stride up to 2^62 within a few dozen operations, and every later kept row then stood
+    /// for 4.6e18 operations.
+    #[test]
+    fn large_operations_do_not_run_the_thinning_level_away() {
+        let max_rows = 1_000; // a level holds 125 rows
+        let rows = 200; // every operation fills a level alone
+        let n = 100_000u64;
+        let mut t = Thinning::default();
+        let mut stood_for = 0.0;
+        let mut kept = 0u64;
+        for id in 1..=n {
+            if let Some(w) = t.pick(id, rows, max_rows) {
+                stood_for += w;
+                kept += 1;
+            }
+        }
+        assert!(t.level <= 20, "level {}", t.level);
+        assert!(kept >= 8, "{kept} kept");
+        // What the kept rows stand for is what was seen, within the level being filled.
+        assert!(
+            stood_for >= n as f64 * 0.5 && stood_for <= n as f64 * 2.0,
+            "{stood_for} of {n} (level {})",
+            t.level
+        );
+    }
+
+    /// A weight is how many operations a kept row stands for: zero, negative or absurd
+    /// weights would corrupt every weighted quantile, and a file carrying one is refused.
+    #[test]
+    fn a_damaged_operation_weight_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, w) in [0.0, -2.0, 0.5, 1e300, 1e17].into_iter().enumerate() {
+            let mut run = crate::report::fixture::run();
+            run.ops[0].weight = w;
+            let path = write_run(&dir.path().join(format!("w{i}.oprobe")), &run).unwrap();
+            let e = read_run(std::fs::File::open(&path).unwrap()).unwrap_err();
+            assert!(format!("{e:#}").contains("operation weight"), "{w}: {e:#}");
+        }
+        let mut run = crate::report::fixture::run();
+        run.ops[0].weight = 4.0;
+        let path = write_run(&dir.path().join("ok.oprobe"), &run).unwrap();
+        let back = read_run(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            back.ops
+                .iter()
+                .find(|o| o.op_id == run.ops[0].op_id)
+                .unwrap()
+                .weight,
+            4.0
+        );
+    }
+
+    /// A report block that spends a few bytes per value (here 2: `0,` in `slowest`) is
+    /// refused by its count before it is built: 64 MiB of it would otherwise become some
+    /// 128 MiB of `u64`s, and items that default would take far more. A real report is far
+    /// below the bound.
+    #[test]
+    fn a_report_of_millions_of_tiny_values_is_refused_before_it_is_built() {
+        let base = crate::report::fixture::run();
+        let real = serde_json::to_vec(&base.report).unwrap();
+        assert!(
+            json_values(&real) < MAX_REPORT_VALUES / 20,
+            "{}",
+            json_values(&real)
+        );
+        assert_eq!(json_values(br#"{"a":"x,[{\"","b":[1,2,{}]}"#), 6);
+        let mut v = serde_json::to_value(&base.report).unwrap();
+        v["slowest"] = serde_json::Value::Array(vec![0.into(); MAX_REPORT_VALUES + 1]);
+        let crafted = serde_json::to_vec(&v).unwrap();
+        let header = header_json();
+        let bytes = stream(&[
+            (KIND_HEADER, header.len() as u32, &header[..]),
+            (KIND_REPORT, crafted.len() as u32, &crafted[..]),
+        ]);
+        let mut rd = RunFileReader::new(&bytes[..]).unwrap();
+        assert!(matches!(rd.next_block(), Ok(Some(Block::Header(_)))));
+        let e = rd.next_block().unwrap_err();
+        assert!(format!("{e:#}").contains("values"), "{e:#}");
     }
 
     /// K1-7. The largest file a stream writes is one the reader opens: the stream stops

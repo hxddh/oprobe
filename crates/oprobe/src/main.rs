@@ -15,7 +15,9 @@ fn main() -> ExitCode {
     // A bare `oprobe` is the app: it owns the main thread (native windows need it) and runs
     // its work on a runtime of its own.
     if cli.command.is_none() {
-        return oprobe::launch::bare(&cli, file);
+        let code = oprobe::launch::bare(&cli, file);
+        oprobe::output::flush_stderr(std::time::Duration::from_secs(2));
+        return code;
     }
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -26,11 +28,14 @@ fn main() -> ExitCode {
         Ok(rt) => rt,
         Err(e) => {
             oprobe::output::stderr_line(format_args!("error: cannot start the async runtime: {e}"));
+            oprobe::output::flush_stderr(std::time::Duration::from_secs(2));
             return ExitCode::FAILURE;
         }
     };
     let code = rt.block_on(oprobe::cli::main(cli));
     // Don't wait for lingering background tasks (idle connections, lab servers).
     rt.shutdown_timeout(std::time::Duration::from_millis(200));
+    // What is still queued for stderr; a stderr nobody reads does not hold the exit.
+    oprobe::output::flush_stderr(std::time::Duration::from_secs(2));
     code
 }

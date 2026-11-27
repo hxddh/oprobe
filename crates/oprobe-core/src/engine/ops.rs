@@ -131,6 +131,22 @@ async fn stream_write(ctx: &OpCtx, path: &str, data: bytes::Bytes) -> opendal::R
     Ok(())
 }
 
+/// Write `data` to `path` in one call through `writer` (opened with the operation's
+/// conditions) and complete it. `Operator::write_with` opens the same writer, but inside a
+/// future the engine may drop (a cancelled or cut operation): a service that writes through
+/// an upload session (a GCS resumable upload, an S3 multipart upload past the single-PUT
+/// size) would then keep it. Owned by an [`Upload`], it is aborted unless it completes.
+async fn upload_whole(
+    ctx: &OpCtx,
+    writer: opendal::Writer,
+    path: &str,
+    data: bytes::Bytes,
+) -> opendal::Result<opendal::Metadata> {
+    let mut upload = Upload::new(&ctx.op, writer, path, &ctx.aborts);
+    upload.write(data).await?;
+    upload.close().await
+}
+
 fn crc_of(buf: &Buffer) -> u32 {
     buf.clone()
         .fold(0u32, |acc, chunk| crate::util::crc32c_append(acc, &chunk))
@@ -428,7 +444,8 @@ async fn execute_more(
                 // Optimistic update of the object this slot wrote last.
                 Some(etag) if cap.write_with_if_match => {
                     key.clone_from(&slot_path);
-                    ctx.op.write_with(&slot_path, data).if_match(&etag).await?
+                    let w = ctx.op.writer_with(&slot_path).if_match(&etag);
+                    upload_whole(ctx, w.await?, &slot_path, data).await?
                 }
                 _ => {
                     // Conditional create. On the slot's key when an overwrite can follow
@@ -445,11 +462,12 @@ async fn execute_more(
                         slot_path.clone()
                     };
                     key.clone_from(&path);
-                    if cap.write_with_if_not_exists {
-                        ctx.op.write_with(&path, data).if_not_exists(true).await?
+                    let w = if cap.write_with_if_not_exists {
+                        ctx.op.writer_with(&path).if_not_exists(true).await?
                     } else {
-                        ctx.op.write_with(&path, data).if_none_match("*").await?
-                    }
+                        ctx.op.writer_with(&path).if_none_match("*").await?
+                    };
+                    upload_whole(ctx, w, &path, data).await?
                 }
             };
             if *key == slot_path || ctx.state.etag(slot).is_none() {

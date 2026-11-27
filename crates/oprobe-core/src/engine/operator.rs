@@ -390,6 +390,11 @@ pub async fn measured_operator_with(
     let mut cfg = transport_config(target, &spec.http)?;
     cfg.max_inflight = spec.http_limit();
     op = op.layer(transport_layer(target, cfg, Some(recorder.clone()), gate)?);
+    // Beneath every measured layer: the timers above cannot cut an abort, and a cancelled
+    // run aborts the uploads that wait in a throttle or a backoff.
+    if let Some(g) = gate {
+        op = op.layer(g.shield_layer());
+    }
     // Async call stacks: operations are registered as await-tree roots by the runner, OpenDAL
     // sub-tasks by `ScopePropagatingExecutor`, and the transports add zero-allocation spans per
     // request. OpenDAL's `AwaitTreeLayer` is not used: it wraps every call and read chunk and
@@ -825,9 +830,13 @@ pub fn preflight_operator(
     target: &TargetSpec,
     gate: Option<&Gate>,
 ) -> Result<Operator> {
-    Ok(base
+    let mut op = base
         .clone()
-        .layer(trace_layer(target, &HttpOptions::default(), None, gate)?)
+        .layer(trace_layer(target, &HttpOptions::default(), None, gate)?);
+    if let Some(g) = gate {
+        op = op.layer(g.shield_layer());
+    }
+    Ok(op
         .layer(
             TimeoutLayer::new()
                 .with_timeout(Duration::from_secs(30))
@@ -856,9 +865,13 @@ pub fn admin_operator_with(
     target: &TargetSpec,
     gate: Option<&Gate>,
 ) -> Result<Operator> {
-    Ok(base
+    let mut op = base
         .clone()
-        .layer(trace_layer(target, &HttpOptions::default(), None, gate)?)
+        .layer(trace_layer(target, &HttpOptions::default(), None, gate)?);
+    if let Some(g) = gate {
+        op = op.layer(g.shield_layer());
+    }
+    Ok(op
         .layer(
             TimeoutLayer::new()
                 .with_timeout(Duration::from_secs(300))

@@ -99,6 +99,9 @@ The window works like other professional tools on your platform (design:
   remain on the target (the next run against the same target removes them), and offers
   **Quit Anyway**; the same line goes to the log file. In a terminal, Ctrl+C waits the same
   way and prints what was left; a second Ctrl+C leaves at once.
+- **Signals.** SIGTERM (`kill`, a logout), SIGHUP (the terminal or SSH session closed) and SIGINT
+  stop the app the same way, in a window and in a terminal: the jobs stop and remove their test
+  data, then the app exits with code 130. A second signal leaves at once.
 - **Run files**: open a `.oprobe`, `.prove.json`, report `.json` or `op.toml` file with File ▸ Open Run File… (the
   system's open dialog, filtered to those types), drop it on the window (the window is outlined
   while a file is dragged over it), or double-click a `.oprobe` / `.json` file: `oprobe.app` (macOS), the `.msi`

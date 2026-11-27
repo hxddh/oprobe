@@ -221,6 +221,8 @@ impl Output {
 
     /// Print a command's result and return its exit code.
     pub fn finish<T: CommandOutput>(&self, v: &T) -> anyhow::Result<u8> {
+        // The progress before the result, as a terminal showing both expects.
+        flush_stderr(std::time::Duration::from_secs(1));
         let mut out = std::io::stdout().lock();
         match self.format {
             OutputFormat::Text => {
@@ -248,6 +250,7 @@ impl Output {
         match self.format {
             OutputFormat::Json => {
                 let v = serde_json::json!({"type": "error", "error": e});
+                flush_stderr(std::time::Duration::from_secs(1));
                 let mut out = std::io::stdout().lock();
                 // A closed stdout (`| head`) is not worth a second error.
                 let _ = writeln!(
@@ -313,10 +316,82 @@ impl ErrStream {
 
 static STDERR: std::sync::LazyLock<ErrStream> = std::sync::LazyLock::new(ErrStream::default);
 
+/// What the stderr writer thread is handed.
+enum ErrMsg {
+    Text(String),
+    /// Answer once everything before it is written.
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+/// Texts for stderr waiting for the writer thread, at most.
+const STDERR_QUEUE: usize = 1024;
+
+/// The one thread that writes to stderr, and its queue (`None`: it could not start; texts
+/// are then written where they are produced).
+///
+/// A stderr that is open but not read (a terminal paused with Ctrl-S, a pipe nobody drains)
+/// blocks the write that fills it, and every later one waits for its lock. 9.3.2 wrote where
+/// the text was produced: the signal handler's "stopping…" waited behind the live line, so
+/// the second Ctrl-C, SIGTERM or SIGHUP was never seen and nothing could stop the process,
+/// and a cancelled run's cleanup waited too. Now only this thread waits on stderr; whoever
+/// produces a text queues it, and a full queue drops it (nobody is reading).
+static STDERR_QUEUE_TX: std::sync::LazyLock<Option<std::sync::mpsc::SyncSender<ErrMsg>>> =
+    std::sync::LazyLock::new(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ErrMsg>(STDERR_QUEUE);
+        std::thread::Builder::new()
+            .name("oprobe-stderr".into())
+            .spawn(move || {
+                for msg in rx {
+                    match msg {
+                        ErrMsg::Text(text) => STDERR.write(&mut std::io::stderr().lock(), &text),
+                        ErrMsg::Flush(done) => {
+                            let _ = done.try_send(());
+                        }
+                    }
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+
 /// Write `text` to stderr as it is (no newline added: a live line redraws itself). Never
-/// panics and never fails: see the module documentation.
+/// panics, never fails and never blocks: see the module documentation and
+/// [`STDERR_QUEUE_TX`].
 pub fn stderr_text(text: &str) {
-    STDERR.write(&mut std::io::stderr().lock(), text);
+    match &*STDERR_QUEUE_TX {
+        Some(tx) => {
+            let _ = tx.try_send(ErrMsg::Text(text.to_owned()));
+        }
+        None => STDERR.write(&mut std::io::stderr().lock(), text),
+    }
+}
+
+/// Wait until every text queued for stderr so far is written, for at most `timeout`;
+/// whether it was. Called before stdout is written (a terminal shows both in order) and
+/// before the process exits.
+pub fn flush_stderr(timeout: std::time::Duration) -> bool {
+    let Some(tx) = &*STDERR_QUEUE_TX else {
+        return true;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    let (done, written) = std::sync::mpsc::sync_channel(1);
+    let mut msg = ErrMsg::Flush(done);
+    loop {
+        match tx.try_send(msg) {
+            Ok(()) => break,
+            Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                msg = back;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return true,
+        }
+    }
+    written
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .is_ok()
 }
 
 /// Write one line to stderr. Never panics and never fails: see the module documentation.

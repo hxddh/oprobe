@@ -379,7 +379,10 @@ fn http_client_expr(s: &OperatorSpec) -> (String, bool) {
             e += ".no_proxy()";
         } else {
             let red = crate::util::redact_url(proxy);
-            let _ = write!(e, ".proxy(reqwest::Proxy::all({red:?})?)");
+            // `${NAME}` from the environment, as everywhere else.
+            let (value, env) = rust_string(&red);
+            let value = if env { value } else { format!("{red:?}") };
+            let _ = write!(e, ".proxy(reqwest::Proxy::all({value})?)");
         }
     }
     e += ".build()?";
@@ -665,7 +668,11 @@ fn service_rust(s: &OperatorSpec) -> (String, bool) {
         && fs_ok
         && !disp_url.contains('?');
     if plain_uri {
-        return (format!("Operator::from_uri({disp_url:?})?"), false);
+        // A `${NAME}` in the URL is read from the environment, as in the options (9.3.2
+        // wrote it into the URL literally).
+        let (uri, env) = rust_string(&disp_url);
+        let uri = if env { uri } else { format!("{disp_url:?}") };
+        return (format!("Operator::from_uri({uri})?"), env);
     }
     let (scheme, opts) = resolved_rust_target(s);
     if opts.is_empty() {
@@ -756,6 +763,10 @@ pub fn to_rust(s: &OperatorSpec) -> String {
         out,
         "\n/// The operator as oprobe measured it.\npub {asyncness}fn build_operator() -> {result} {{"
     );
+    // `Operator::from_uri` and `via_iter` find a service in OpenDAL's registry, which only
+    // `auto-register-services` (a default feature) fills before `main`: with
+    // `default-features = false` it starts empty. Filling it again is a no-op.
+    out.push_str("    opendal::init_default_registry();\n");
     let _ = write!(out, "    let op = {service}");
     // A multi-line service expression ends at the statement's own indent.
     let indent = if service.ends_with("\n    )?") {

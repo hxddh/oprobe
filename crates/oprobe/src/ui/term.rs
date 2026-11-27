@@ -264,6 +264,15 @@ impl Drop for Guard {
     }
 }
 
+/// Whether a stop signal arrived that is not handled yet (and it is now).
+fn take_signal(handled: &mut usize) -> bool {
+    let fresh = crate::ui::stop::seen() > *handled;
+    if fresh {
+        *handled += 1;
+    }
+    fresh
+}
+
 fn is_ctrl_c(ev: &Event) -> bool {
     matches!(ev, Event::Key(k)
         if k.kind == KeyEventKind::Press
@@ -310,17 +319,36 @@ pub fn run(monochrome: bool) -> io::Result<()> {
     let mut stopping: Option<Instant> = None;
     // A second Ctrl+C: leave without waiting any longer.
     let mut hurried = false;
+    // SIGTERM, SIGHUP and SIGINT count as Ctrl+C (`stop`), each seen within 100 ms.
+    crate::ui::stop::watch(|_| {});
+    let mut signals = 0;
     let res = run_app(&mut term, &mut view, |timeout: Duration| {
         if let Some(since) = stopping
             && (!jobs::busy() || since.elapsed() >= crate::app::STOP_GRACE)
         {
             return Ok(RunEvent::Exit);
         }
-        if !event::poll(timeout)? {
-            return Ok(RunEvent::Idle);
-        }
-        let ev = event::read()?;
-        if is_ctrl_c(&ev) {
+        // `None`: a stop signal.
+        let ev = if take_signal(&mut signals) {
+            None
+        } else {
+            let deadline = Instant::now() + timeout.min(Duration::from_secs(3600));
+            loop {
+                let slice = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(100));
+                if event::poll(slice)? {
+                    break Some(event::read()?);
+                }
+                if take_signal(&mut signals) {
+                    break None;
+                }
+                if Instant::now() >= deadline {
+                    return Ok(RunEvent::Idle);
+                }
+            }
+        };
+        if ev.as_ref().is_none_or(is_ctrl_c) {
             if stopping.is_some() || !jobs::busy() {
                 hurried = stopping.is_some();
                 return Ok(RunEvent::Exit);
@@ -329,7 +357,7 @@ pub fn run(monochrome: bool) -> io::Result<()> {
             stopping = Some(Instant::now());
             return Ok(RunEvent::Redraw);
         }
-        Ok(convert(ev))
+        Ok(convert(ev.expect("a key event")))
     });
     drop(term);
     drop(guard);

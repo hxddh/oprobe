@@ -121,13 +121,15 @@ impl HttpTransport for WrappedTransport {
             resp.version(),
             resp.headers(),
         );
-        // The declared length tells a body read to its end from one dropped part-way; a
-        // header that does not parse is the service's to report.
-        let expected = if is_head || !matches!(parse_content_encoding(resp.headers()), Ok(None)) {
-            None
-        } else {
-            parse_content_length(resp.headers()).ok().flatten()
-        };
+        // The declared length tells a body read to its end from one dropped part-way, as
+        // OpenDAL's own transport parses it.
+        let declared = parse_content_encoding(resp.headers()).and_then(|encoding| {
+            if is_head || encoding.is_some() {
+                Ok(None)
+            } else {
+                parse_content_length(resp.headers())
+            }
+        });
         let fin = Finisher {
             record,
             // The connection is the host client's own.
@@ -140,6 +142,9 @@ impl HttpTransport for WrappedTransport {
             _permit: permit,
             sniff,
         };
+        // A header that does not parse fails the request here, recorded as such (9.3.2 let
+        // it through, and the body dropped unread was recorded as an abort).
+        let (fin, expected) = fin.declared_length(declared)?;
         let (parts, body) = resp.into_parts();
         let body =
             body.map_inner(|inner| Box::new(TimedResponseBody::new(inner, fin, expected)));
@@ -171,6 +176,13 @@ mod tests {
                     .set_temporary());
             }
             let body = stream::iter([Ok(Buffer::from("he")), Ok(Buffer::from("llo"))]);
+            if req.uri().path().ends_with("/badlen") {
+                return Ok(Response::builder()
+                    .status(200)
+                    .header("content-length", "five")
+                    .body(HttpBody::new(body, None))
+                    .unwrap());
+            }
             Ok(Response::builder()
                 .status(200)
                 .header("content-length", "5")
@@ -218,5 +230,30 @@ mod tests {
         assert!(error.starts_with("send http request"), "{error}");
         assert!(error.contains("bucket.example/refused"), "{error}");
         assert!(!error.contains("SECRET"), "{error}");
+    }
+
+    /// A response whose `Content-Length` does not parse fails the request, recorded as a
+    /// failed request that would fail again, never as one its reader aborted (as
+    /// `FidelityTransport` does).
+    #[tokio::test]
+    async fn an_unparsable_content_length_is_a_failed_request_not_an_abort() {
+        let recorder = Recorder::always_on(64);
+        let host = HttpTransporter::new(Host {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let t = WrappedTransport::new(host, recorder.clone(), None);
+        let req = Request::get("https://bucket.example/badlen")
+            .body(Buffer::new())
+            .unwrap();
+        assert!(t.fetch(req).await.is_err());
+        let rows = recorder.take_trace().reqs;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let r = &rows[0];
+        assert_eq!(r.status, 200);
+        let error = r.error.as_deref().unwrap_or_default();
+        assert!(error.starts_with("response headers"), "{error}");
+        let d = r.detail.as_deref().expect("detail");
+        assert_eq!(d.temporary, Some(false));
+        assert!(!d.aborted);
     }
 }

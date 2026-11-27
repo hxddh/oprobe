@@ -202,6 +202,9 @@ pub struct LabConfig {
     /// Create multipart uploads but never answer `CreateMultipartUpload`: the client does not
     /// learn the upload id, so it can neither use the upload nor abort it.
     pub create_never_answers: bool,
+    /// Carry out and answer `AbortMultipartUpload` only after this long (a slow abort: a
+    /// client that gives up on it first leaves the upload).
+    pub abort_delay: Duration,
 }
 
 /// A fault on `UploadPart` requests: parts numbered `from_part` and above (1-based, as S3
@@ -1681,6 +1684,9 @@ async fn handle_s3_request<'a>(
         }
 
         if method == Method::DELETE {
+            if !faults.abort_delay.is_zero() {
+                tokio::time::sleep(faults.abort_delay).await;
+            }
             store.multipart.aborted.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut ups) = store.uploads.write() {
                 ups.remove(upload_id);

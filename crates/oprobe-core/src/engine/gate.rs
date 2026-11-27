@@ -70,6 +70,13 @@ impl Gate {
         }
     }
 
+    /// The layer to put beneath the measured layers of an operator behind this gate: aborts
+    /// that no timer above cuts, and uploads a cancelled run aborts while they wait above the
+    /// transport ([`super::shield`]).
+    pub fn shield_layer(&self) -> super::shield::AbortShieldLayer {
+        self.aborts.shield_layer()
+    }
+
     /// `transport` behind this gate.
     pub fn wrap<T: HttpTransport>(&self, transport: T) -> Gated<T> {
         Gated {

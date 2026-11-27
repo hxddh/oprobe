@@ -70,7 +70,7 @@ const ENTRIES: &[Entry] = &[
         code: "bandwidth_cap",
         title: "Every stream shares one bandwidth cap",
         severity: Severity::Warning,
-        meaning: "The aggregate throughput is flat while a stream's rate falls as more streams run beside it: a shared cap (a NIC, proxy, endpoint or bucket limit), on the response bodies or on the request bodies (a saturated uplink: its slow uploads are the cap's doing, not hung requests). OpenDAL's ThrottleLayer shapes writes only: the remedy is `layers.throttle.bandwidth` (sized by prove) where the workload writes; on reads the cap is not a layer.",
+        meaning: "The aggregate throughput is flat while a stream's rate falls as more streams run beside it: a shared cap (a NIC, proxy, endpoint or bucket limit), on the response bodies or on the request bodies (a saturated uplink: its slow uploads are the cap's doing, not hung requests). OpenDAL's ThrottleLayer shapes writes only: the remedy is `layers.throttle.bandwidth` (sized by prove) when the cap is on the request bodies (a capped uplink); on the response bodies the cap is not a layer, whatever else the workload does.",
         causes: &[
             "a network link, NAT gateway or proxy at its capacity",
             "an uplink narrower than the downlink (uploads from an office, a home or a metered egress)",

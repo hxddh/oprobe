@@ -4,7 +4,7 @@
 //!   two-sided sequential boundary ([`critical`]) that the verdict, the interval and every
 //!   look share, so the chance of ever calling a change that is none stays under 5 %
 //!   whenever prove stops;
-//! - **the noise floor** ([`noise_floor_ab`]): the per-pair spread learned from each side's
+//! - **the noise floor** ([`noise_floor_paired`]): the per-pair spread learned from the paired
 //!   trial-to-trial differences, never below the trials' count resolution;
 //! - **intervals that cannot be impossible**: a log-ratio interval for positive metrics
 //!   (goodput, latency: `exp(·) − 1`, never below −100 %, [`log_ratio`]); Wilson score
@@ -232,43 +232,6 @@ pub fn p99_on_a_cliff(spread: f64) -> bool {
     spread > P99_CLIFF_RATIO.ln() / 4.0
 }
 
-/// The mean squared log ratio of consecutive trials of one side, with how many ratios it
-/// averages: twice that side's trial-to-trial variance (von Neumann), robust to a slow drift.
-fn successive_msd(x: &[f64]) -> (f64, usize) {
-    let d: Vec<f64> = x
-        .windows(2)
-        .filter(|w| w[0] > 0.0 && w[1] > 0.0)
-        .map(|w| (w[1] / w[0]).ln())
-        .collect();
-    let msd = if d.is_empty() {
-        0.0
-    } else {
-        d.iter().map(|x| x * x).sum::<f64>() / d.len() as f64
-    };
-    (msd, d.len())
-}
-
-/// The noise floor of a pair's log ratio `ln(b/a)`: its variance is A's trial-to-trial
-/// variance plus B's, each estimated from that side's consecutive trials
-/// ([`successive_msd`]: `σ² ≈ MSSD / 2`), so `floor² = (MSSD_A + MSSD_B) / 2`. Until B has
-/// two trials it is assumed as noisy as A (an A/A pair: `floor² = MSSD_A`).
-/// W8: 9.0 took the A/A spread alone, which overstates a pair's spread by up to √2 when the
-/// change steadies B (a cap that ends the throttling of a throttled baseline). At least
-/// [`MIN_NOISE_SD`] and the count `resolution` ([`count_resolution`]), and doubled while A has
-/// fewer than two differences (they cannot say how precise the floor is). An order effect
-/// (the second trial of a pair running better or worse) only raises it.
-pub fn noise_floor_ab(a: &[f64], b: &[f64], resolution: f64) -> f64 {
-    let (msd_a, na) = successive_msd(a);
-    let (msd_b, nb) = successive_msd(b);
-    let var = if nb == 0 {
-        msd_a
-    } else {
-        (msd_a + msd_b) / 2.0
-    };
-    let floor = var.sqrt().max(MIN_NOISE_SD).max(resolution);
-    if na < 2 { 2.0 * floor } else { floor }
-}
-
 /// Whether pair `pair` (0-based) runs its candidate (B) first. The orders come in blocks of
 /// two pairs, one `AB` and one `BA`, and which comes first in a block is a fair coin drawn
 /// from `seed` (splitmix64): random across blocks, the same for the same run, and after any
@@ -287,46 +250,58 @@ pub fn candidate_first(seed: u64, pair: u64) -> bool {
 /// pairs) of a proof planned for at most `K` pairs, `3 ≤ k ≤ K ≤ 12`.
 ///
 /// The statistic is `T_k = estimate_k / (s_k · √w_k)` as [`AbTest`] computes it (the 2×2
-/// crossover estimate, `w_k = (1/n_AB + 1/n_BA) / 4`, `s_k` the sample SD of the `k` log
-/// ratios), over orders drawn as [`candidate_first`] draws them. Each row holds one nominal
-/// two-sided level at every look (Pocock), chosen so that under the null (i.i.d. normal log
-/// ratios; the statistic is scale-free) `P(|T_k| > CRITICAL[K − 3][k − 3] for any k in 3..=K)`
-/// is 4.0 % — under the 5 % the verdict promises, with margin for the simulation error and
-/// for noise that is not quite normal. The per-look levels are 4.00, 2.40, 1.80, 1.47, 1.26,
-/// 1.12, 1.02, 0.93, 0.87 and 0.82 % for K = 3..=12.
+/// crossover estimate, `w_k = (1/n_AB + 1/n_BA) / 4`, `s_k` the spread of [`crossover`]: from
+/// the fourth pair the pooled within-order SD on `k − 2` degrees of freedom, at the third the
+/// SD of all three log ratios), over orders drawn as [`candidate_first`] draws them. Each row
+/// holds one nominal two-sided level at every look (Pocock): the null quantile of `|T_k|` at
+/// that level (Student's t on `k − 2` degrees of freedom from the fourth look; simulated at
+/// the third), chosen so that under the null (i.i.d. normal log ratios; the statistic is
+/// scale-free) `P(|T_k| > CRITICAL[K − 3][k − 3] for any k in 3..=K)` is 4.0 % — under the
+/// 5 % the verdict promises, with margin for the simulation error and for noise that is not
+/// quite normal. The per-look levels are 4.00, 2.24, 1.65, 1.33, 1.14, 1.01, 0.93, 0.85,
+/// 0.80 and 0.75 % for K = 3..=12. The fourth look's value can exceed the third's: its spread
+/// has two degrees of freedom, the third's has two as well but is a different statistic.
 ///
-/// Calibrated offline by simulation: 8 000 000 proofs of 12 pairs (numpy, seed 20261126), the
+/// 9.3.2 divided by the SD of all `k` log ratios at every look: an order effect (the second
+/// trial of every pair better or worse by γ) put γ² into it, and a +15 % change under such an
+/// effect was found in under 5 % of proofs. The pooled within-order SD leaves the order effect
+/// out. At the third look it would have one degree of freedom, and the look could decide
+/// nothing; the SD of all three is kept there, which an order effect can only inflate (that
+/// look then waits for the next).
+///
+/// Calibrated offline by simulation: 4 000 000 proofs of 12 pairs (numpy, seed 20261127), the
 /// level of each row bisected until the crossing rate was 0.0400, each value rounded up to
-/// 0.001. A second run on 8 000 000 fresh proofs (seed 99) gave every row a crossing rate of
-/// 0.0400 to 0.0401. The spread [`AbTest`] divides by is never below `s_k` (it is the larger
+/// 0.001. A second run on 4 000 000 fresh proofs (seed 99) gave every row a crossing rate of
+/// 0.0398 to 0.0400. The spread [`AbTest`] divides by is never below `s_k` (it is the larger
 /// of `s_k` and the noise floor), so its error rate is at most the calibrated one.
 const CRITICAL: [&[f64]; MAX_PAIRS - MIN_DECISIVE_PAIRS + 1] = [
-    &[4.607],
-    &[6.000, 4.238],
-    &[6.968, 4.725, 3.814],
-    &[7.723, 5.089, 4.053, 3.659],
-    &[8.326, 5.373, 4.236, 3.801, 3.493],
-    &[8.846, 5.616, 4.387, 3.920, 3.593, 3.418],
-    &[9.285, 5.812, 4.507, 4.017, 3.671, 3.490, 3.334],
-    &[9.696, 5.993, 4.620, 4.102, 3.743, 3.553, 3.390, 3.292],
+    &[4.612],
+    &[6.230, 6.571],
+    &[7.290, 7.702, 4.881],
+    &[8.138, 8.597, 5.278, 4.241],
+    &[8.782, 9.268, 5.567, 4.428, 3.898],
+    &[9.333, 9.856, 5.813, 4.586, 4.019, 3.696],
+    &[9.791, 10.327, 6.006, 4.709, 4.112, 3.774, 3.558],
+    &[10.224, 10.775, 6.187, 4.823, 4.199, 3.846, 3.621, 3.466],
     &[
-        10.053, 6.141, 4.713, 4.173, 3.803, 3.605, 3.436, 3.334, 3.242,
+        10.558, 11.135, 6.331, 4.913, 4.266, 3.902, 3.670, 3.510, 3.393,
     ],
     &[
-        10.381, 6.279, 4.800, 4.239, 3.857, 3.652, 3.479, 3.374, 3.279, 3.215,
+        10.889, 11.485, 6.469, 4.999, 4.331, 3.955, 3.716, 3.552, 3.431, 3.340,
     ],
 ];
 
 /// The critical value of the interval after `pairs` pairs of a proof planned for at most
 /// `max_pairs` ([`CRITICAL`]). Before the first look (fewer than [`MIN_DECISIVE_PAIRS`]) no
-/// verdict is read, and the interval shown is Student's plain one on one degree of freedom
-/// (12.706), wider than any look's. Both counts are clamped to the calibrated range.
+/// verdict is read, and the interval shown is the wider of Student's plain one on one degree
+/// of freedom (12.706) and the plan's widest look. Both counts are clamped to the calibrated
+/// range.
 pub fn critical(max_pairs: usize, pairs: usize) -> f64 {
-    if pairs < MIN_DECISIVE_PAIRS {
-        return t975(1.0);
-    }
-    let planned = max_pairs.max(pairs).min(MAX_PAIRS);
+    let planned = max_pairs.max(pairs).clamp(MIN_DECISIVE_PAIRS, MAX_PAIRS);
     let row = CRITICAL[planned - MIN_DECISIVE_PAIRS];
+    if pairs < MIN_DECISIVE_PAIRS {
+        return t975(1.0).max(row.iter().copied().fold(0.0, f64::max));
+    }
     row[pairs.min(planned) - MIN_DECISIVE_PAIRS]
 }
 
@@ -390,26 +365,91 @@ pub enum AbDecision {
 /// The 2×2 crossover statistics of the signed log ratios `d` of pairs whose candidate ran
 /// first where `candidate_first` says so: `(estimate, w, s)`, the estimate's variance being
 /// `w` times a pair's. With both orders present the estimate is the mean of the two orders'
-/// means and `w = (1/n_AB + 1/n_BA) / 4`; with one order only, the plain mean and `1/n`. `s`
-/// is the sample SD of all of `d`. [`CRITICAL`] is calibrated on `estimate / (s · √w)`.
+/// means, `w = (1/n_AB + 1/n_BA) / 4`, and, from four pairs, `s` the pooled within-order SD
+/// (each order's deviations from its own mean, on `n − 2` degrees of freedom): an order effect
+/// moves the two orders' means apart and is left out of `s`, as it is out of the estimate.
+/// With fewer pairs (the pooled SD would have one degree of freedom or none) and with one order
+/// only, `s` is the sample SD of all of `d`. [`CRITICAL`] is calibrated on
+/// `estimate / (s · √w)`.
 fn crossover(d: &[f64], candidate_first: &[bool]) -> (f64, f64, f64) {
-    let (mean, var) = mean_var(d);
-    let of_order = |first: bool| {
-        let v: Vec<f64> = d
-            .iter()
+    /// From how many pairs the spread is the pooled within-order SD (two degrees of freedom).
+    const POOLED_FROM_PAIRS: usize = 4;
+    let of_order = |first: bool| -> Vec<f64> {
+        d.iter()
             .zip(candidate_first)
             .filter(|(_, f)| **f == first)
             .map(|(x, _)| *x)
-            .collect();
-        (mean_var(&v).0, v.len() as f64)
+            .collect()
     };
-    let ((m_ba, n_ba), (m_ab, n_ab)) = (of_order(true), of_order(false));
-    let (est, w) = if n_ba > 0.0 && n_ab > 0.0 {
-        ((m_ab + m_ba) / 2.0, (1.0 / n_ab + 1.0 / n_ba) / 4.0)
+    let (ba, ab) = (of_order(true), of_order(false));
+    let (n_ba, n_ab) = (ba.len() as f64, ab.len() as f64);
+    if n_ba > 0.0 && n_ab > 0.0 && d.len() >= POOLED_FROM_PAIRS {
+        let ((m_ba, v_ba), (m_ab, v_ab)) = (mean_var(&ba), mean_var(&ab));
+        let pooled = ((n_ba - 1.0) * v_ba + (n_ab - 1.0) * v_ab) / (n_ba + n_ab - 2.0);
+        (
+            (m_ab + m_ba) / 2.0,
+            (1.0 / n_ab + 1.0 / n_ba) / 4.0,
+            pooled.sqrt(),
+        )
+    } else if n_ba > 0.0 && n_ab > 0.0 {
+        let ((m_ba, _), (m_ab, _)) = (mean_var(&ba), mean_var(&ab));
+        (
+            (m_ab + m_ba) / 2.0,
+            (1.0 / n_ab + 1.0 / n_ba) / 4.0,
+            mean_var(d).1.sqrt(),
+        )
     } else {
-        (mean, 1.0 / d.len().max(1) as f64)
+        let (mean, var) = mean_var(d);
+        (mean, 1.0 / d.len().max(1) as f64, var.sqrt())
+    }
+}
+
+/// The noise floor of a pair's log ratio from the pairs themselves: the paired differences
+/// `d` (in pair order) of each order (`candidate_first`), and the mean squared difference of
+/// consecutive ones of the same order (von Neumann: `σ² ≈ MSSD / 2`).
+///
+/// Paired, as the design is: what moves both trials of a pair alike (the service slowing
+/// through the proof, a neighbour's load, a cache warming) is not in `d`, and within one order
+/// an order effect is not in a difference of consecutive `d` either; a slow drift of the
+/// change itself barely is. 9.3.2 learned the floor from each arm's own consecutive trials:
+/// a drift common to both arms raised it although the pairs cancel it, and with it the
+/// interval. At least [`MIN_NOISE_SD`] and the count `resolution` ([`count_resolution`]), and
+/// doubled while there is no difference yet (fewer than three pairs: nothing says how precise
+/// it is).
+pub fn noise_floor_paired(d: &[f64], candidate_first: &[bool], resolution: f64) -> f64 {
+    let mut squares = Vec::new();
+    for order in [true, false] {
+        let mine: Vec<f64> = d
+            .iter()
+            .zip(candidate_first)
+            .filter(|(x, f)| **f == order && x.is_finite())
+            .map(|(x, _)| *x)
+            .collect();
+        squares.extend(mine.windows(2).map(|w| (w[1] - w[0]).powi(2)));
+    }
+    let var = if squares.is_empty() {
+        0.0
+    } else {
+        squares.iter().sum::<f64>() / squares.len() as f64 / 2.0
     };
-    (est, w, var.sqrt())
+    let floor = var.sqrt().max(MIN_NOISE_SD).max(resolution);
+    if squares.is_empty() {
+        2.0 * floor
+    } else {
+        floor
+    }
+}
+
+/// [`noise_floor_paired`] of the pairs `a[i]`, `b[i]` (positive values; the log ratios
+/// `ln(b/a)`), in one order: a metric shown beside the objective.
+pub fn noise_floor_of_pairs(a: &[f64], b: &[f64], resolution: f64) -> f64 {
+    let d: Vec<f64> = a
+        .iter()
+        .zip(b)
+        .filter(|(x, y)| **x > 0.0 && **y > 0.0)
+        .map(|(x, y)| (y / x).ln())
+        .collect();
+    noise_floor_paired(&d, &vec![false; d.len()], resolution)
 }
 
 /// The A/B decision of `oprobe prove`, one pair at a time: pure and synchronous, so the whole
@@ -420,7 +460,7 @@ fn crossover(d: &[f64], candidate_first: &[bool]) -> (f64, f64, f64) {
 ///   crossover estimate): a constant order effect — the second trial of a pair running better
 ///   or worse — cancels exactly, also when the orders differ by one.
 /// - **Spread.** The larger of the pairs' own sample SD (which an order effect only inflates)
-///   and the noise floor ([`noise_floor_ab`]); the standard error is that spread times
+///   and the noise floor ([`noise_floor_paired`]); the standard error is that spread times
 ///   `√((1/n_AB + 1/n_BA) / 4)`.
 /// - **Boundary.** One two-sided sequential boundary ([`critical`]): the interval after each
 ///   pair is a repeated confidence interval, and the verdict is whether it excludes no
@@ -471,10 +511,11 @@ impl AbTest {
         self.pairs.len()
     }
 
-    /// The noise floor after the pairs so far (a per-pair log-ratio spread).
+    /// The noise floor after the pairs so far (a per-pair log-ratio spread), from the paired
+    /// differences ([`noise_floor_paired`]).
     pub fn noise_floor(&self) -> f64 {
-        let a: Vec<f64> = self.pairs.iter().map(|p| p.baseline).collect();
-        let b: Vec<f64> = self.pairs.iter().map(|p| p.candidate).collect();
+        let d: Vec<f64> = self.pairs.iter().map(|p| self.signed(p)).collect();
+        let orders: Vec<bool> = self.pairs.iter().map(|p| p.candidate_first).collect();
         let count = self
             .pairs
             .iter()
@@ -488,7 +529,16 @@ impl AbTest {
             (self.pairs.iter().map(|p| p.resolution.powi(2)).sum::<f64>() / self.pairs.len() as f64)
                 .sqrt()
         };
-        noise_floor_ab(&a, &b, count.max(own))
+        noise_floor_paired(&d, &orders, count.max(own))
+    }
+
+    /// The signed log ratio of pair `p`: positive when the candidate is better.
+    fn signed(&self, p: &AbPair) -> f64 {
+        if self.higher_is_better {
+            (p.candidate / p.baseline).ln()
+        } else {
+            (p.baseline / p.candidate).ln()
+        }
     }
 
     /// The smallest change this proof can show at the spread of its pairs so far, as a
@@ -506,17 +556,7 @@ impl AbTest {
         if n == 0 {
             return None;
         }
-        let d: Vec<f64> = self
-            .pairs
-            .iter()
-            .map(|p| {
-                if self.higher_is_better {
-                    (p.candidate / p.baseline).ln()
-                } else {
-                    (p.baseline / p.candidate).ln()
-                }
-            })
-            .collect();
+        let d: Vec<f64> = self.pairs.iter().map(|p| self.signed(p)).collect();
         let orders: Vec<bool> = self.pairs.iter().map(|p| p.candidate_first).collect();
         let (est, w, s) = crossover(&d, &orders);
         let sd = s.max(self.noise_floor());
@@ -635,41 +675,65 @@ mod tests {
         }
     }
 
-    /// The A/A floor of baseline values alone (no candidate yet).
-    fn noise_floor(a: &[f64], resolution: f64) -> f64 {
-        noise_floor_ab(a, &[], resolution)
+    /// The floor of pairs `a[i]`, `b[i]` in one order.
+    fn noise_floor(a: &[f64], b: &[f64], resolution: f64) -> f64 {
+        noise_floor_of_pairs(a, b, resolution)
     }
 
     #[test]
     fn the_noise_floor_has_a_minimum() {
-        // No A/A difference yet: the minimum, widened.
-        assert_eq!(noise_floor(&[100.0], 0.0), 2.0 * MIN_NOISE_SD);
-        let f = noise_floor(&[100.0, 120.0, 100.0], 0.0);
-        assert!(f > 0.15 && f < 0.2, "{f}");
+        // No difference of consecutive pairs yet: the minimum, widened.
+        assert_eq!(noise_floor(&[100.0], &[100.0], 0.0), 2.0 * MIN_NOISE_SD);
+        let f = noise_floor(&[100.0, 120.0, 100.0], &[100.0; 3], 0.0);
+        assert!(f > 0.12 && f < 0.14, "{f}");
+        // Identical pairs: the minimum.
+        assert_eq!(noise_floor(&[100.0; 4], &[100.0; 4], 0.0), MIN_NOISE_SD);
     }
 
-    /// W8: a steady candidate against a noisy (throttled) baseline: the pair's spread is A's
-    /// alone, not the A/A spread of two noisy trials (√2 more).
+    /// What moves both trials of a pair alike is not in the pair's log ratio, and so not in
+    /// the floor: a service slowing through the proof (or a neighbour's load coming and
+    /// going) by tens of percent leaves the floor of steady pairs at its minimum. 9.3.2
+    /// learned it from each arm's consecutive trials and took the drift for noise.
     #[test]
-    fn a_steady_candidate_does_not_double_the_baselines_noise() {
-        let a = [100.0, 150.0, 100.0, 150.0];
-        let steady = [60.0, 60.0, 60.0, 60.0];
-        let aa = noise_floor(&a, 0.0);
-        let ab = noise_floor_ab(&a, &steady, 0.0);
-        assert!((ab - aa / 2f64.sqrt()).abs() < 1e-12, "{ab} vs {aa}");
-        // As noisy as A: the A/A floor.
-        assert!((noise_floor_ab(&a, &a, 0.0) - aa).abs() < 1e-12);
-        // One B trial says nothing about B: A/A.
-        assert_eq!(noise_floor_ab(&a, &[60.0], 0.0), aa);
-        // Minimums hold.
-        assert_eq!(noise_floor_ab(&[100.0; 4], &[100.0; 4], 0.0), MIN_NOISE_SD);
+    fn a_drift_common_to_both_arms_is_not_noise() {
+        let drift = [1.0, 1.3, 0.8, 1.5, 0.9, 1.4];
+        let a: Vec<f64> = drift.iter().map(|k| 100.0 * k).collect();
+        let b: Vec<f64> = drift.iter().map(|k| 120.0 * k).collect();
+        assert_eq!(noise_floor(&a, &b, 0.0), MIN_NOISE_SD);
+        // A steady candidate against a noisy baseline: the pair's spread is the baseline's.
+        let noisy = [100.0, 150.0, 100.0, 150.0, 100.0];
+        let f = noise_floor(&noisy, &[60.0; 5], 0.0);
+        let step = (1.5f64).ln();
+        assert!((f - step / 2f64.sqrt()).abs() < 1e-12, "{f}");
+    }
+
+    /// An order effect (the second trial of a pair better by γ) alternates the sign of the
+    /// pairs' log ratios with their order: within one order it cancels, and the floor of
+    /// otherwise steady pairs stays at its minimum.
+    #[test]
+    fn an_order_effect_is_not_noise() {
+        let gamma = 0.2;
+        let orders = [true, false, false, true, true, false];
+        let d: Vec<f64> = orders
+            .iter()
+            .map(|first| 0.05 + if *first { -gamma } else { gamma })
+            .collect();
+        assert_eq!(noise_floor_paired(&d, &orders, 0.0), MIN_NOISE_SD);
+        // Unaware of the orders it would have been the order effect.
+        assert!(noise_floor_paired(&d, &[false; 6], 0.0) > gamma);
     }
 
     #[test]
-    fn one_aa_difference_is_not_a_precise_floor() {
-        let one = noise_floor(&[100.0, 110.0], 0.0);
+    fn no_difference_is_not_a_precise_floor() {
+        let one = noise_floor(&[100.0, 110.0], &[100.0, 100.0], 0.0);
         let d = (110.0f64 / 100.0).ln();
-        assert!((one - 2.0 * d).abs() < 1e-12, "{one}");
+        assert!((one - d / 2f64.sqrt()).abs() < 1e-12, "{one}");
+        // Two pairs of different orders: no difference within an order yet.
+        let d = [0.1, 0.3];
+        assert_eq!(
+            noise_floor_paired(&d, &[true, false], 0.0),
+            2.0 * MIN_NOISE_SD
+        );
     }
 
     #[test]
@@ -679,9 +743,9 @@ mod tests {
         // at least what one operation resolves.
         let a = [37.0, 37.0, 37.0, 38.0, 37.0];
         let b = [36.0, 35.0, 37.0, 37.0, 35.0];
-        let floor = noise_floor(&a, count_resolution(35));
+        let floor = noise_floor(&a, &a, count_resolution(35));
         assert_eq!(floor, count_resolution(35));
-        assert!(floor > MIN_NOISE_SD && floor > noise_floor(&a, 0.0));
+        assert!(floor > MIN_NOISE_SD && floor > noise_floor(&a, &a, 0.0));
         let mut t = AbTest::new(true, 3, 5);
         for (i, (x, y)) in a.iter().zip(&b).enumerate() {
             t.push(AbPair {
@@ -695,8 +759,8 @@ mod tests {
         assert!(i.low < 0.0 && i.high > 0.0, "{i:?}");
         // Thousands of operations resolve far below the minimum floor: nothing changes.
         assert_eq!(
-            noise_floor(&a, count_resolution(10_000)),
-            noise_floor(&a, 0.0)
+            noise_floor(&a, &b, count_resolution(10_000)),
+            noise_floor(&a, &b, 0.0)
         );
     }
 
@@ -768,7 +832,9 @@ mod tests {
     #[test]
     fn the_boundary_tightens_with_looks_and_widens_with_the_plan() {
         for planned in MIN_DECISIVE_PAIRS..=MAX_PAIRS {
-            for k in MIN_DECISIVE_PAIRS..planned {
+            // From the fourth look, where the spread is the pooled within-order SD (the third
+            // reads another statistic).
+            for k in MIN_DECISIVE_PAIRS + 1..planned {
                 assert!(critical(planned, k) > critical(planned, k + 1));
             }
             if planned < MAX_PAIRS {
@@ -870,9 +936,9 @@ mod tests {
             (AbDecision::Futile, AbVerdict::Inconclusive)
         );
         // An effect near the floor is neither: every planned pair runs.
-        let mut t = AbTest::new(true, 3, 4);
+        let mut t = AbTest::new(true, 3, 5);
         let mut last = AbDecision::Continue;
-        for (i, b) in [103.0, 101.0, 104.0, 102.0].into_iter().enumerate() {
+        for (i, b) in [103.0, 101.0, 104.0, 102.0, 103.0].into_iter().enumerate() {
             assert_eq!(last, AbDecision::Continue);
             last = t.push(pair(100.0, b, i % 2 == 0));
         }
@@ -893,19 +959,26 @@ mod tests {
     }
 
     /// What a simulated service does to a pair of trials: each trial's objective is
-    /// log-normal with spread `sigma`, the candidate's is `effect` (log) higher, and the
-    /// trial that runs second in its pair is `carry` (log) higher.
+    /// log-normal with spread `sigma`, the candidate's is `effect` (log) higher, the trial
+    /// that runs second in its pair is `carry` (log) higher, and both trials of a pair move
+    /// with the service's level, a random walk of `drift` (log) per pair.
     #[derive(Clone, Copy)]
     struct World {
         sigma: f64,
         effect: f64,
         carry: f64,
+        drift: f64,
     }
 
     impl World {
         fn pair(&self, rng: &mut SmallRng, candidate_first: bool) -> AbPair {
-            let mut a = self.sigma * normal(rng);
-            let mut b = self.effect + self.sigma * normal(rng);
+            self.pair_at(rng, candidate_first, 0.0)
+        }
+
+        /// A pair at service level `level` (log).
+        fn pair_at(&self, rng: &mut SmallRng, candidate_first: bool, level: f64) -> AbPair {
+            let mut a = level + self.sigma * normal(rng);
+            let mut b = level + self.effect + self.sigma * normal(rng);
             if candidate_first {
                 a += self.carry;
             } else {
@@ -918,9 +991,11 @@ mod tests {
         fn prove(&self, rng: &mut SmallRng, max_pairs: usize) -> AbTest {
             let seed = rng.r#gen::<u64>();
             let mut t = AbTest::new(true, MIN_DECISIVE_PAIRS, max_pairs);
+            let mut level = 0.0;
             loop {
                 let first = candidate_first(seed, t.pairs() as u64);
-                if t.push(self.pair(rng, first)) != AbDecision::Continue {
+                level += self.drift * normal(rng);
+                if t.push(self.pair_at(rng, first, level)) != AbDecision::Continue {
                     return t;
                 }
             }
@@ -946,6 +1021,7 @@ mod tests {
                     sigma,
                     effect: 0.0,
                     carry: 0.0,
+                    drift: 0.0,
                 };
                 let rate = w.verdict_rate(1000 * max_pairs as u64 + i as u64, 3000, max_pairs);
                 assert!(rate <= 0.05, "{max_pairs} pairs, σ {sigma}: {rate}");
@@ -985,6 +1061,7 @@ mod tests {
                     sigma,
                     effect: 0.0,
                     carry: k * sigma,
+                    drift: 0.0,
                 };
                 let rate =
                     w.verdict_rate(77_000 + 10 * max_pairs as u64 + i as u64, 2000, max_pairs);
@@ -1003,6 +1080,7 @@ mod tests {
             sigma,
             effect: 3.0 * sigma_pair,
             carry: 0.0,
+            drift: 0.0,
         };
         let mut rng = SmallRng::seed_from_u64(4242);
         let (mut found, mut pairs) = (0, 0);
@@ -1023,6 +1101,7 @@ mod tests {
                 sigma,
                 effect: 2.0 * sigma_pair,
                 carry,
+                drift: 0.0,
             };
             let power = w.verdict_rate(4243, 2000, 12);
             assert!(power > 0.9, "carry {carry}: {power}");
@@ -1032,6 +1111,7 @@ mod tests {
             sigma,
             effect: -0.3,
             carry: 0.0,
+            drift: 0.0,
         };
         let t = w.prove(&mut SmallRng::seed_from_u64(1), 6);
         assert_eq!(t.verdict(), AbVerdict::Worse);
@@ -1047,6 +1127,7 @@ mod tests {
                 sigma: 0.05,
                 effect: [0.0, 0.05, 0.2, -0.2][i % 4],
                 carry: [0.0, 0.1][i % 2],
+                drift: 0.0,
             };
             let max_pairs = 3 + i % 10;
             let seed = rng.r#gen::<u64>();
@@ -1110,43 +1191,45 @@ mod tests {
         let sd = 0.15;
         let shown: Vec<f64> = [3, 6, 12].iter().map(|k| resolvable(*k, sd) / sd).collect();
         assert!(
-            (shown[0] - 4.607 * 0.375f64.sqrt()).abs() < 1e-9,
+            (shown[0] - 4.612 * 0.375f64.sqrt()).abs() < 1e-9,
             "{shown:?}"
         );
-        assert!((shown[1] - 3.659 / 6f64.sqrt()).abs() < 1e-9, "{shown:?}");
-        assert!((shown[2] - 3.215 / 12f64.sqrt()).abs() < 1e-9, "{shown:?}");
+        assert!((shown[1] - 4.241 / 6f64.sqrt()).abs() < 1e-9, "{shown:?}");
+        assert!((shown[2] - 3.340 / 12f64.sqrt()).abs() < 1e-9, "{shown:?}");
         assert_eq!(resolvable(40, sd), resolvable(12, sd));
-        // Three pairs at a 15 % floor (A and B each swing ±15 %), the candidate +7 %.
+        // Three pairs spreading by 15 % (the candidate's trials swing against the baseline's),
+        // the candidate +7 % on the crossover estimate.
         let pairs = |max_pairs: usize| {
             let mut t = AbTest::new(true, 3, max_pairs);
             let mut last = AbDecision::Continue;
-            for (i, a) in [100.0, 116.0, 100.0].into_iter().enumerate() {
-                last = t.push(pair(a, a * 1.07, i % 2 == 1));
+            for (i, (a, d)) in [(100.0, 0.268), (116.0, -0.022), (100.0, 0.056)]
+                .into_iter()
+                .enumerate()
+            {
+                last = t.push(pair(a, a * f64::exp(d), i % 2 == 1));
             }
             (t, last)
         };
         let (t, last) = pairs(12);
+        let (est, _, sd, _) = t.estimate().unwrap();
+        assert!((est - 0.07).abs() < 1e-9, "{est}");
+        assert!((sd - 0.15).abs() < 0.001, "{sd}");
         assert!(
-            (t.noise_floor() - 0.148).abs() < 0.01,
+            (t.noise_floor() - 0.15).abs() < 0.001,
             "{}",
             t.noise_floor()
         );
-        // 9.2's rule on the same pairs: futile.
-        let (est, _, sd, _) = t.estimate().unwrap();
-        let old = Sprt::new((2.0 * t.noise_floor()).max(MIN_EFFECT), ALPHA, BETA).decision(
-            1.0 / 3.0,
-            est,
-            sd,
-        );
+        // 9.2's rule on the same pairs (twice a 15 % floor): futile.
+        let old = Sprt::new((2.0 * sd).max(MIN_EFFECT), ALPHA, BETA).decision(1.0 / 3.0, est, sd);
         assert_eq!(old, SprtDecision::Same);
         // Twelve pairs can show less than a floor: the proof goes on.
         assert_eq!(last, AbDecision::Continue);
         let shown = t.resolvable_change().unwrap();
         assert!(shown > 0.13 && shown < 0.16, "{shown}");
-        // No change at all (both sides swinging 20 % together) is still futile once the pairs
-        // rule out what the plan could show:
-        // at the first look of six pairs, not yet of twelve.
-        for (max_pairs, at) in [(6, 3), (12, 6)] {
+        // No change at all, both sides swinging 20 % together: the swing is in neither pair's
+        // log ratio, and the proof is futile at its first look whatever its plan. (9.3.2 took
+        // the common swing for noise and ran twelve-pair plans to their sixth pair.)
+        for (max_pairs, at) in [(6, 3), (12, 3)] {
             let mut t = AbTest::new(true, 3, max_pairs);
             let mut stopped = None;
             for i in 0..max_pairs {
@@ -1205,5 +1288,61 @@ mod tests {
         assert!((t.noise_floor() - 0.3).abs() < 1e-12);
         let w = |i: Interval| i.high - i.low;
         assert!(w(t.interval()) > 10.0 * w(plain.interval()));
+    }
+
+    /// The power the 9.3.2 statistics lost, back: a +15 % change found as often under a
+    /// symmetric order effect (the second trial of every pair 15 % better or worse) and
+    /// under a drift both arms share (the service's level a random walk of 25 % per pair)
+    /// as without them. 9.3.2 put the order effect into the spread and the drift into the
+    /// noise floor: on these seeds it found the change in 78.6 % of six-pair proofs without
+    /// them, but in 1.1 % and 1.2 % under the order effect and 2.0 % under the drift (27.9 %
+    /// and 4.5 % of twelve-pair proofs). Now: 66 to 70 % at six pairs whatever the order
+    /// effect or drift (the pooled spread's lost degree of freedom costs some 9 points
+    /// without either), 99.5 % at twelve; a change that is none, at most 2.4 %.
+    #[test]
+    fn a_real_change_is_found_through_an_order_effect_and_a_drift() {
+        let (sigma, effect) = (0.05, 1.15f64.ln());
+        let world = |carry, drift| World {
+            sigma,
+            effect,
+            carry,
+            drift,
+        };
+        for (max_pairs, at_least) in [(6, 0.6), (12, 0.95)] {
+            let plain = world(0.0, 0.0).verdict_rate(9_300, 3000, max_pairs);
+            assert!(plain >= at_least, "{max_pairs} pairs, plain: {plain}");
+            for (carry, drift) in [(0.15, 0.0), (-0.15, 0.0), (0.0, 0.25), (0.15, 0.25)] {
+                let rate = world(carry, drift).verdict_rate(9_301, 3000, max_pairs);
+                assert!(
+                    rate >= at_least && rate >= plain - 0.1,
+                    "{max_pairs} pairs, order {carry}, drift {drift}: {rate} (plain {plain})"
+                );
+            }
+        }
+    }
+
+    /// Neither the pooled within-order spread nor the paired floor lets a change that is
+    /// none through more often: under order effects and drifts, for every plan, at most 5 %.
+    #[test]
+    fn no_change_is_called_through_an_order_effect_or_a_drift() {
+        for max_pairs in MIN_DECISIVE_PAIRS..=MAX_PAIRS {
+            for (i, (carry, drift)) in [(0.15, 0.0), (-0.15, 0.0), (0.0, 0.25), (0.15, 0.25)]
+                .into_iter()
+                .enumerate()
+            {
+                let w = World {
+                    sigma: 0.05,
+                    effect: 0.0,
+                    carry,
+                    drift,
+                };
+                let rate =
+                    w.verdict_rate(5_000 + 10 * max_pairs as u64 + i as u64, 3000, max_pairs);
+                assert!(
+                    rate <= 0.05,
+                    "{max_pairs} pairs, order {carry}, drift {drift}: {rate}"
+                );
+            }
+        }
     }
 }

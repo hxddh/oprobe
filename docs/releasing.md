@@ -5,14 +5,16 @@
 `.github/workflows/release.yml` builds and publishes a release when:
 
 - a commit lands on `main` whose `Cargo.toml` version has no `v<version>` tag yet (the workflow
-  tags it);
+  tags it, in its last job, only once the tests and every build passed: a failed release leaves
+  no tag, and the same version can be merged again);
 - a `v*` tag is pushed by hand;
 - the workflow is run manually (optionally naming an existing tag to rebuild).
 
 ## Checklist
 
 1. Set the version in one place, `workspace.package.version` of the root `Cargo.toml`. Run
-   `cargo build` (updates `Cargo.lock`).
+   `cargo build` (updates `Cargo.lock`). Point the git `tag` of the `oprobe-trace` snippets in
+   `README.md`, `README.zh-CN.md` and `docs/embedding.md` at the new tag (a docs test checks).
 2. Title and date the section at the top of `CHANGELOG.md` (`## Unreleased` becomes
    `## vX.Y.Z — <date>`): it becomes the release notes.
 3. Refresh generated files if anything changed: `OPROBE_BLESS=1 cargo test --test cli` (schemas)
@@ -21,8 +23,9 @@
    `cargo bench -p oprobe-trace --bench overhead -- --quick`.
 5. Merge. The workflow tests, builds every platform (the app build and the CLI-only build of each
    target), writes `latest.json`, attests every asset and publishes the GitHub release; then
-   `oprobe-trace` goes to crates.io when `CARGO_REGISTRY_TOKEN` is set (without it the job ends
-   with a warning, not a failure). No package manager is updated: the release assets and the
+   `oprobe-trace` goes to crates.io when `CARGO_REGISTRY_TOKEN` is set (without it the publish
+   steps show as skipped, with a warning and a line in the run summary saying nothing was
+   published). No package manager is updated: the release assets and the
    install scripts are the only channel of the binary.
 
 ## Crates

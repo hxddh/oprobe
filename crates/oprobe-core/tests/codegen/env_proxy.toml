@@ -1,0 +1,3 @@
+url = "s3://bucket/prefix"
+[http]
+proxy = "http://${OPROBE_PROXY_HOST}:3128"
