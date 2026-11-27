@@ -643,3 +643,63 @@ mod host_transport {
         assert!(service.get("http_transport").is_none(), "{service}");
     }
 }
+
+/// T2: a save that cannot be written loses nothing. 9.3.3 reset the window and took the rows
+/// before it wrote, so `save_and_reset` to a missing directory returned the error with the
+/// period gone.
+#[tokio::test]
+async fn a_failed_save_keeps_what_it_was_saving() {
+    let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+    let op = Operator::new(Memory::default()).unwrap().layer(layer);
+    op.write("a", "x").await.unwrap();
+    op.stat("a").await.unwrap();
+    let nowhere = std::env::temp_dir()
+        .join(format!("oprobe-trace-missing-{}", std::process::id()))
+        .join("p.oprobe");
+    assert!(handle.save_and_reset(&nowhere).is_err());
+    assert!(handle.save(&nowhere).is_err());
+    assert_eq!(handle.snapshot().summary.ops, 2, "the window was kept");
+    let path = temp_file("after-failure");
+    handle.save_and_reset(&path).unwrap();
+    let doc = read_json(&path);
+    assert_eq!(doc["snapshot"]["summary"]["ops_count"], 2);
+    assert_eq!(
+        doc["rows"]["ops"].as_array().unwrap().len(),
+        2,
+        "the rows were kept"
+    );
+}
+
+/// T3: concurrent saves to one path each write a whole file. 9.3.3 wrote every save through
+/// `<path>.tmp`, and two at once interleaved into files that did not parse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_saves_to_one_path_write_whole_files() {
+    let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+    let op = Operator::new(Memory::default()).unwrap().layer(layer);
+    for i in 0..200 {
+        op.write(&format!("k{i}"), vec![1u8; 64]).await.unwrap();
+    }
+    let path = temp_file("concurrent");
+    let handle = std::sync::Arc::new(handle);
+    for _ in 0..50 {
+        let savers: Vec<_> = (0..2)
+            .map(|_| {
+                let (h, p) = (handle.clone(), path.clone());
+                std::thread::spawn(move || h.save(&p))
+            })
+            .collect();
+        for s in savers {
+            s.join().unwrap().unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        serde_json::from_str::<serde_json::Value>(&text).expect("a whole file");
+    }
+    let dir = path.parent().unwrap();
+    let left: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(left.len(), 1, "no temporary file is left: {left:?}");
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -114,33 +114,73 @@ pub(crate) fn write(
     snapshot: &Snapshot,
     rows: Option<&TraceRows>,
 ) -> io::Result<()> {
-    let doc = FileRef {
-        format: TRACE_FORMAT,
-        oprobe_trace_version: env!("CARGO_PKG_VERSION"),
-        created_at: crate::util::now_rfc3339(),
-        service,
-        snapshot,
-        rows: rows.map(|r| RowsRef {
-            ops: &r.ops,
-            reqs: &r.reqs,
-            info: &r.info,
-            sampling: &r.sampling,
-        }),
-    };
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    let result = (|| {
-        let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
+    Pending::create(path)?.finish(service, snapshot, rows)
+}
+
+/// A file being written next to its destination, under a temporary name of its own: two
+/// saves to one path never write the same temporary file (9.3.3 used `<path>.tmp` for every
+/// save, and concurrent saves interleaved into files that did not parse). Created before
+/// anything is taken from the recorder, so a destination that cannot be written fails
+/// first, with nothing lost. Dropped unfinished, it removes its temporary file.
+pub(crate) struct Pending {
+    path: std::path::PathBuf,
+    tmp: std::path::PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl Pending {
+    pub(crate) fn create(path: &Path) -> io::Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".{}-{n}.tmp", std::process::id()));
+        let tmp = std::path::PathBuf::from(tmp);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            tmp,
+            file: Some(file),
+        })
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        service: Option<&ServiceRecord>,
+        snapshot: &Snapshot,
+        rows: Option<&TraceRows>,
+    ) -> io::Result<()> {
+        let doc = FileRef {
+            format: TRACE_FORMAT,
+            oprobe_trace_version: env!("CARGO_PKG_VERSION"),
+            created_at: crate::util::now_rfc3339(),
+            service,
+            snapshot,
+            rows: rows.map(|r| RowsRef {
+                ops: &r.ops,
+                reqs: &r.reqs,
+                info: &r.info,
+                sampling: &r.sampling,
+            }),
+        };
+        let file = self.file.take().expect("finished once");
+        let mut w = BufWriter::new(file);
         serde_json::to_writer(&mut w, &doc).map_err(io::Error::other)?;
         w.write_all(b"\n")?;
-        w.into_inner().map_err(|e| e.into_error())?.sync_all()
-    })();
-    match result {
-        Ok(()) => std::fs::rename(&tmp, path),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
+        w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        std::fs::rename(&self.tmp, &self.path)?;
+        self.tmp = std::path::PathBuf::new();
+        Ok(())
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if !self.tmp.as_os_str().is_empty() {
+            self.file = None;
+            let _ = std::fs::remove_file(&self.tmp);
         }
     }
 }

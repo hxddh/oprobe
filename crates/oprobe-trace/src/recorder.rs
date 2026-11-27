@@ -931,6 +931,8 @@ impl Recorder {
                 failures: 0,
                 ..conn
             };
+            *self.window_start.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+            self.frozen_elapsed_us.store(WINDOW_OPEN, Ordering::Release);
             drop(a);
             for t in &self.trace {
                 t.lock().unwrap_or_else(|e| e.into_inner()).reset();
@@ -942,8 +944,6 @@ impl Recorder {
                 Ordering::Relaxed,
             );
             self.interval_peak.store(0, Ordering::Release);
-            *self.window_start.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-            self.frozen_elapsed_us.store(WINDOW_OPEN, Ordering::Release);
             self.measuring.store(true, Ordering::Release);
         } else if self.measuring.load(Ordering::Acquire) {
             // Freeze the window length at the moment measurement ends (unless the runner already
@@ -951,8 +951,9 @@ impl Recorder {
             self.close_window(Instant::now());
             // The last interval's in-flight peak, before nothing folds it any more.
             let packed = self.interval_peak.load(Ordering::Acquire);
-            let window_start = self.window_start();
-            self.fold_interval_peak(&mut self.agg(), packed, window_start);
+            let (mut a, window_start) = self.agg_at();
+            self.fold_interval_peak(&mut a, packed, window_start);
+            drop(a);
             self.measuring.store(false, Ordering::Release);
         }
         self.phase.store(code, Ordering::Release);
@@ -991,6 +992,16 @@ impl Recorder {
 
     pub fn window_start(&self) -> Instant {
         *self.window_start.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The aggregates, locked, with the start of the window they belong to. A reset replaces
+    /// both under this lock: a start read before taking it may be the previous window's, and
+    /// an event placed by it lands in the wrong interval of the new window (9.3.3: a window
+    /// 6 ms old held intervals up to 3 600 s).
+    fn agg_at(&self) -> (std::sync::MutexGuard<'_, Agg>, Instant) {
+        let a = self.agg();
+        let start = self.window_start();
+        (a, start)
     }
 
     /// Length of the measurement window: time since it started, or its final length once
@@ -1052,7 +1063,7 @@ impl Recorder {
                     // Whichever interval it held (an earlier one, or a later one from a thread
                     // racing a window reset), the value it replaced is folded, never lost.
                     if old_idx != idx && old_idx != 0 {
-                        let mut a = self.agg();
+                        let (mut a, window_start) = self.agg_at();
                         self.fold_interval_peak(&mut a, old, window_start);
                     }
                     return;
@@ -1087,10 +1098,9 @@ impl Recorder {
         if !self.window_open() {
             return;
         }
-        let window_start = self.window_start();
+        let (mut a, window_start) = self.agg_at();
         let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
         let idx = event_bucket(window_start.elapsed().as_micros() as u64, frozen);
-        let mut a = self.agg();
         self.ensure_bucket(&mut a, idx, window_start);
         f(a.bucket(idx));
     }
@@ -1177,14 +1187,14 @@ impl Recorder {
             e.on_request(r);
         }
         if self.is_measuring() {
-            let window_start = self.window_start();
-            // Unscoped: its offset is not relative to an operation; it ended just now.
-            let now_us = window_start.elapsed().as_micros() as i64;
+            let now_us;
             {
+                let (mut a, window_start) = self.agg_at();
+                // Unscoped: its offset is not relative to an operation; it ended just now.
+                now_us = window_start.elapsed().as_micros() as i64;
                 let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
                 let ended = event_bucket(now_us as u64, frozen);
                 let sent = event_bucket((now_us as u64).saturating_sub(r.timing.total_us), frozen);
-                let mut a = self.agg();
                 a.record_request(r);
                 self.ensure_bucket(&mut a, ended.max(sent), window_start);
                 a.bucket(sent).requests += 1;
@@ -1215,11 +1225,10 @@ impl Recorder {
         if !self.is_measuring() {
             return;
         }
-        let window_start = self.window_start();
+        let (mut a, window_start) = self.agg_at();
         let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
         let issued = window_start.elapsed() + backoff;
         let idx = event_bucket(issued.as_micros() as u64, frozen);
-        let mut a = self.agg();
         a.res.retries += 1;
         a.res.retry_backoff_ms += backoff.as_secs_f64() * 1000.0;
         self.ensure_bucket(&mut a, idx, window_start);
@@ -1247,9 +1256,8 @@ impl Recorder {
         if !self.is_measuring() {
             return;
         }
-        let window_start = self.window_start();
+        let (mut a, window_start) = self.agg_at();
         let idx = bucket_index(intended.saturating_duration_since(window_start).as_secs());
-        let mut a = self.agg();
         a.censored += 1;
         rec(&mut a.all_latency, lower_bound_us.max(1));
         self.ensure_bucket(&mut a, idx, window_start);
@@ -1358,11 +1366,6 @@ impl Recorder {
             }
             return;
         }
-        let window_start = self.window_start();
-        let at_s = c
-            .started
-            .saturating_duration_since(window_start)
-            .as_secs_f64();
         let mut bd = breakdown_us(&c.data, c.latency_us);
         if let Some(s) = c.schedule_us {
             // Waiting for an open-loop slot is queueing (an in-flight cap), not client work:
@@ -1382,7 +1385,11 @@ impl Recorder {
         let bytes = c.logical_read + c.logical_write;
         let req_count = c.data.requests.len() as u64 + c.data.dropped_requests;
 
-        let mut a = self.agg();
+        let (mut a, window_start) = self.agg_at();
+        let at_s = c
+            .started
+            .saturating_duration_since(window_start)
+            .as_secs_f64();
         // Leave the live set only under the aggregate lock: until then this operation keeps
         // its second open, so a concurrent completion cannot close that second before this
         // sample is in it.
@@ -1719,9 +1726,8 @@ impl Recorder {
         c.rss_mib = rss_mib;
         drop(c);
         if self.window_open() {
-            let window_start = self.window_start();
+            let (mut a, window_start) = self.agg_at();
             let idx = bucket_index(window_start.elapsed().as_secs());
-            let mut a = self.agg();
             self.ensure_bucket(&mut a, idx, window_start);
             a.bucket(idx).cpu_pct = Some(cpu_pct);
         }
@@ -2242,6 +2248,64 @@ mod tests {
             let last = t.last().unwrap();
             assert!(last.t_s + last.len_s >= (month_s + 20) as f64);
         }
+    }
+
+    /// T1: completions racing `snapshot_and_reset` land in the new window's intervals. 9.3.3
+    /// read the window start before taking the aggregate lock, so an operation placed against
+    /// the old start went into the new window: a window a few ms old held intervals up to
+    /// 3 600 s, and almost every later operation landed in one of them.
+    #[test]
+    fn a_reset_racing_completions_keeps_the_new_timeline() {
+        let rec = Recorder::always_on(10_000_000);
+        let stop = Arc::new(AtomicBool::new(false));
+        let next = Arc::new(AtomicU64::new(1));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let (rec, stop, next) = (rec.clone(), stop.clone(), next.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let id = next.fetch_add(1, Ordering::Relaxed);
+                        rec.op_started(id);
+                        rec.complete_op(
+                            true,
+                            OpCompletion {
+                                verb: "stat",
+                                op_id: id,
+                                started: Instant::now(),
+                                latency_us: 10,
+                                logical_read: 0,
+                                logical_write: 0,
+                                error: None,
+                                key: String::new(),
+                                data: Default::default(),
+                                schedule_us: None,
+                            },
+                        );
+                    }
+                })
+            })
+            .collect();
+        // Each window is over a second old when it is reset, so an operation placed against
+        // its start lands a whole interval (or more) into the fresh window.
+        let mut bad = Vec::new();
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            rec.snapshot_and_reset();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let snap = rec.snapshot();
+            let last = snap.timeline.iter().map(|p| p.t_s).fold(0.0, f64::max);
+            if snap.timeline.len() > 1 || last >= 1.0 {
+                bad.push((snap.elapsed_s, snap.timeline.len(), last));
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert!(
+            bad.is_empty(),
+            "fresh windows (age s, intervals, last interval s): {bad:?}"
+        );
     }
 
     /// Windows saved while operations complete on other threads: each window's rows are the

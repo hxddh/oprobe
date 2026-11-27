@@ -127,6 +127,8 @@ pub struct OpSampler {
     stratum_cap: usize,
     always: Vec<WholeOp>,
     slow: BinaryHeap<Reverse<Slow>>,
+    /// Rows (operations plus requests) of `slow`.
+    slow_rows: usize,
     unscoped: Vec<ReqRow>,
     unscoped_seen: u64,
     kept_rows: usize,
@@ -149,6 +151,7 @@ impl OpSampler {
             stratum_cap: usize::MAX,
             always: Vec::new(),
             slow: BinaryHeap::new(),
+            slow_rows: 0,
             unscoped: Vec::new(),
             unscoped_seen: 0,
             kept_rows: 0,
@@ -187,6 +190,10 @@ impl OpSampler {
         }
         let slow_cap = ((self.seen_ops as f64 * self.cfg.slow_ratio).ceil() as usize)
             .clamp(1, (self.cfg.max_rows / 10).max(1));
+        // The slow set holds at most a quarter of the row budget (failures hold at most half):
+        // capped only in operations, 9.3.3 kept 50 times the budget of operations with many
+        // requests, which the reservoir's shrinking could not make up for.
+        let slow_rows_cap = (self.cfg.max_rows / 4).max(1);
         if self.cfg.max_rows > 0 {
             let qualifies = self.slow.len() < slow_cap
                 || self
@@ -195,11 +202,15 @@ impl OpSampler {
                     .is_some_and(|Reverse(m)| w.op.latency_us > m.0.op.latency_us);
             if qualifies {
                 self.kept_rows += w.rows();
+                self.slow_rows += w.rows();
                 self.slow.push(Reverse(Slow(w)));
-                if self.slow.len() > slow_cap
-                    && let Some(Reverse(Slow(out))) = self.slow.pop()
-                {
+                // Over either cap: the fastest of the slow set go to the reservoir.
+                while self.slow.len() > slow_cap || self.slow_rows > slow_rows_cap {
+                    let Some(Reverse(Slow(out))) = self.slow.pop() else {
+                        break;
+                    };
                     self.kept_rows -= out.rows();
+                    self.slow_rows -= out.rows();
                     self.reservoir(out);
                 }
                 self.shrink();
@@ -381,6 +392,27 @@ mod tests {
             [0; 5],
             2,
         )
+    }
+
+    /// T7: operations with many requests and rising latency stay within the row budget.
+    /// 9.3.3 capped the slow set in operations only: one shard of 625 rows, fed 20 000
+    /// operations of 512 requests each, kept 31 806 rows.
+    #[test]
+    fn the_slow_set_stays_within_the_row_budget() {
+        let mut s = OpSampler::new(SampleConfig {
+            max_rows: 625,
+            ..SampleConfig::default()
+        });
+        let mut most = 0;
+        for i in 1..=20_000u64 {
+            let reqs = (0..512).map(|_| req(i, 200)).collect();
+            s.offer(op(i, (i as i64) * 1_000, i, true), reqs);
+            most = most.max(s.kept_rows());
+        }
+        assert!(most <= 625, "kept {most} rows of a budget of 625");
+        let (ops, reqs, _) = s.take();
+        // Whole operations still: each kept one has all its requests.
+        assert_eq!(reqs.len(), ops.len() * 512);
     }
 
     #[test]

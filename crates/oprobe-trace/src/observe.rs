@@ -125,6 +125,42 @@ struct ReadGroup {
     calls: usize,
     last_end: Option<Instant>,
     error: Option<Error>,
+    /// A read of the group was dropped before it returned (a timeout, the application).
+    cancelled: bool,
+}
+
+impl ReadGroup {
+    /// Complete the group's operation, as cancelled when one of its reads was dropped.
+    fn finish(self, obs: &Observer) {
+        let end = self.last_end.unwrap_or_else(Instant::now);
+        if self.cancelled {
+            complete(&obs.recorder, self.st, end, Some("cancelled".into()));
+        } else {
+            obs.finish_at(self.st, end, self.error.as_ref(), self.calls == 1);
+        }
+    }
+}
+
+/// One read of a [`ReadGroup`] in flight: dropped before it returned, it leaves the group,
+/// which then completes as cancelled. (9.3.3 left the group's count of reads above zero, and
+/// the operation never completed: it stayed live and in flight, and held its intervals open.)
+struct ActiveRead<'a> {
+    slot: &'a ReadSlot,
+    returned: bool,
+}
+
+impl Drop for ActiveRead<'_> {
+    fn drop(&mut self) {
+        if self.returned {
+            return;
+        }
+        let mut g = self.slot.group.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(x) = g.as_mut() {
+            x.active = x.active.saturating_sub(1);
+            x.last_end = Some(Instant::now());
+            x.cancelled = true;
+        }
+    }
 }
 
 /// Shared slot registered with [`Linker`] while an [`OpReader`] holds a coalesced [`ReadGroup`],
@@ -146,8 +182,7 @@ impl ReadSlot {
             }
         };
         if let Some(g) = done {
-            let end = g.last_end.unwrap_or_else(Instant::now);
-            self.obs.finish_at(g.st, end, g.error.as_ref(), g.calls == 1);
+            g.finish(&self.obs);
         }
     }
 }
@@ -842,6 +877,7 @@ impl oio::Read for OpReader {
                     calls: 1,
                     last_end: None,
                     error: None,
+                    cancelled: false,
                 });
                 (flushed, Some(sc))
             } else {
@@ -849,15 +885,20 @@ impl oio::Read for OpReader {
             }
         };
         if let Some(prev) = flushed {
-            let end = prev.last_end.unwrap_or_else(Instant::now);
-            self.obs
-                .finish_at(prev.st, end, prev.error.as_ref(), prev.calls == 1);
+            prev.finish(&self.obs);
         }
+        let mut active = scope.as_ref().map(|_| ActiveRead {
+            slot,
+            returned: false,
+        });
         let r = match &scope {
             Some(s) => s.run(self.inner.read(range)).await,
             None => self.inner.read(range).await,
         };
         let end = Instant::now();
+        if let Some(a) = active.as_mut() {
+            a.returned = true;
+        }
         {
             let mut g = slot.group.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(x) = g.as_mut() {
@@ -1216,6 +1257,41 @@ mod tests {
 
     fn slow_down() -> Error {
         Error::new(ErrorKind::RateLimited, "slow down").set_temporary()
+    }
+
+    /// T5: a read dropped before it returns (a timeout) completes its operation, as
+    /// cancelled. 9.3.3 never decremented the group's count of reads in flight, and the
+    /// operation stayed live and in flight for good.
+    #[tokio::test]
+    async fn a_dropped_read_completes_as_cancelled() {
+        struct Hang;
+        impl oio::Read for Hang {
+            async fn open(&self, _: BytesRange) -> Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+                futures::future::pending().await
+            }
+            async fn read(&self, _: BytesRange) -> Result<(RpRead, Buffer)> {
+                futures::future::pending().await
+            }
+        }
+        let (rec, obs, _) = linked();
+        let reader = OpReader {
+            inner: Box::new(Hang),
+            obs: obs.clone(),
+            path: "a/b".into(),
+            slot: std::sync::OnceLock::new(),
+        };
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            oio::Read::read(&reader, BytesRange::new(0, Some(10))),
+        )
+        .await;
+        assert!(cut.is_err(), "the read hangs");
+        drop(reader);
+        let s = rec.snapshot();
+        assert_eq!(s.summary.ops, 1, "{:?}", s.summary);
+        assert_eq!(s.summary.failed_ops, 1);
+        assert_eq!(s.resilience.error_classes.get("cancelled"), Some(&1));
+        assert_eq!(s.summary.inflight_ops, 0);
     }
 
     #[tokio::test]
