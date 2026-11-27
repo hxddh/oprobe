@@ -7,15 +7,20 @@
 //! nowhere. `--max-requests 10` let 2 005 files be written, and `--max-bytes 1MiB` let 64 MiB
 //! be written and then reported as 1 MiB.
 //!
-//! [`ChargeLayer`] goes where the gate would. Each call of the service is admitted by the
-//! gate: one request, with the bytes it writes. A call of a stopped run is refused before it
-//! reaches the service. Aborting a write is cleanup, and is never charged or refused; the run's
-//! cleaner is a separate operator that this layer is not on.
+//! [`ChargeLayer`] goes where the gate would, on every operator of such a run, the measured one
+//! included. Each call of the service is admitted by the gate before it runs: one request,
+//! with the bytes it writes; the bytes a read returns are counted as they come, as a response
+//! body is. A call of a stopped run, or one the budget has no room for, is refused before it
+//! reaches the service. (9.3.3 charged the measured calls as they completed: an operation of
+//! two calls could jump the count from 399 to 401, and the calls in flight finished past the
+//! limit.) Aborting a write is cleanup, and is never charged or refused; the run's cleaner is
+//! a separate operator that this layer is not on.
 
 use opendal::raw::oio;
 use opendal::raw::{
     Layer, OpCompose, OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpRestore, OpStat,
-    OpWrite, RpCreateDir, RpPresign, RpRename, RpRestore, RpStat, Service, ServiceInfo, Servicer,
+    OpWrite, RpCreateDir, RpPresign, RpRead, RpRename, RpRestore, RpStat, Service, ServiceInfo,
+    Servicer,
 };
 use opendal::{BytesRange, Capability, Metadata, OperationContext, Result};
 use std::sync::Arc;
@@ -61,7 +66,7 @@ impl std::fmt::Debug for ChargeService {
 }
 
 impl Service for ChargeService {
-    type Reader = oio::Reader;
+    type Reader = ChargeReader;
     type Writer = ChargeWriter;
     type Lister = oio::Lister;
     type Deleter = oio::Deleter;
@@ -92,8 +97,11 @@ impl Service for ChargeService {
     }
 
     fn read(&self, ctx: &OperationContext, path: &str, args: OpRead) -> Result<Self::Reader> {
-        self.gate.admit_call(0)?;
-        self.inner.read(ctx, path, args)
+        // Each read of the reader is a call, charged when it is made.
+        Ok(ChargeReader {
+            inner: self.inner.read(ctx, path, args)?,
+            gate: self.gate.clone(),
+        })
     }
 
     fn write(&self, ctx: &OperationContext, path: &str, args: OpWrite) -> Result<Self::Writer> {
@@ -184,5 +192,46 @@ impl oio::Write for ChargeWriter {
     /// Cleanup: never charged or refused.
     async fn abort(&mut self) -> Result<()> {
         oio::Write::abort(&mut self.inner).await
+    }
+}
+
+/// A reader whose reads are charged: one request each, and the bytes they return.
+pub struct ChargeReader {
+    inner: oio::Reader,
+    gate: Gate,
+}
+
+impl oio::Read for ChargeReader {
+    async fn open(&self, range: BytesRange) -> Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+        self.gate.admit_call(0)?;
+        let (rp, stream) = oio::ReadDyn::open_dyn(self.inner.as_ref(), range).await?;
+        Ok((
+            rp,
+            Box::new(ChargeStream {
+                inner: stream,
+                gate: self.gate.clone(),
+            }),
+        ))
+    }
+
+    async fn read(&self, range: BytesRange) -> Result<(RpRead, opendal::Buffer)> {
+        self.gate.admit_call(0)?;
+        let (rp, buf) = oio::ReadDyn::read_dyn(self.inner.as_ref(), range).await?;
+        self.gate.received_call(buf.len() as u64)?;
+        Ok((rp, buf))
+    }
+}
+
+/// The body of a charged read: its bytes are counted as they come.
+struct ChargeStream {
+    inner: Box<dyn oio::ReadStreamDyn>,
+    gate: Gate,
+}
+
+impl oio::ReadStream for ChargeStream {
+    async fn read(&mut self) -> Result<opendal::Buffer> {
+        let buf = self.inner.read_dyn().await?;
+        self.gate.received_call(buf.len() as u64)?;
+        Ok(buf)
     }
 }

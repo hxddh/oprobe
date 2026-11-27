@@ -427,13 +427,8 @@ impl Session {
                     .min(crate::store::runfile::STREAM_MEMORY_ROWS),
             );
         }
-        // HTTP requests are accounted at the gate, as they are sent. An in-process service has
-        // none: its calls are accounted by the recorder, as they complete.
-        if let Some(g) = &self.guard
-            && !self.target.is_network()
-        {
-            recorder.set_guard(g.clone());
-        }
+        // Every request is admitted by the gate before it is sent: in the HTTP transport, or in
+        // the `ChargeLayer` beneath an in-process service.
         let tree = opts
             .trace_slow_ops
             .then(|| await_tree::Registry::new(await_tree::Config::default()));

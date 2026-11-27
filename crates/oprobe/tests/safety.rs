@@ -952,3 +952,38 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         })
         .unwrap_or_default()
 }
+
+/// An in-process service never goes past a request budget, whatever the budget's parity: its
+/// calls are admitted before they run. (The first fix of the upload charged the measured
+/// window as its operations completed: an operation of two calls jumped 399 to 401.)
+#[test]
+fn a_local_service_never_passes_a_request_budget() {
+    for max in 300..310u32 {
+        let home = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_oprobe"))
+            .env("OPROBE_DATA_DIR", home.path().join("data"))
+            .env("OPROBE_CONFIG", home.path().join("config.toml"))
+            .args([
+                "run",
+                "memory://",
+                "-c",
+                "64",
+                "-d",
+                "5s",
+                "--set",
+                "warmup=0s",
+                "-o",
+                "json",
+            ])
+            .args(["--max-requests", &max.to_string()])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(exit::BUDGET.into()), "{max}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap().to_owned();
+        assert!(
+            msg.contains(&format!(": {max} requests (limit {max})")),
+            "{msg}"
+        );
+    }
+}

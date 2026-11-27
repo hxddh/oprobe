@@ -102,6 +102,11 @@ impl Gate {
         self.admit(body_bytes)
     }
 
+    /// Count the bytes an in-process read returned ([`super::charge::ChargeLayer`]).
+    pub(super) fn received_call(&self, bytes: u64) -> Result<(), Error> {
+        self.received(bytes)
+    }
+
     /// The layer that charges the calls of a service without an HTTP transport to this gate.
     pub fn charge_layer(&self) -> super::charge::ChargeLayer {
         super::charge::ChargeLayer::new(self.clone())

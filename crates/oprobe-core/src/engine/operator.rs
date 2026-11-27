@@ -381,6 +381,10 @@ pub async fn measured_operator_with(
 ) -> Result<Operator> {
     let mut op = base.clone();
     if !target.is_network() {
+        // The budgets, beneath what is measured, where the HTTP gate is for other services.
+        if let Some(g) = gate {
+            op = op.layer(g.charge_layer());
+        }
         op = op.layer(InProcessObserveLayer::new(recorder.clone()));
     }
     // `layers.concurrent_limit.http` is enforced by the instrumented transport itself, with the
