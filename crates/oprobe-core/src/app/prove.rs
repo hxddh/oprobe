@@ -3693,10 +3693,14 @@ mod tests {
             "{goodput:?}"
         );
         assert!(goodput.change.low < 0.0 && goodput.change.high > 0.0);
-        // And the other way round: a p99 keeps its own (wide) spread beside a steady goodput.
+        // And the other way round: a p99 keeps its own spread beside a steady goodput. Its
+        // pairs' ratios are steady (every candidate ≈ 96 % faster) although each arm swings
+        // by half: paired, the interval is narrow, and still wider than the goodput's (on the
+        // log ratio: near −96 % the relative scale compresses every width).
         let sec = secondary(ProveObjective::Goodput, &a, &b);
         let p99 = sec.iter().find(|m| m.metric == "p99_ms").unwrap();
-        assert!(p99.change.high - p99.change.low > 0.05, "{p99:?}");
+        let width = |i: &Interval| i.high.ln_1p() - i.low.ln_1p();
+        assert!(width(&p99.change) > width(&goodput.change), "{p99:?} {goodput:?}");
         assert!(p99.change.high < 0.0, "{p99:?}");
     }
 
