@@ -194,7 +194,8 @@ pub fn spec_of(profile: &Profile, target_name: Option<&str>) -> RunSpec {
 }
 
 /// The error of a run whose file cannot be written.
-const CANNOT_SAVE: &str = "cannot save the run (set OPROBE_DATA_DIR or pass --no-save)";
+const CANNOT_SAVE: &str =
+    "cannot save the run (set OPROBE_DATA_DIR to a directory oprobe can write to)";
 
 /// A finished measurement.
 pub struct Measured {

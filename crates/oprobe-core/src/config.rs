@@ -1366,30 +1366,6 @@ pub fn required_options(scheme: &str) -> &'static [&'static str] {
     }
 }
 
-/// Backend options for unsigned, credential-free access to a public bucket (`--anonymous`), per
-/// OpenDAL service. `skip_signature` is what OpenDAL 0.59 calls it (`allow_anonymous` is its
-/// deprecated alias); credential discovery is disabled too so no config files or metadata
-/// servers are consulted.
-pub fn anonymous_options(scheme: &str) -> Result<&'static [(&'static str, &'static str)]> {
-    Ok(match scheme {
-        "s3" => &[("skip_signature", "true"), ("disable_config_load", "true")],
-        "gcs" => &[
-            ("skip_signature", "true"),
-            ("disable_vm_metadata", "true"),
-            ("disable_config_load", "true"),
-        ],
-        // No credentials at all: unsigned requests.
-        "azblob" | "oss" => &[("skip_signature", "true")],
-        other => {
-            return Err(crate::input::invalid(format!(
-                "--anonymous is not supported for `{other}` (OpenDAL's {other} service has no unsigned mode)"
-            ))
-            .with_hint("configure credentials instead")
-            .into());
-        }
-    })
-}
-
 /// Expand `${NAME}` references from the environment.
 pub fn expand_env(v: &str) -> Result<String> {
     expand_with(v, |name| std::env::var(name).ok())
@@ -1565,22 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_access_maps_per_service() {
-        for scheme in ["s3", "gcs", "azblob", "oss"] {
-            let opts = anonymous_options(scheme).unwrap();
-            assert!(opts.contains(&("skip_signature", "true")), "{scheme}");
-            // Every key is one the service accepts (none silently ignored).
-            let keys: Vec<String> = opts.iter().map(|(k, _)| (*k).to_owned()).collect();
-            crate::service_options::validate_keys(scheme, &keys).unwrap();
-        }
-        assert!(
-            anonymous_options("gcs")
-                .unwrap()
-                .contains(&("disable_vm_metadata", "true"))
-        );
-        let e = anonymous_options("b2").unwrap_err().to_string();
-        assert!(e.contains("not supported for `b2`"), "{e}");
-        assert!(anonymous_options("fs").is_err());
+    fn a_service_scheme_ignores_the_url_spelling() {
         let t = TargetSpec::from_url("gs://b").unwrap();
         assert_eq!(
             TargetSpec {

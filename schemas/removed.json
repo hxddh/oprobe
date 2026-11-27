@@ -34,6 +34,7 @@
       "type": "array"
     },
     "removed": {
+      "description": "The ids deleted: each run, and each prove followed by its trial runs (oldest first).",
       "items": {
         "type": "string"
       },

@@ -731,6 +731,7 @@ pub fn show(app: &App, r: &RunRef) -> Result<Profile> {
 /// Result of `oprobe show --rm`.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct RemovedRuns {
+    /// The ids deleted: each run, and each prove followed by its trial runs (oldest first).
     pub removed: Vec<String>,
     pub dry_run: bool,
 }
@@ -805,14 +806,28 @@ pub fn stored_ids(app: &App, refs: &[RunRef]) -> Result<Vec<String>> {
 pub fn rm(app: &App, refs: &[RunRef]) -> Result<RemovedRuns> {
     let ids = stored_ids(app, refs)?;
     let store = app.store();
-    for id in &ids {
-        // A prove goes with its trial runs.
-        if !store.delete_prove(id)? {
-            store.delete(id)?;
+    let mut removed = Vec::with_capacity(ids.len());
+    for id in ids {
+        // A prove goes with its trial runs, which are listed after it (N7: 9.3.3 listed the
+        // prove alone, and the JSON did not say what was deleted).
+        let mut trials = store.children(&id)?;
+        trials.sort();
+        if store.delete_prove(&id)? {
+            removed.push(id);
+            for t in trials {
+                if !removed.contains(&t) {
+                    removed.push(t);
+                }
+            }
+        } else {
+            store.delete(&id)?;
+            if !removed.contains(&id) {
+                removed.push(id);
+            }
         }
     }
     Ok(RemovedRuns {
-        removed: ids,
+        removed,
         dry_run: false,
     })
 }
@@ -898,6 +913,28 @@ mod tests {
         assert_eq!(when(id, t + s(5)), "just now");
         assert_eq!(when(id, t + s(600)), "10m ago");
         assert_eq!(when(id, t + s(3 * 86_400)), "3d ago");
+    }
+
+    /// N7: removing a prove lists its trial runs too (9.3.3 listed the prove alone).
+    #[test]
+    fn removing_a_prove_lists_its_trials() {
+        let d = tempfile::tempdir().unwrap();
+        let app = App::new(crate::store::Paths {
+            config_file: d.path().join("config.toml"),
+            data_dir: d.path().join("data"),
+        });
+        let store = app.store();
+        let pid = "20261120-150000-ffff";
+        let trials = ["20261120-150001-a1b2", "20261120-150002-c3d4"];
+        for t in trials {
+            let mut run = crate::store::runs::tests::sample_run(t, None);
+            run.report.run.parent_id = Some(pid.to_owned());
+            store.save(&run).unwrap();
+        }
+        std::fs::write(store.dir().join(format!("{pid}.prove.json")), b"{}").unwrap();
+        let removed = rm(&app, &[RunRef::from(pid)]).unwrap();
+        assert_eq!(removed.removed, [pid, trials[0], trials[1]]);
+        assert!(app.list_all().unwrap().runs.is_empty());
     }
 
     /// `show --rm X X` failed on the second X (the run was gone by then): a run named twice,

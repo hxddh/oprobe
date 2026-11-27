@@ -18,7 +18,7 @@ oprobe lab   [SCENARIO]    # a local S3 with faults
 | Flag | Meaning |
 |---|---|
 | `-o, --output text\|json` | the result on stdout as text (default) or one JSON document (env `OPROBE_OUTPUT`); logs and progress always go to stderr |
-| `--color auto\|always\|never` | colors (default `auto`; `NO_COLOR` is honoured) |
+| `--color auto\|always\|never` | colors (default: `[defaults] color` in the config file, else `auto`; `NO_COLOR` is honoured) |
 | `-q, --quiet` | no progress or informational messages on stderr |
 | `--non-interactive` | never prompt or redraw (implied when stdin or stdout is not a terminal) |
 | `-h, --help` | help (`-h` for a summary) |
@@ -199,7 +199,7 @@ Print a profile: a stored run, or a file (`.oprobe` from `run` or from
 Pass two or more runs or files to compare them side by side on goodput, bandwidth, latency,
 retries, throttling and stage split (`-o json`: the `run` document, `schemas/run.json`, `--detail` adds the per-API
 comparison table). `-o json` for one run prints the shown run (`schemas/show.json`: the report of `schemas/report.json`, where it is stored, and the `by` and `range` sections when asked for); `--list -o json` the run list
-(`schemas/run-list.json`; `-n` limits the runs and the proves alike), and `--rm -o json` the deleted ids (`schemas/removed.json`). A prove id, unambiguous prove prefix, `last-prove`, or `.prove.json` file (`show --list`
+(`schemas/run-list.json`; `-n` limits the runs and the proves alike), and `--rm -o json` the deleted ids, a prove's trial runs after it (`schemas/removed.json`). A prove id, unambiguous prove prefix, `last-prove`, or `.prove.json` file (`show --list`
 lists them) prints that prove's stored result as `prove` printed it (`schemas/prove.json`), also
 after its run was removed.
 
@@ -214,6 +214,7 @@ multipart and repeated reads (not bandwidth cap or client bound). `prove` refuse
 |---|---|
 | `--list` | list the stored runs (prove trials hidden) and the proves; a long change is cut in the list (`show PROVE` prints it whole) |
 | `--all` | with `--list`: include the prove trials |
+| `-n`, `--limit N` | with `--list`: at most N runs and N proves, newest first (default 20) |
 | `--rm RUN…` | delete stored runs (a run named twice is deleted once) |
 | `--detail` | every section of the profile: the timeline (one row per interval of 1 s, or 10 s after ten minutes; long runs merge rows), the spread of the requests over keys, sizes, prefixes and remotes, the operator and the five slowest operations |
 | `--by stage\|api\|conn` | group the requests by stage, storage API or connection |

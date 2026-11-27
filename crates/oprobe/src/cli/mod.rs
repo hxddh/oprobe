@@ -25,8 +25,22 @@ use crate::store::{ConfigFile, Paths};
 pub const EXIT_INTERRUPTED: u8 = exit::INTERRUPTED;
 
 /// Run the parsed command line and return the process exit code.
-pub async fn main(cli: Cli) -> ExitCode {
-    match cli.color {
+pub async fn main(mut cli: Cli) -> ExitCode {
+    let paths = Paths::resolve(cli.config.as_deref());
+    let defaults = ConfigFile::load(&paths.config_file)
+        .ok()
+        .map(|c| c.defaults);
+    // The flag, else `[defaults] color` (9.3.3 validated it and never applied it).
+    let color =
+        cli.color.unwrap_or_else(
+            || match defaults.as_ref().and_then(|d| d.color.as_deref()) {
+                Some("always") => ColorChoice::Always,
+                Some("never") => ColorChoice::Never,
+                _ => ColorChoice::Auto,
+            },
+        );
+    cli.color = Some(color);
+    match color {
         ColorChoice::Always => style::set(true),
         ColorChoice::Never => style::set(false),
         ColorChoice::Auto => {}
@@ -34,12 +48,11 @@ pub async fn main(cli: Cli) -> ExitCode {
     let Some(command) = cli.command else {
         return crate::launch::bare(&cli, None);
     };
-    let paths = Paths::resolve(cli.config.as_deref());
     let format = cli.output.map(OutputFormat::from).unwrap_or_else(|| {
-        ConfigFile::load(&paths.config_file)
-            .ok()
-            .and_then(|c| c.defaults.output)
-            .and_then(|o| OutputFormat::parse(&o))
+        defaults
+            .as_ref()
+            .and_then(|d| d.output.as_deref())
+            .and_then(OutputFormat::parse)
             .unwrap_or_default()
     });
     let non_interactive = cli.non_interactive || !crate::output::interactive_terminal();
@@ -166,13 +179,20 @@ pub fn parse_cli(args: Vec<std::ffi::OsString>) -> std::result::Result<Cli, Exit
         return Err(ExitCode::from(e.exit_code().clamp(0, 255) as u8));
     }
     let rendered = e.render().to_string();
+    // clap's first paragraph, whole: "the following required arguments were not provided:"
+    // is followed by the arguments, on lines of their own (9.3.3 kept the first line only).
     let message = rendered
         .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("invalid arguments")
-        .trim_start_matches("error:")
-        .trim()
-        .to_owned();
+        .skip_while(|l| l.trim().is_empty())
+        .take_while(|l| !l.trim().is_empty())
+        .map(|l| l.trim().trim_start_matches("error:").trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let message = if message.is_empty() {
+        "invalid arguments".to_owned()
+    } else {
+        message
+    };
     let usage = rendered
         .lines()
         .find_map(|l| l.trim().strip_prefix("Usage:"))

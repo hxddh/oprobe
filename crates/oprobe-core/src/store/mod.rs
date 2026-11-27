@@ -107,6 +107,21 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Replace the existing file `path` names as [`atomic_write`] does, but through a symlink, in
+/// the file it points to, and keeping that file's permissions. 9.3.3's `--save` replaced a
+/// symlinked `op.toml` (the one under version control was never updated) with a file of its
+/// own, and reset the mode of every file it edited to `0600`.
+pub fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let perms = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    atomic_write(&target, bytes)?;
+    if let Some(p) = perms {
+        std::fs::set_permissions(&target, p)
+            .with_context(|| format!("cannot set the permissions of `{}`", target.display()))?;
+    }
+    Ok(())
+}
+
 /// Create (or truncate) `path` for writing, readable by its owner only (`0600` on unix).
 pub fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut o = std::fs::OpenOptions::new();
@@ -147,6 +162,29 @@ pub fn write_secret(path: &Path, secret: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// U1: an edit goes through a symlink to its file, and keeps the file's mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_file_keeps_its_link_and_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real.toml");
+        std::fs::write(&real, "old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = d.path().join("op.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        atomic_replace(&link, b"new").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
 
     /// S5: files `0600`, created directories `0700`, also when a file already existed with
     /// wider permissions.

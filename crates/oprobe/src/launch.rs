@@ -71,7 +71,7 @@ fn open(cli: &Cli, terminal: bool, file: Option<PathBuf>, show: &str) -> ExitCod
             "the app opens when `oprobe` runs in a terminal or on a desktop (no window: {why}){show}"
         ));
     }
-    let monochrome = match cli.color {
+    let monochrome = match cli.color.unwrap_or(crate::cli::args::ColorChoice::Auto) {
         crate::cli::args::ColorChoice::Always => false,
         crate::cli::args::ColorChoice::Never => true,
         crate::cli::args::ColorChoice::Auto => {

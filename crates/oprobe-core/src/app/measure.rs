@@ -124,7 +124,7 @@ pub async fn measure_to_breach(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Resu
     }
     if gate.load(Ordering::Relaxed) == 1 {
         ctx.out.warn(format!(
-            "`--fail-on`: the diagnosis has {} findings (exit {})",
+            "the findings gate: the diagnosis has {} findings (exit {})",
             m.run.report.worst_severity().label(),
             exit::GATE
         ));

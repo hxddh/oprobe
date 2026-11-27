@@ -75,12 +75,7 @@ pub fn show(a: ShowArgs, ctx: &Ctx) -> Result<u8> {
     }
     if !a.rm.is_empty() {
         let refs: Vec<RunRef> = a.rm.into_iter().map(RunRef).collect();
-        let ids = app.run_ids(&refs)?;
-        app.rm(&refs)?;
-        return ctx.out.finish(&crate::app::RemovedRuns {
-            removed: ids,
-            dry_run: false,
-        });
+        return ctx.out.finish(&app.rm(&refs)?);
     }
     let by = a.by.map(|b| match b {
         ByArg::Stage => crate::analysis::slice::By::Stage,

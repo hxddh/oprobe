@@ -2294,11 +2294,25 @@ fn refuse_unjudged(run: &Run) -> Result<()> {
         ),
     )
     // The run's whole command (K1-2): the operator reference alone drops its `--set` values,
-    // and a run against a local endpoint would be repeated against the real service.
-    .with_hint(format!(
-        "profile the operator again until the run completes: {}",
-        profile_command(&r.spec, &[])
-    ))
+    // and a run against a local endpoint would be repeated against the real service. A
+    // window shorter than its warm-up is not cured by running it again (9.3.3 hinted the very
+    // command that made it): the command shortens the warm-up to half the window.
+    .with_hint(
+        if !r.is_trace() && r.workload.warmup_s > 0.0 && r.run.window_s < r.workload.warmup_s {
+            let half = crate::util::HumanDuration(std::time::Duration::from_secs_f64(
+                (r.workload.duration_s / 2.0).max(0.001),
+            ));
+            format!(
+                "profile again with a warm-up shorter than the window (or a longer -d): {}",
+                profile_command(&r.spec, &[("warmup".into(), half.to_string())])
+            )
+        } else {
+            format!(
+                "profile the operator again until the run completes: {}",
+                profile_command(&r.spec, &[])
+            )
+        },
+    )
     .into())
 }
 

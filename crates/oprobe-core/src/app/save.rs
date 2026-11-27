@@ -293,7 +293,7 @@ fn patch_operator_file(path: &Path, pairs: &[(String, String)]) -> Result<Operat
     crate::operator::patch_toml_table(doc.as_table_mut(), pairs)?;
     let out = doc.to_string();
     let spec = OperatorSpec::parse(&out).map_err(|e| with_file(e, path))?;
-    crate::store::atomic_write(path, out.as_bytes())?;
+    crate::store::atomic_replace(path, out.as_bytes())?;
     Ok(spec)
 }
 
@@ -311,6 +311,7 @@ fn patch_config_operator(
             ErrorCode::ConfigInvalid,
             format!("invalid config file `{}`: {e}", path.display()),
         )
+        .with_hint(crate::store::config::CONFIG_HINT)
     };
     ConfigFile::load(path)?;
     let raw = match std::fs::read_to_string(path) {
@@ -352,7 +353,7 @@ fn patch_config_operator(
             o
         })?;
     }
-    crate::store::atomic_write(path, out.as_bytes())?;
+    crate::store::atomic_replace(path, out.as_bytes())?;
     Ok(validated.operators[name].clone())
 }
 

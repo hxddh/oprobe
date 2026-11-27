@@ -328,3 +328,102 @@ fn the_oprobe_trace_dependency_line_resolves_when_pasted() {
         );
     }
 }
+
+/// Every flag an error, a hint or a message names is one oprobe takes (U4: 9.3.3 told the user
+/// to "use --http auto", a flag that does not exist; the check covered `hints.rs` only). Every
+/// string literal of the sources outside their tests is scanned.
+#[test]
+fn messages_name_only_flags_that_exist() {
+    let top = help(&[]);
+    let mut known: Vec<String> = long_flags(&top);
+    for c in commands(&top) {
+        known.extend(long_flags(&help(&[c.as_str()])));
+    }
+    known.extend(["--help", "--version"].map(str::to_owned));
+    // Hidden flags are flags too (`--config`, `oprobe lab --max-store-size`).
+    let args = std::fs::read_to_string(root().join("crates/oprobe/src/cli/args.rs")).unwrap();
+    let mut long = false;
+    for line in args.lines().map(str::trim) {
+        if line.starts_with("#[arg(") {
+            long = line.contains("long");
+        } else if line == "long," || line.starts_with("long ") {
+            long = true;
+        }
+        if let Some((field, _)) = line.strip_prefix("pub ").and_then(|l| l.split_once(':')) {
+            if long {
+                known.push(format!("--{}", field.trim().replace('_', "-")));
+            }
+            long = false;
+        }
+    }
+    // Other programs' flags (`cargo install --locked --git …`, the clipboard tools).
+    let foreign = [
+        "--features",
+        "--no-default-features",
+        "--locked",
+        "--git",
+        "--release",
+        "--clipboard",
+        "--input",
+        "--output",
+        "--no-newline",
+    ];
+    let mut bad = Vec::new();
+    let mut files = Vec::new();
+    for dir in [
+        "crates/oprobe-core/src",
+        "crates/oprobe/src",
+        "crates/oprobe-trace/src",
+    ] {
+        collect_rs(&root().join(dir), &mut files);
+    }
+    for f in files {
+        let src = std::fs::read_to_string(&f).unwrap();
+        let src = src.split("#[cfg(test)]").next().unwrap_or("");
+        for line in src.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") || code.starts_with("#[") {
+                continue;
+            }
+            // The string literals of the line.
+            for (k, lit) in code.split('"').enumerate() {
+                if k % 2 == 0 {
+                    continue;
+                }
+                for (i, _) in lit.match_indices("--") {
+                    if i > 0 && !lit[..i].ends_with([' ', '`', '(', '\'']) {
+                        continue;
+                    }
+                    let name: String = lit[i + 2..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                        .collect();
+                    let flag = format!("--{name}");
+                    if !name.starts_with(|c: char| c.is_ascii_lowercase())
+                        || known.contains(&flag)
+                        || foreign.contains(&flag.as_str())
+                    {
+                        continue;
+                    }
+                    bad.push(format!("{}: {flag} in {line:?}", f.display()));
+                }
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "messages name flags oprobe does not take:\n{}",
+        bad.join("\n")
+    );
+}
+
+fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_rs(&p, out);
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            out.push(p);
+        }
+    }
+}

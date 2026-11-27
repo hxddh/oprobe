@@ -198,6 +198,7 @@ static EN: &[(&str, &str)] = &[
     ("ev.explains_ratio", "Share it explains"),
     ("ev.stream_bytes_per_s", "Per-stream throughput"),
     ("ev.fitted_bytes_per_s", "Fitted bandwidth"),
+    ("ev.typical_transfer_ms", "Typical transfer time"),
     ("ev.fitted_requests_per_s", "Fitted request rate"),
     ("ev.fitted_inflight_count", "Fitted limit (in flight)"),
     ("ev.ceiling_lo_inflight_count", "Clean up to (in flight)"),
@@ -999,6 +1000,7 @@ static ZH: &[(&str, &str)] = &[
     ("ev.explains_ratio", "可解释的比例"),
     ("ev.stream_bytes_per_s", "单流吞吐"),
     ("ev.fitted_bytes_per_s", "拟合带宽"),
+    ("ev.typical_transfer_ms", "典型传输时间"),
     ("ev.fitted_requests_per_s", "拟合请求速率"),
     ("ev.fitted_inflight_count", "拟合上限（在途）"),
     ("ev.ceiling_lo_inflight_count", "不被限流的在途数上限"),
@@ -1705,6 +1707,32 @@ mod tests {
             missing.is_empty(),
             "keys missing from the catalog: {missing:?}"
         );
+    }
+
+    /// U9: every evidence value the core labels has a label in both languages (9.3.3 showed
+    /// `typical_transfer_ms` in English in the Chinese app: no test enumerated these keys).
+    #[test]
+    fn every_evidence_key_the_core_labels_is_in_the_catalog() {
+        let src = include_str!("../../../oprobe-core/src/model/report.rs");
+        let from = src.find("pub fn evidence_label").unwrap();
+        let table = &src[from..from + src[from..].find("_ => None,").unwrap()];
+        let keys: Vec<&str> = table
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|k| {
+                k.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            })
+            .collect();
+        assert!(keys.len() > 50, "{}", keys.len());
+        for lang in [Lang::En, Lang::Zh] {
+            let missing: Vec<_> = keys
+                .iter()
+                .filter(|k| find(lang, &format!("ev.{k}")).is_none())
+                .collect();
+            assert!(missing.is_empty(), "{lang:?} has no label for {missing:?}");
+        }
     }
 
     #[test]

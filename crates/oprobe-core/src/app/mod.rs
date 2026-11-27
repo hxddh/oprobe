@@ -94,7 +94,15 @@ impl std::fmt::Display for RunRef {
     }
 }
 
-type CachedConfig = Option<std::result::Result<Arc<ConfigFile>, String>>;
+/// The error of a config file that did not load, from its cached message and hint.
+fn config_error((message, hint): (String, Option<String>)) -> anyhow::Error {
+    let mut e = OprobeError::new(ErrorCode::ConfigInvalid, message);
+    e.hint = hint;
+    e.into()
+}
+
+/// The loaded config file, or its error: the message and the hint.
+type CachedConfig = Option<std::result::Result<Arc<ConfigFile>, (String, Option<String>)>>;
 
 /// The service layer: paths, the (lazily loaded) config file. Cheap to clone; one per process
 /// is enough.
@@ -128,16 +136,19 @@ impl App {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
-            return cached
-                .clone()
-                .map_err(|m| OprobeError::new(ErrorCode::ConfigInvalid, m).into());
+            return cached.clone().map_err(config_error);
         }
+        // The error is kept whole, its hint too (9.3.3 kept its text only, and the config
+        // file's error got the operator file's hint).
         let loaded = ConfigFile::load(&self.paths.config_file)
             .map(Arc::new)
-            .map_err(|e| format!("{e:#}"));
+            .map_err(|e| {
+                let hint = e.downcast_ref::<OprobeError>().and_then(|x| x.hint.clone());
+                (format!("{e:#}"), hint)
+            });
         let mut slot = self.config.write().unwrap_or_else(|e| e.into_inner());
         let res = slot.get_or_insert(loaded).clone();
-        res.map_err(|m| OprobeError::new(ErrorCode::ConfigInvalid, m).into())
+        res.map_err(config_error)
     }
 
     /// The run store.
@@ -598,8 +609,8 @@ impl App {
     }
 
     /// Delete stored runs (a file outside the store is refused).
-    pub fn rm(&self, r: &[RunRef]) -> Result<()> {
-        runs::rm(self, r).map(|_| ())
+    pub fn rm(&self, r: &[RunRef]) -> Result<RemovedRuns> {
+        runs::rm(self, r)
     }
 
     /// Move stored runs to oprobe's trash (`<data>/trash/`, kept a week) instead of deleting

@@ -1708,3 +1708,164 @@ fn files_that_are_not_runs_say_what_they_are() {
     let hint = e["hint"].as_str().unwrap();
     assert!(hint.contains(&run_id) && !hint.contains("versions"), "{e}");
 }
+
+/// U2: a run file is recognised by its content, whatever its name. 9.3.3 took a name with no
+/// `/` that did not end in `.oprobe` or `.json` for a run reference, and refused it.
+#[test]
+fn a_run_file_is_a_file_whatever_its_name() {
+    let env = Env::new();
+    let o = env.run(&["run", "memory://", "-d", "1s", "--set", "warmup=0s", "-q"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let stored = std::fs::read_dir(env.data().join("runs"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "oprobe"))
+        .unwrap();
+    std::fs::copy(&stored, env.path("profile")).unwrap();
+    let o = env
+        .cmd()
+        .current_dir(env.dir.path())
+        .args(["show", "profile", "-o", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(json(&o)["report"]["summary"].is_object());
+}
+
+/// U6: `[defaults] color` applies when `--color` is not given (9.3.3 validated it and never
+/// used it); the flag still wins.
+#[test]
+fn the_config_file_sets_the_colors() {
+    let env = Env::new();
+    std::fs::write(env.path("config.toml"), "[defaults]\ncolor = \"always\"\n").unwrap();
+    let raw = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_oprobe"))
+            .env("OPROBE_DATA_DIR", env.data())
+            .env("OPROBE_CONFIG", env.path("config.toml"))
+            .env_remove("NO_COLOR")
+            .args(["run", "memory://", "-d", "1s", "--set", "warmup=0s", "-q"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let o = raw(&[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("\x1b["), "colored: {}", stdout(&o));
+    let o = raw(&["--color", "never"]);
+    assert!(!stdout(&o).contains("\x1b["), "{}", stdout(&o));
+}
+
+/// U8: a usage error in JSON keeps clap's whole message: the missing argument's name too.
+#[test]
+fn a_json_usage_error_names_the_missing_argument() {
+    let env = Env::new();
+    let o = env.run(&["prove", "-o", "json"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    let msg = json(&o)["error"]["message"].as_str().unwrap().to_owned();
+    assert!(msg.contains("<RUN>"), "{msg}");
+}
+
+/// U5: a config file that does not parse gets the config file's hint, not the operator
+/// file's ("The operator file is not valid: Fix the field…").
+#[test]
+fn an_invalid_config_file_gets_its_own_hint() {
+    let env = Env::new();
+    std::fs::write(env.path("config.toml"), "[defaults]\nbogus = 1\n").unwrap();
+    let o = env.run(&["run", "memory://", "-d", "1s", "-o", "json"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    let hint = json(&o)["error"]["hint"].as_str().unwrap().to_owned();
+    assert!(!hint.contains("operator file"), "{hint}");
+    assert!(hint.starts_with("fix the key"), "{hint}");
+}
+
+/// U3: a run whose window is shorter than its warm-up is refused with a command that changes
+/// the outcome (9.3.3 hinted the very command that made the run).
+#[test]
+fn a_refused_prove_hints_a_command_that_changes_the_outcome() {
+    let env = Env::new();
+    let o = env.run(&["run", "memory://", "-d", "1s", "--set", "warmup=2s", "-q"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = env.run(&["prove", "last", "-o", "json"]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
+    let hint = json(&o)["error"]["hint"].as_str().unwrap().to_owned();
+    assert!(hint.contains("warmup=500ms"), "{hint}");
+}
+
+/// N1: a warm-up nobody set takes at most half the window, so a short run can be proved;
+/// one that was set is kept.
+#[test]
+fn an_unset_warmup_fits_a_short_window() {
+    let env = Env::new();
+    let o = env.run(&["run", "memory://", "-d", "1s", "-o", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!stderr(&o).contains("warmup"), "{}", stderr(&o));
+    assert_eq!(json(&o)["runs"][0]["report"]["workload"]["warmup_s"], 0.5);
+    let o = env.run(&[
+        "run",
+        "memory://",
+        "-d",
+        "1s",
+        "--set",
+        "warmup=0s",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(json(&o)["runs"][0]["report"]["workload"]["warmup_s"], 0.0);
+}
+
+/// N2: a flag and a `--set` of the same setting that disagree are refused (9.3.3 ran with
+/// the `--set` value, silently); the same value twice is fine.
+#[test]
+fn a_flag_and_a_set_that_disagree_are_refused() {
+    let env = Env::new();
+    let o = env.run(&[
+        "run",
+        "memory://",
+        "-c",
+        "4",
+        "--set",
+        "concurrency=8",
+        "--dry-run",
+    ]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("disagrees with its flag"),
+        "{}",
+        stderr(&o)
+    );
+    let o = env.run(&[
+        "run",
+        "memory://",
+        "-c",
+        "4",
+        "--set",
+        "concurrency=4",
+        "--dry-run",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
+/// N3: a run of several operators names each run it made (9.3.3 printed a generic
+/// `oprobe show RUN --detail`).
+#[test]
+fn a_run_of_several_operators_names_its_runs() {
+    let env = Env::new();
+    let o = env.run(&["run", "memory://", "memory://", "-d", "1s"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let list = json(&env.run(&["show", "--list", "-o", "json"]));
+    let ids: Vec<String> = list["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ids.len(), 2, "{list}");
+    for id in ids {
+        assert!(
+            stdout(&o).contains(&format!("oprobe show {id} --detail")),
+            "{}",
+            stdout(&o)
+        );
+    }
+}

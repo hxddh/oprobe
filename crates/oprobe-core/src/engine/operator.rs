@@ -764,7 +764,7 @@ pub fn explain_preflight(err: anyhow::Error, target: &TargetSpec) -> anyhow::Err
         .into()
 }
 
-/// With `--http h2`, check the target speaks HTTP/2 before anything else (design v5 §3, M6):
+/// With `http.version = "h2"`, check the target speaks HTTP/2 before anything else (design v5 §3, M6):
 /// an endpoint without h2c (plain HTTP) or without `h2` in ALPN (TLS) would otherwise fail
 /// every request of the run.
 pub async fn check_protocol(
@@ -813,12 +813,12 @@ pub async fn check_protocol(
     Err(OprobeError::new(
         ErrorCode::NetHttp,
         format!(
-            "{endpoint} does not speak HTTP/2{} (`--http h2`): {chain}",
+            "{endpoint} does not speak HTTP/2{} (`http.version = \"h2\"`): {chain}",
             if plain { " with prior knowledge (h2c)" } else { " (no `h2` in ALPN)" }
         ),
     )
     .with_hint(
-        "use --http auto or --http h1; lab targets speak HTTP/2 as lab://NAME?proto=h2c (plain), h2 or https (TLS)",
+        "use `--set http.version=auto` or `--set http.version=h1`; lab targets speak HTTP/2 as lab://NAME?proto=h2c (plain), h2 or https (TLS)",
     )
     .into())
 }

@@ -135,6 +135,11 @@ pub struct ConfigFile {
     pub operators: BTreeMap<String, OperatorSpec>,
 }
 
+/// The hint of a config file that does not parse (not the operator file's: 9.3.3 said "The
+/// operator file is not valid" of the config file).
+pub const CONFIG_HINT: &str =
+    "fix the key named above; docs/operator.md (\"The config file\") lists the config file's keys";
+
 impl ConfigFile {
     /// Load `path`; a missing file is an empty config.
     pub fn load(path: &Path) -> Result<Self> {
@@ -150,6 +155,7 @@ impl ConfigFile {
                 ErrorCode::ConfigInvalid,
                 format!("invalid config file `{}`: {e}", path.display()),
             )
+            .with_hint(CONFIG_HINT)
         })?;
         cfg.defaults.validate().map_err(|e| {
             let mut o = OprobeError::new(
