@@ -871,6 +871,19 @@ impl Session {
                 if pending.is_some() {
                     cut_short();
                 }
+                // The schedule has no arrival left in the window: the window still runs to
+                // its deadline (9.3.3 closed it at the last arrival, so `--rate 2 -d 2s` had a
+                // 1.5 s window and reported 2.66 ops/s, and `--rate 0.001` reported 1000 ops/s).
+                if !max_ops.is_some_and(|m| issued >= m) {
+                    while !self.cancel.is_cancelled() {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let wake = deadline.min(now + Duration::from_millis(100));
+                        tokio::time::sleep_until(wake.into()).await;
+                    }
+                }
                 let window_end = Instant::now().min(deadline);
                 close_window();
                 // Arrivals that were due inside the window but never started: censored at

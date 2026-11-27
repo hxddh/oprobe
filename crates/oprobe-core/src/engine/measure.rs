@@ -530,6 +530,25 @@ mod tests {
         );
     }
 
+    /// E2: an open-loop window runs to its deadline. 9.3.3 closed it at the last arrival:
+    /// at 2 ops/s for 1.5 s, a 1 s window.
+    #[tokio::test]
+    async fn an_open_loop_window_runs_to_its_deadline() {
+        let mut p = quick("memory://");
+        p.workload.rate = Some(2.0);
+        p.workload.duration = crate::util::HumanDuration(std::time::Duration::from_millis(1500));
+        let rails = Rails::new(&p, false, None, Budgets::default()).unwrap();
+        let req = Request::new(p, rails, Cancel::new(), silent());
+        let m = measure(req).await.unwrap();
+        let w = m.run.report.run.window_s;
+        assert!((1.45..1.6).contains(&w), "window {w} s");
+        assert!(
+            m.run.report.summary.ops_per_s < 2.1,
+            "{}",
+            m.run.report.summary.ops_per_s
+        );
+    }
+
     #[tokio::test]
     async fn a_budget_breach_returns_the_partial_run() {
         let mut p = quick("memory://");

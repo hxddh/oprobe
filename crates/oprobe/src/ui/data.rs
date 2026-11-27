@@ -458,37 +458,17 @@ fn findings(r: &Report) -> Vec<FindingRow> {
         .collect()
 }
 
-/// The remedy of a finding as operator paths: the finding's own remedy path (and the paths
-/// changed with it), else the remedy path of its code (design v6 §8 "Findings → remedies").
+/// The remedy of a finding as operator paths: the finding's own remedy path and the paths
+/// changed with it, as the core gives them; none when the core says the remedy is not a layer
+/// (9.3.3 fell back to a table of its own, and offered `prove` a remedy it then refused).
 /// Values are left empty: `oprobe prove` sizes them.
 pub fn remedy(f: &Finding) -> Vec<(String, String)> {
-    if let Some(path) = &f.remedy.path {
-        return std::iter::once(path)
-            .chain(f.remedy.with.iter())
-            .map(|p| (p.clone(), String::new()))
-            .collect();
-    }
-    remedy_paths(&f.code)
+    f.remedy
+        .path
         .iter()
-        .map(|p| ((*p).to_owned(), String::new()))
+        .chain(f.remedy.with.iter())
+        .map(|p| (p.clone(), String::new()))
         .collect()
-}
-
-/// The `OperatorSpec` paths that remedy a finding code.
-pub fn remedy_paths(code: &str) -> &'static [&'static str] {
-    match code {
-        "throttling" => &["layers.concurrent_limit.http", "layers.retry.jitter"],
-        "rate_limit" => &["layers.concurrent_limit.http"],
-        "bandwidth_cap" => &["layers.throttle.bandwidth"],
-        "tail_stragglers" | "tail_latency" => &["layers.tail_cut"],
-        "hung_requests" => &["layers.timeout.io"],
-        "small_ranges" | "overread" => &["read.gap", "read.concurrent"],
-        "slow_multipart" | "upload_bound" => &["write.chunk", "write.concurrent"],
-        "repeated_reads" | "cache_opportunity" => &["layers.cache"],
-        "cold_connections" => &["http.keep_alive"],
-        "http1_connections" => &["http.version"],
-        _ => &[],
-    }
 }
 
 /// An operation's waterfall (core's [`view::WaterfallOp`]) as bars: each request from the
@@ -966,6 +946,27 @@ pub fn plan_view(p: &crate::app::RunPlan) -> PlanView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A5: the app offers the core's remedy and nothing else. 9.3.3 fell back to a table of
+    /// its own when the core gave none, and offered `layers.throttle.bandwidth` for a read
+    /// bandwidth cap, which `prove` refuses.
+    #[test]
+    fn a_finding_without_a_layer_remedy_offers_none() {
+        let mut f = Finding {
+            code: "bandwidth_cap".into(),
+            ..Default::default()
+        };
+        assert!(remedy(&f).is_empty());
+        f.remedy.path = Some("layers.concurrent_limit.http".into());
+        f.remedy.with = vec!["layers.retry.jitter".into()];
+        assert_eq!(
+            remedy(&f),
+            vec![
+                ("layers.concurrent_limit.http".to_owned(), String::new()),
+                ("layers.retry.jitter".to_owned(), String::new())
+            ]
+        );
+    }
 
     #[test]
     fn every_field_reads_and_writes_back() {

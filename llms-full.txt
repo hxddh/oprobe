@@ -1836,7 +1836,8 @@ The window works like other professional tools on your platform (design:
 - **Details** (open on demand):
   - bytes asked for against bytes moved: read, write and request amplification, cache hits,
     and the bytes on the wire (in / out, from the kernel's counters) when they were measured;
-  - the hottest keys, object sizes (as ranges: `0 B`, `4 KiB – 64 KiB`, …), prefixes, the first
+  - the hottest keys, object sizes (as ranges: `0 B`, `4 KiB – 64 KiB`, …; only reads and writes
+    that moved their data have one), prefixes, the first
     read and re-reads of a key, and server addresses, each with its share of the requests (with
     a bar), its throttled share, error share and p99 (a column no row has is left out: hot keys
     carry their share of the throttling only).

@@ -49,6 +49,8 @@ pub struct DimensionStats {
     pub prefix_depth_count: u32,
     pub prefixes: Vec<SliceStats>,
     pub hot_keys: Vec<HotKeyStats>,
+    /// The reads and writes that moved their object's data, by its size (failures, stats and
+    /// lists have none).
     pub size_buckets: Vec<SliceStats>,
     pub cold_warm: Vec<SliceStats>,
     pub total_requests_count: u64,
@@ -203,13 +205,19 @@ impl DimAgg {
         } else {
             self.untracked += 1;
         }
-        let i = SIZE_BUCKETS
-            .iter()
-            .position(|(_, lim)| o.bytes < *lim)
-            .unwrap_or(SIZE_BUCKETS.len() - 1);
-        self.sizes[i].add(o);
         let read =
             o.verb.starts_with("read") || o.verb.starts_with("parquet") || o.verb == "replay.read";
+        // The object size slice: the bytes an operation moved are its object's size only when
+        // it moved the object's data. A failure moved none, and a stat or a list moves none:
+        // 9.3.3 put them all in "0 B", where HEADs and failed retries looked like a throttled
+        // size class.
+        if (read || o.verb.starts_with("write")) && !o.failed {
+            let i = SIZE_BUCKETS
+                .iter()
+                .position(|(_, lim)| o.bytes < *lim)
+                .unwrap_or(SIZE_BUCKETS.len() - 1);
+            self.sizes[i].add(o);
+        }
         if read {
             let h = hash(o.key);
             if self.seen.contains(&h) {
@@ -307,5 +315,24 @@ mod tests {
         assert_eq!(s.cold_warm[0].key, "cold");
         assert_eq!(s.cold_warm[0].ops_count, 2);
         assert_eq!(s.cold_warm[1].ops_count, 2);
+    }
+
+    /// A4: a failure, a stat and a list are in no size class (9.3.3 put them in "0 B").
+    #[test]
+    fn only_operations_that_moved_their_data_have_a_size() {
+        let mut d = DimAgg::new(1);
+        d.record(&op("read.full", "a/k", 100 << 10, false));
+        d.record(&op("stat", "a/k", 0, true));
+        d.record(&op("list", "a/", 0, false));
+        d.record(&DimOp {
+            failed: true,
+            ..op("read.full", "a/k", 0, true)
+        });
+        let s = d.stats();
+        let names: Vec<&str> = s.size_buckets.iter().map(|b| b.key.as_str()).collect();
+        assert_eq!(names, ["<1MiB"]);
+        assert_eq!(s.size_buckets[0].throttled_count, 0);
+        // They still count everywhere else.
+        assert_eq!(s.total_throttled_count, 2);
     }
 }

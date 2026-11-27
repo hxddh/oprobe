@@ -145,13 +145,19 @@ struct Manifest {
     partitions: Vec<String>,
 }
 
+/// The name of a persisted dataset: what decides its objects and their sizes. A size
+/// distribution is part of it (9.3.3 left it out, and a lognormal-size run reused a
+/// fixed-size dataset); a dataset of fixed size keeps the name it had.
 fn fingerprint(spec: &DatasetSpec, seed: u64) -> String {
-    let s = format!(
+    let mut s = format!(
         "{}|{}|{}|{seed}|v2",
         spec.objects,
         spec.object_size.0,
         spec.partitions.max(1)
     );
+    if let Some(d) = &spec.size_dist {
+        s.push_str(&format!("|{d}"));
+    }
     format!("{:08x}", crate::util::crc32c(s.as_bytes()))
 }
 
@@ -587,6 +593,27 @@ mod tests {
     /// End to end on a filesystem: a persisted dataset whose manifest cannot be read (here
     /// it is a directory, an error that is not "not found") is neither uploaded again nor
     /// deleted.
+    /// E3: a persisted dataset is named after its size distribution too.
+    #[test]
+    fn a_size_distribution_names_its_own_persisted_dataset() {
+        let fixed = DatasetSpec {
+            objects: 8,
+            object_size: crate::util::ByteSize(64 * 1024),
+            ..Default::default()
+        };
+        let dist = DatasetSpec {
+            size_dist: Some("dist:lognormal(64KiB,1.5)".parse().unwrap()),
+            ..fixed.clone()
+        };
+        assert_ne!(fingerprint(&fixed, 1), fingerprint(&dist, 1));
+        // A fixed-size dataset keeps the name 9.3.3 gave it.
+        let s = format!("8|{}|{}|1|v2", 64 * 1024, fixed.partitions.max(1));
+        assert_eq!(
+            fingerprint(&fixed, 1),
+            format!("{:08x}", crate::util::crc32c(s.as_bytes()))
+        );
+    }
+
     #[tokio::test]
     async fn an_unreadable_manifest_leaves_the_persisted_dataset_alone() {
         let dir = tempfile::tempdir().unwrap();
