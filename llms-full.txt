@@ -62,7 +62,7 @@ each with its remedy as an `op.toml` path, and the next command:
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.3/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.4/docs/concepts.md#glossary
 ```
 
 `prove last` runs trials of the current operator (A) and of the remedy (B), interleaved, and ends
@@ -143,7 +143,7 @@ Add one layer to your own operator and save a profile the workbench opens like a
 
 ```toml
 [dependencies]
-oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.3" }   # not on crates.io yet
+oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.4" }   # not on crates.io yet
 ```
 
 ```rust
@@ -189,7 +189,7 @@ oprobe prove last --with layers.retry.max_times=5 --max-duration 5m -o json > pr
 | macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` (`-s -- --cli` for the CLI without the app) |
 | Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` or the `.msi` |
 | Debian / Ubuntu, Fedora / RHEL | `.deb` / `.rpm` from the release page |
-| Rust (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.3 oprobe` (`--no-default-features --features cli` for the CLI only, `--features gui` for native windows on Linux) |
+| Rust (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.4 oprobe` (`--no-default-features --features cli` for the CLI only, `--features gui` for native windows on Linux) |
 
 The macOS and Windows packages are **not code-signed**: the first open needs one confirmation
 ([how](docs/install.md#first-open-of-unsigned-packages)). Every asset has a SHA-256 in `SHA256SUMS`
@@ -780,7 +780,8 @@ takes the same paths. The paths: `url`, `options.KEY`, `layers.NAME` (`on`/`off`
 (`unset` goes back to the environment's).
 
 `--set` also takes the workload's keys, the ones without a flag of their own included:
-`concurrency`, `preset`, `duration`, `warmup` (e.g. `--set warmup=2s`), `max_ops`, `rate`,
+`concurrency`, `preset`, `duration`, `warmup` (e.g. `--set warmup=2s`; unset, it is 2 s or half the
+window, whichever is shorter), `max_ops`, `rate`,
 `arrivals`, `shape`, `access`, `objects`, `object_size`, `partitions`, `existing`, `persist`,
 `verify`, `cleanup`, `seed` and `mix`; and the run's `label`. There are no limits to set: the
 findings judge a run, an open loop that stalled fails its checks by itself (see
@@ -873,7 +874,7 @@ oprobe lab   [SCENARIO]    # a local S3 with faults
 | Flag | Meaning |
 |---|---|
 | `-o, --output text\|json` | the result on stdout as text (default) or one JSON document (env `OPROBE_OUTPUT`); logs and progress always go to stderr |
-| `--color auto\|always\|never` | colors (default `auto`; `NO_COLOR` is honoured) |
+| `--color auto\|always\|never` | colors (default: `[defaults] color` in the config file, else `auto`; `NO_COLOR` is honoured) |
 | `-q, --quiet` | no progress or informational messages on stderr |
 | `--non-interactive` | never prompt or redraw (implied when stdin or stdout is not a terminal) |
 | `-h, --help` | help (`-h` for a summary) |
@@ -900,7 +901,7 @@ from the config file's `[operators.NAME]` also works.
 | `-d, --duration DURATION` | the measurement window (`30s`, `2m`) |
 | `--objects N` | dataset objects to generate |
 | `--object-size SIZE` | size of each generated object (`16MiB`) |
-| `--rate OPS` | open-loop arrival rate (operations per second); latency counts from the intended start |
+| `--rate OPS` | open-loop arrival rate (operations per second, 0.001 to 1 000 000); latency counts from the intended start |
 | `--existing PREFIX` | profile the objects already under `PREFIX`; writes nothing (implies `--read-only`) |
 | `--seed N` | seed of the workload's random choices |
 | `--set PATH=VALUE` | change one value of the operator or the workload, repeatable (`--set layers.retry.max_times=5`, `--set read.gap=1MiB`, `--set layers.cache=off`; [paths](operator.md#--set)) |
@@ -911,8 +912,8 @@ from the config file's `[operators.NAME]` also works.
 |---|---|
 | `--dry-run` | print the plan (requests, bytes, objects written and deleted, ETA, budgets; a warning when it would spend one) and exit (`-o json`: `schemas/plan.json`) |
 | `--read-only` | refuse every write and delete (exit 5) |
-| `--max-requests N` | send at most this many HTTP requests to the target, retries and the dataset upload included; the next one is not sent (exit 4) |
-| `--max-bytes SIZE` | transfer at most this many body bytes, up and down, e.g. `10GiB`; a request body that does not fit is not sent, a download is cut where it crosses the budget (exit 4) |
+| `--max-requests N` | send at most this many HTTP requests to the target (calls, for `fs://` and `memory://`), retries and the dataset upload included; the next one is not sent (exit 4) |
+| `--max-bytes SIZE` | transfer at most this many body bytes, up and down, e.g. `10GiB`; a request body that does not fit is not sent, a download is cut where it crosses the budget, and a dataset larger than the budget is refused before it is uploaded (exit 4) |
 | `--max-duration DURATION` | stop after this much wall time, e.g. `5m` (exit 4) |
 
 A budget that stops a run cuts what is in flight, aborts the multipart uploads it interrupted,
@@ -1054,7 +1055,7 @@ Print a profile: a stored run, or a file (`.oprobe` from `run` or from
 Pass two or more runs or files to compare them side by side on goodput, bandwidth, latency,
 retries, throttling and stage split (`-o json`: the `run` document, `schemas/run.json`, `--detail` adds the per-API
 comparison table). `-o json` for one run prints the shown run (`schemas/show.json`: the report of `schemas/report.json`, where it is stored, and the `by` and `range` sections when asked for); `--list -o json` the run list
-(`schemas/run-list.json`; `-n` limits the runs and the proves alike), and `--rm -o json` the deleted ids (`schemas/removed.json`). A prove id, unambiguous prove prefix, `last-prove`, or `.prove.json` file (`show --list`
+(`schemas/run-list.json`; `-n` limits the runs and the proves alike), and `--rm -o json` the deleted ids, a prove's trial runs after it (`schemas/removed.json`). A prove id, unambiguous prove prefix, `last-prove`, or `.prove.json` file (`show --list`
 lists them) prints that prove's stored result as `prove` printed it (`schemas/prove.json`), also
 after its run was removed.
 
@@ -1069,6 +1070,7 @@ multipart and repeated reads (not bandwidth cap or client bound). `prove` refuse
 |---|---|
 | `--list` | list the stored runs (prove trials hidden) and the proves; a long change is cut in the list (`show PROVE` prints it whole) |
 | `--all` | with `--list`: include the prove trials |
+| `-n`, `--limit N` | with `--list`: at most N runs and N proves, newest first (default 20) |
 | `--rm RUN…` | delete stored runs (a run named twice is deleted once) |
 | `--detail` | every section of the profile: the timeline (one row per interval of 1 s, or 10 s after ten minutes; long runs merge rows), the spread of the requests over keys, sizes, prefixes and remotes, the operator and the five slowest operations |
 | `--by stage\|api\|conn` | group the requests by stage, storage API or connection |
@@ -1163,7 +1165,7 @@ The app's Profile view shows the same sections with charts ([app](app.md)).
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.3/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.4/docs/concepts.md#glossary
 ```
 
 (`oprobe demo`; your numbers differ from run to run.)
@@ -1351,7 +1353,7 @@ meter).
 
 ```toml
 [dependencies]
-oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.3" }
+oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.4" }
 ```
 
 `oprobe-trace` is not on crates.io yet: the git dependency above is the one that resolves today
@@ -1836,7 +1838,8 @@ The window works like other professional tools on your platform (design:
 - **Details** (open on demand):
   - bytes asked for against bytes moved: read, write and request amplification, cache hits,
     and the bytes on the wire (in / out, from the kernel's counters) when they were measured;
-  - the hottest keys, object sizes (as ranges: `0 B`, `4 KiB – 64 KiB`, …), prefixes, the first
+  - the hottest keys, object sizes (as ranges: `0 B`, `4 KiB – 64 KiB`, …; only reads and writes
+    that moved their data have one), prefixes, the first
     read and re-reads of a key, and server addresses, each with its share of the requests (with
     a bar), its throttled share, error share and p99 (a column no row has is left out: hot keys
     carry their share of the throttling only).
@@ -1932,7 +1935,7 @@ JSON.
 | macOS, Linux (CLI only) | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh -s -- --cli` |
 | Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, or the `.msi` |
 | Debian, Ubuntu, Fedora, RHEL | the `.deb` / `.rpm` from the release page |
-| Rust ≥ 1.97 (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.3 oprobe` |
+| Rust ≥ 1.97 (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.4 oprobe` |
 
 Then try it with no account: `oprobe demo` ([getting started](getting-started.md)).
 
@@ -2021,9 +2024,9 @@ sudo dnf install ./oprobe-<ver>-1.x86_64.rpm
 ## From source
 
 ```bash
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.3 oprobe                                         # the app in the terminal
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.3 oprobe --features gui                          # plus native windows (Linux: libgtk-4-dev)
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.3 oprobe --no-default-features --features cli    # the CLI only
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.4 oprobe                                         # the app in the terminal
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.4 oprobe --features gui                          # plus native windows (Linux: libgtk-4-dev)
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.4 oprobe --no-default-features --features cli    # the CLI only
 ```
 
 oprobe is not on crates.io. To embed oprobe's instrumentation in your own program use
@@ -2155,6 +2158,11 @@ change with `oprobe prove`.
 An operator file or the config file does not parse, or has an invalid value (an unknown key, a
 size that does not parse). The message names the key.
 
+"`op.toml` now names …, not the operator the run used": `prove` replays a stored run with the
+secrets of the operator it was run with, and the operator file or configured operator it names
+now has another URL or endpoint. Its keys are not sent to the run's endpoint. Put the file back
+as the run had it, or start a new run with the operator you mean.
+
 <a id="config-unknown_option"></a>
 ### `config.unknown_option` (exit 2)
 
@@ -2241,13 +2249,15 @@ preset.
 A budget (`--max-requests`, `--max-bytes`, `--max-duration`, or `[defaults.budgets]`) stopped the
 command. Budgets cover the whole command: every operator of `run`, every trial of `prove`, and
 every HTTP request sent to the target before cleanup (the preflight, the dataset upload and
-retries included). The request the budget had no room for was not sent, the operations in flight
+retries included; for `fs://` and `memory://`, every call of the service). The request the budget had no room for was not sent, the operations in flight
 were cut, their multipart uploads aborted, the partial run saved and the test data cleaned up.
 When the budget runs out during the preflight or the dataset upload there is no run to save (and
 nothing is left on the target: the preflight's probe object is deleted outside the budget).
 "the next request (8.0 MiB) does not fit the byte budget: 1 B of 4.0 MiB used" means
 `--max-bytes` is smaller than one request body (a multipart part, an object): raise it above
-that size. Raise the budget or shorten the run; `--dry-run` shows the estimates.
+that size. "the dataset alone (…) does not fit the byte budget" means the objects to upload are
+larger than `--max-bytes`: nothing was uploaded. Lower `--objects` or `--object-size`, or raise
+the budget. Raise the budget or shorten the run; `--dry-run` shows the estimates.
 
 <a id="safety-read_only"></a>
 ### `safety.read_only` (exit 5)

@@ -462,10 +462,14 @@ impl Handle {
     /// with their requests (the request waterfall). The rows are moved out of memory, so
     /// successive saves hold the rows recorded since the previous one; the aggregates are
     /// cumulative. Open the file with `oprobe show FILE` or in the workbench.
+    ///
+    /// A path that cannot be written (a missing directory, no permission) fails before
+    /// anything is taken: the rows stay for the next save.
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let pending = file::Pending::create(path.as_ref())?;
         let snapshot = self.snapshot();
         let rows = self.recorder.take_trace();
-        file::write(path.as_ref(), self.service.get(), &snapshot, Some(&rows))
+        pending.finish(self.service.get(), &snapshot, Some(&rows))
     }
 
     /// [`Handle::save`], then start a fresh window: the aggregates start again from zero, so
@@ -478,11 +482,15 @@ impl Handle {
     /// handle.save_and_reset("prod-1400.oprobe")?;
     /// # Ok(()) }
     /// ```
+    ///
+    /// A path that cannot be written (a missing directory, no permission) fails before the
+    /// reset: the window goes on, and the next save holds it.
     pub fn save_and_reset(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let pending = file::Pending::create(path.as_ref())?;
         self.linker.flush(&self.recorder);
         // The rows of the same window as the aggregates (one critical section).
         let (snapshot, rows) = self.recorder.snapshot_and_reset_with_rows();
-        file::write(path.as_ref(), self.service.get(), &snapshot, Some(&rows))
+        pending.finish(self.service.get(), &snapshot, Some(&rows))
     }
 
     /// Why HTTP requests are not instrumented (the transport could not be built, for example

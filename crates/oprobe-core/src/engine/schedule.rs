@@ -306,8 +306,9 @@ pub struct ArrivalClock {
     shape: Option<RateShape>,
     base: f64,
     window: Duration,
-    /// Offset of the last arrival handed out.
-    t: Duration,
+    /// Offset of the last arrival handed out (s). Kept as `f64`: a `Duration` truncates each
+    /// gap to whole nanoseconds, and at a high enough rate the clock stopped advancing.
+    t: f64,
     started: bool,
 }
 
@@ -322,7 +323,7 @@ impl ArrivalClock {
             shape,
             base: base.max(0.0),
             window,
-            t: Duration::ZERO,
+            t: 0.0,
             started: false,
         }
     }
@@ -357,7 +358,7 @@ impl ArrivalClock {
         };
         self.started = true;
         let h = horizon.as_secs_f64();
-        let mut t = self.t.as_secs_f64();
+        let mut t = self.t;
         if need > 0.0 {
             match &self.shape {
                 None => {
@@ -386,8 +387,8 @@ impl ArrivalClock {
         if t >= h {
             return None;
         }
-        self.t = Duration::from_secs_f64(t);
-        Some(self.t)
+        self.t = t;
+        Some(Duration::from_secs_f64(t))
     }
 }
 
@@ -395,6 +396,21 @@ impl ArrivalClock {
 mod tests {
     use super::*;
     use rand::SeedableRng;
+
+    /// S2: at a gap under a nanosecond a `Duration` clock stopped advancing, and the run's
+    /// missed-arrival loop spun for ever. The clock now advances at any rate, and ends at its
+    /// horizon (here 3e9/s, three thousand times the highest rate a run accepts).
+    #[test]
+    fn the_clock_advances_at_any_rate() {
+        let mut c = ArrivalClock::new(Arrivals::Constant, None, 3e9, Duration::from_micros(1));
+        let mut rng = SmallRng::seed_from_u64(7);
+        let mut n = 0u64;
+        while c.next(&mut rng, Duration::from_micros(1)).is_some() {
+            n += 1;
+            assert!(n < 10_000, "the clock does not advance");
+        }
+        assert!((2_900..=3_100).contains(&n), "{n}");
+    }
 
     fn count(c: &mut ArrivalClock, window: Duration) -> Vec<Duration> {
         let mut rng = SmallRng::seed_from_u64(7);

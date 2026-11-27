@@ -4,6 +4,66 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v9.3.4 — 2026-11-27
+
+The fixes of the fresh review of 9.3.3 (`docs/design/v9.3-review.md`): credentials a replay
+could send to the wrong place, budgets and rates that did not hold, data `oprobe-trace` could
+lose, numbers that were wrong. No command or flag was added; the file formats are unchanged.
+
+### Fixed
+
+#### Safety
+
+- **A replay sends only the credentials of the operator the run used.** A run stores an
+  operator file by its canonical path, and `prove` (and the app's Run Again) takes redacted
+  secrets back only from an operator with the run's URL and endpoint; another one is refused
+  (`config.invalid`), or replaced by the run's own URL.
+- **`--rate` is bounded to 0.001–1 000 000 ops/s.** `1e9` hung the run past Ctrl-C and SIGTERM;
+  `1e-20` panicked and left the dataset on the target. A panic inside a run still cleans up.
+- **Budgets cover the dataset upload and the preflight of `fs://` and `memory://`.**
+  `--max-requests 10 --objects 2000` wrote 2 005 files.
+- **A dataset larger than `--max-bytes` is refused before anything is uploaded**, and objects
+  are generated in 8 MiB pieces (`--object-size 64GiB` aborted the process).
+
+#### `oprobe-trace`
+
+- A completion racing `snapshot_and_reset` lands in the new window's intervals.
+- `save` and `save_and_reset` to a path that cannot be written fail with nothing lost.
+- Concurrent saves to one path each write a whole file.
+- The exporter sees each request as it is captured, and a failed call that is not retried
+  within a second, without waiting for a snapshot.
+- A read dropped before it returns completes its operation, as cancelled.
+- Ended operations leave no retry scope behind; a full map evicts its oldest entry.
+- The sampler stays within `max_rows` with operations of many requests.
+- The object size slice holds only reads and writes that moved their data.
+
+#### Numbers
+
+- **Throttling is charged with the backoff after its 429/503 only**, not after 5xx.
+- **An open-loop window runs to its deadline** (`--rate 2 -d 2s` measured 1.5 s).
+- **A constant `--rate` keeps up beyond the timer's resolution** (20 000/s reached 3 256).
+- A `--since` range to the end of the window keeps the requests sent as the window drained.
+- A persisted dataset is named after its size distribution too.
+
+#### Usability
+
+- An unset warm-up takes at most half the window, so a short run can be proved.
+- A flag and a `--set` of the same setting that disagree are refused.
+- `show FILE` takes a run file whatever its name; a damaged run is listed as damaged.
+- `[defaults] color` applies; `show --list -n` is documented; `--dry-run`'s ETA honours
+  `max_ops`; a multi-operator run names its runs; `show --rm PROVE -o json` lists its trials.
+- Hints name only flags that exist (a test scans every message), the config file has its
+  own hint, a JSON usage error names the missing argument, and the app no longer offers a
+  remedy the core does not have.
+- `--save` writes through a symlinked `op.toml` and keeps its mode.
+
+### Changed
+
+- Runs of `fs://` and `memory://` count every call against `--max-requests`, the dataset
+  upload included (about 260 requests by default): a budget that left room for the window in
+  9.3.3 may now stop the run before it measures.
+- `-c 4 --set concurrency=8` is refused instead of running with 8.
+
 ## v9.3.3 — 2026-11-27
 
 A correctness pass on what 9.3.2 left: memory an idle embedded operator could take, uploads a

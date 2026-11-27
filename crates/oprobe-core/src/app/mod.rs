@@ -94,7 +94,15 @@ impl std::fmt::Display for RunRef {
     }
 }
 
-type CachedConfig = Option<std::result::Result<Arc<ConfigFile>, String>>;
+/// The error of a config file that did not load, from its cached message and hint.
+fn config_error((message, hint): (String, Option<String>)) -> anyhow::Error {
+    let mut e = OprobeError::new(ErrorCode::ConfigInvalid, message);
+    e.hint = hint;
+    e.into()
+}
+
+/// The loaded config file, or its error: the message and the hint.
+type CachedConfig = Option<std::result::Result<Arc<ConfigFile>, (String, Option<String>)>>;
 
 /// The service layer: paths, the (lazily loaded) config file. Cheap to clone; one per process
 /// is enough.
@@ -128,16 +136,19 @@ impl App {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
-            return cached
-                .clone()
-                .map_err(|m| OprobeError::new(ErrorCode::ConfigInvalid, m).into());
+            return cached.clone().map_err(config_error);
         }
+        // The error is kept whole, its hint too (9.3.3 kept its text only, and the config
+        // file's error got the operator file's hint).
         let loaded = ConfigFile::load(&self.paths.config_file)
             .map(Arc::new)
-            .map_err(|e| format!("{e:#}"));
+            .map_err(|e| {
+                let hint = e.downcast_ref::<OprobeError>().and_then(|x| x.hint.clone());
+                (format!("{e:#}"), hint)
+            });
         let mut slot = self.config.write().unwrap_or_else(|e| e.into_inner());
         let res = slot.get_or_insert(loaded).clone();
-        res.map_err(|m| OprobeError::new(ErrorCode::ConfigInvalid, m).into())
+        res.map_err(config_error)
     }
 
     /// The run store.
@@ -409,18 +420,26 @@ impl App {
     /// default operator of a URL: [`RunSpec::replay_on`]), under the same label. Secrets are
     /// not in a spec: they come from where the operator does (its file, the config file, the
     /// environment), as for any run. A reference that no longer resolves is kept as it is
-    /// (running it says so), its values those that differ from its URL's defaults.
+    /// (running it says so), its values those that differ from its URL's defaults. One that
+    /// now names another operator (another URL or endpoint) is replaced by the run's own URL:
+    /// that operator's credentials are never sent to the run's endpoint.
     pub fn replaying(&self, spec: &RunSpec) -> RunRequest {
-        let given = self
-            .config()
-            .ok()
-            .and_then(|cfg| crate::operator::resolve::resolve(&spec.operator_ref, &cfg).ok());
-        let (workload, set) = match &given {
-            Some((operator, _)) => spec.replay_on(operator),
-            None => spec.replay(),
+        let given = self.config().ok().map(|cfg| {
+            crate::operator::resolve::replayed_operator(
+                &spec.operator_ref,
+                &spec.profile.operator,
+                &cfg,
+            )
+        });
+        let (operator, (workload, set)) = match &given {
+            Some(Ok(Some(operator))) => (spec.operator_ref.clone(), spec.replay_on(operator)),
+            // The reference names another operator now: run the run's own URL, with its
+            // values, and none of that operator's credentials.
+            Some(Err(_)) => (spec.profile.operator.url.clone(), spec.replay()),
+            _ => (spec.operator_ref.clone(), spec.replay()),
         };
         RunRequest {
-            operators: vec![spec.operator_ref.clone()],
+            operators: vec![operator],
             workload,
             set,
             label: spec.label.clone(),
@@ -444,7 +463,7 @@ impl App {
                 Ok(Resolved {
                     profile,
                     target_name: source.name(),
-                    operator_ref: op.clone(),
+                    operator_ref: crate::operator::resolve::stored_ref(op),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -590,8 +609,8 @@ impl App {
     }
 
     /// Delete stored runs (a file outside the store is refused).
-    pub fn rm(&self, r: &[RunRef]) -> Result<()> {
-        runs::rm(self, r).map(|_| ())
+    pub fn rm(&self, r: &[RunRef]) -> Result<RemovedRuns> {
+        runs::rm(self, r)
     }
 
     /// Move stored runs to oprobe's trash (`<data>/trash/`, kept a week) instead of deleting
@@ -648,6 +667,60 @@ mod tests {
             data_dir: d.join("data"),
         });
         (app, file.display().to_string())
+    }
+
+    /// S1: a replay never sends the credentials of an operator other than the run's. 9.3.3
+    /// stored an operator file as typed and took every redacted secret from whatever file the
+    /// reference named at replay time (another directory's `op.toml`, or the file edited to
+    /// another bucket), and sent it to the run's endpoint.
+    #[test]
+    fn a_replay_takes_secrets_only_from_the_operator_the_run_used() {
+        let d = tempfile::tempdir().unwrap();
+        let (app, _) = app_with_operators(d.path());
+        let file = d.path().join("keys.toml");
+        let write = |url: &str, key: &str| {
+            std::fs::write(
+                &file,
+                format!(
+                    "url = \"{url}\"\n\n[options]\nendpoint = \"http://127.0.0.1:9000\"\n\
+                     access_key_id = \"{key}\"\nsecret_access_key = \"{key}-secret\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        write("s3://mine/data", "MYKEY");
+        // The reference is stored as an absolute path.
+        let run = app
+            .resolve(&RunRequest::new([file.display().to_string()]))
+            .unwrap()
+            .remove(0);
+        let spec = run.spec();
+        assert!(std::path::Path::new(&spec.operator_ref).is_absolute());
+        assert_eq!(spec.operator_ref, file.display().to_string());
+        let ctx = app.ctx(&EventSink::silent());
+        // The same operator: its secrets come back.
+        let p = profile::spec_profile(&ctx, spec.clone()).unwrap();
+        assert_eq!(p.operator.options.get("access_key_id").unwrap(), "MYKEY");
+        // The file now names another bucket with other keys: they are not taken.
+        write("s3://theirs/data", "OTHERPROJECTKEY");
+        let e = profile::spec_profile(&ctx, spec.clone()).unwrap_err();
+        assert!(
+            e.to_string().contains("not the operator the run used"),
+            "{e}"
+        );
+        let again = app.replaying(&spec);
+        assert_eq!(again.operators, vec!["s3://mine/data".to_owned()]);
+        let replayed = app.resolve(&again).unwrap().remove(0);
+        assert!(
+            replayed
+                .profile
+                .operator
+                .options
+                .values()
+                .all(|v| !v.contains("OTHERPROJECTKEY")),
+            "{:?}",
+            replayed.profile.operator.options
+        );
     }
 
     /// Every leaf of `v` as `(path, value)`.

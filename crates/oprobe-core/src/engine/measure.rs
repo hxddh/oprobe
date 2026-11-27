@@ -194,7 +194,8 @@ pub fn spec_of(profile: &Profile, target_name: Option<&str>) -> RunSpec {
 }
 
 /// The error of a run whose file cannot be written.
-const CANNOT_SAVE: &str = "cannot save the run (set OPROBE_DATA_DIR or pass --no-save)";
+const CANNOT_SAVE: &str =
+    "cannot save the run (set OPROBE_DATA_DIR to a directory oprobe can write to)";
 
 /// A finished measurement.
 pub struct Measured {
@@ -265,6 +266,21 @@ async fn open_with_tail_cut(
 
 /// Run one measurement end to end. A budget breach is not an error here: the partial run is
 /// built, saved and returned with [`Measured::breach`] set (callers turn it into exit 4).
+/// The error of a panic caught in the measurement window.
+fn panicked(payload: &(dyn std::any::Any + Send)) -> anyhow::Error {
+    let what = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown cause");
+    crate::errors::OprobeError::new(
+        crate::errors::ErrorCode::Internal,
+        format!("the run stopped on an internal error: {what}"),
+    )
+    .with_hint("the test data was removed; please report this with the command you ran")
+    .into()
+}
+
 pub async fn measure(req: Request) -> Result<Measured> {
     let Request {
         profile,
@@ -381,13 +397,16 @@ pub async fn measure(req: Request) -> Result<Measured> {
         session.stream_rows(st.clone());
         stream = Some(st);
     }
-    let res = session
-        .run(
-            &knobs,
-            &RunOptions::from_profile(&session.profile),
-            Some(progress.clone()),
-        )
-        .await;
+    // A panic inside the window is an error like any other: the dataset it uploaded is
+    // removed below (9.3.3 unwound past the cleanup and left it on the target).
+    let options = RunOptions::from_profile(&session.profile);
+    let res = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(session.run(
+        &knobs,
+        &options,
+        Some(progress.clone()),
+    )))
+    .await
+    .unwrap_or_else(|panic| Err(panicked(panic.as_ref())));
     stage(Stage::Measured);
     let (ok, bad) = if res.is_ok() && session.profile.workload.verify {
         session.verify_writes(None).await
@@ -512,11 +531,47 @@ mod tests {
         );
     }
 
+    /// E2: an open-loop window runs to its deadline. 9.3.3 closed it at the last arrival:
+    /// at 2 ops/s for 1.5 s, a 1 s window.
+    #[tokio::test]
+    async fn an_open_loop_window_runs_to_its_deadline() {
+        let mut p = quick("memory://");
+        p.workload.rate = Some(2.0);
+        p.workload.duration = crate::util::HumanDuration(std::time::Duration::from_millis(1500));
+        let rails = Rails::new(&p, false, None, Budgets::default()).unwrap();
+        let req = Request::new(p, rails, Cancel::new(), silent());
+        let m = measure(req).await.unwrap();
+        let w = m.run.report.run.window_s;
+        assert!((1.45..1.6).contains(&w), "window {w} s");
+        assert!(
+            m.run.report.summary.ops_per_s < 2.1,
+            "{}",
+            m.run.report.summary.ops_per_s
+        );
+    }
+
     #[tokio::test]
     async fn a_budget_breach_returns_the_partial_run() {
-        let p = quick("memory://");
+        let mut p = quick("memory://");
+        p.workload.verify = false;
+        // The dataset's upload is charged too: the budget leaves the window 50 requests.
+        let setup = {
+            let mut one = p.clone();
+            one.workload.concurrency = 1;
+            one.workload.max_ops = Some(1);
+            let budgets = Budgets {
+                max_requests_count: Some(u64::MAX),
+                ..Default::default()
+            };
+            let guard = guard_for(&budgets).unwrap();
+            let rails = Rails::new(&one, false, None, budgets).unwrap();
+            let mut req = Request::new(one, rails, Cancel::new(), silent());
+            req.guard = Some(guard.clone());
+            measure(req).await.unwrap();
+            guard.usage().0 - 1
+        };
         let budgets = Budgets {
-            max_requests_count: Some(50),
+            max_requests_count: Some(setup + 50),
             ..Default::default()
         };
         let rails = Rails::new(&p, false, None, budgets.clone()).unwrap();
@@ -536,6 +591,9 @@ mod tests {
         let mut p = quick("memory://");
         p.workload.concurrency = 1;
         p.workload.max_ops = Some(40);
+        // The re-read of written objects after the window is charged too, and is skipped
+        // (not a breach) when the budget is spent: leave it out, so the window is the edge.
+        p.workload.verify = false;
         p.workload.duration = crate::util::HumanDuration(std::time::Duration::from_secs(30));
         let run = |max: u64| {
             let p = p.clone();

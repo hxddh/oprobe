@@ -448,6 +448,25 @@ fn throttled_out_of_retries(r: &Report) -> u64 {
     rate_limited_failures(r) - refused_by_client(r)
 }
 
+/// The share of operation time (%) in the retry backoff that followed a throttled response
+/// (429/503). The retries are split by the status of the attempt they followed: a throttled
+/// response was retried unless its operation then failed out of retries. 9.3.3 charged the
+/// throttling with all the backoff, the backoff after 5xx included: `lab://noisy` reported 7
+/// throttled responses as 87% of operation time, the same 87% its `errors` finding claimed
+/// for 16 server errors.
+fn throttle_backoff_pct(r: &Report) -> f64 {
+    let retries = r.resilience.retries;
+    if retries == 0 {
+        return 0.0;
+    }
+    let after_throttle = r
+        .resilience
+        .throttled_responses
+        .saturating_sub(throttled_out_of_retries(r))
+        .min(retries);
+    r.stages.shares.retry_pct * after_throttle as f64 / retries as f64
+}
+
 /// Failed operations by error class, most common first, without those the service's
 /// throttling failed.
 fn failure_classes(r: &Report) -> Vec<(&str, u64)> {
@@ -548,10 +567,14 @@ fn errors(c: &Ctx, random_throttle: bool) -> Option<Finding> {
             &format!("; {network} of {requests} requests lost their connection before a response");
     }
     if recovered && retried > 0 {
-        text += &format!(
-            "; {:.0}% of operation time in retry backoff",
+        // The backoff after the throttled responses is the throttling finding's, unless the
+        // throttling is random and reported here.
+        let own = if random_throttle {
             r.stages.shares.retry_pct
-        );
+        } else {
+            r.stages.shares.retry_pct - throttle_backoff_pct(r)
+        };
+        text += &format!("; {own:.0}% of operation time in retry backoff");
     }
     let error_ratio = failed as f64 / r.summary.ops.max(1) as f64;
     let retried_pct = retried as f64 * 100.0 / requests as f64;
@@ -665,10 +688,10 @@ fn throttle_family(c: &Ctx) -> (Option<Finding>, bool) {
         confidence = Confidence::Low;
     }
     let out_of_retries = throttled_out_of_retries(r);
+    let backoff_pct = throttle_backoff_pct(r);
     let mut text = format!(
-        "{thr} throttled responses (429/503) in {requests} requests ({:.2}%); {:.0}% of operation time in retry backoff",
+        "{thr} throttled responses (429/503) in {requests} requests ({:.2}%); {backoff_pct:.0}% of operation time in retry backoff after them",
         req_ratio * 100.0,
-        r.stages.shares.retry_pct
     );
     if out_of_retries > 0 {
         text += &format!("; {out_of_retries} operations failed when their retries ran out");
@@ -690,12 +713,12 @@ fn throttle_family(c: &Ctx) -> (Option<Finding>, bool) {
             h.explains_ratio * 100.0
         );
     }
-    let backoff_share = r.stages.shares.retry_pct / 100.0;
+    let backoff_share = backoff_pct / 100.0;
     let failed_ratio = out_of_retries as f64 / r.summary.ops.max(1) as f64;
     let mut vals = vec![
         ("throttled_responses_count", thr as f64),
         ("throttled_request_ratio", req_ratio),
-        ("retry_pct", r.stages.shares.retry_pct),
+        ("retry_pct", backoff_pct),
         ("rate_limited_failures_count", out_of_retries as f64),
         (COST_KEY, backoff_share),
     ];
@@ -733,10 +756,9 @@ fn throttle_family(c: &Ctx) -> (Option<Finding>, bool) {
         1 => "; 1 operation failed when its retries ran out".to_owned(),
         n => format!("; {n} operations failed when their retries ran out"),
     };
-    let cause = if r.stages.shares.retry_pct >= 0.5 {
+    let cause = if backoff_pct >= 0.5 {
         format!(
-            "{:.0}% of operation time is spent in retry backoff after 429/503: {what}{failed}.",
-            r.stages.shares.retry_pct
+            "{backoff_pct:.0}% of operation time is spent in retry backoff after 429/503: {what}{failed}."
         )
     } else {
         let mut s = what;
@@ -2218,6 +2240,8 @@ pub(crate) mod tests {
     fn throttled(kind: HypothesisKind, explains: f64, conf: Confidence) -> Run {
         let mut run = base();
         run.report.resilience.throttled_responses = 100;
+        // Every throttled response was retried.
+        run.report.resilience.retries = 100;
         // Throttling that costs: most of the operation time is retry backoff (critical).
         run.report.stages.shares.retry_pct = 60.0;
         run.report.capacity.hypotheses = vec![Hypothesis {
@@ -2247,6 +2271,27 @@ pub(crate) mod tests {
         assert!(f[0].remedy.sized);
         assert_eq!(f[0].evidence.values["fitted_inflight_count"], 24.0);
         assert!(!f[0].cause.contains("24"));
+    }
+
+    /// A1: the throttling is charged with the backoff after its 429/503 only, not with the
+    /// backoff after 5xx (9.3.3: 7 throttled responses beside 16 server errors were "87% of
+    /// operation time in retry backoff after 429/503", Critical).
+    #[test]
+    fn throttling_is_charged_only_with_its_own_backoff() {
+        let mut run = throttled(HypothesisKind::InflightLimit, 0.95, Confidence::High);
+        run.report.resilience.throttled_responses = 7;
+        run.report.resilience.retries = 23;
+        run.report.stages.shares.retry_pct = 87.0;
+        let f = derive(&run);
+        let t = f.iter().find(|x| x.code == "throttling").unwrap();
+        let own = 87.0 * 7.0 / 23.0;
+        assert!((t.evidence.values["retry_pct"] - own).abs() < 1e-9);
+        assert!(
+            t.cause
+                .starts_with("26% of operation time is spent in retry backoff after 429/503"),
+            "{}",
+            t.cause
+        );
     }
 
     /// The cause (the headline) leads with what throttling costs, not the share of requests.

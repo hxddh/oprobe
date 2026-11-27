@@ -72,6 +72,11 @@ change with `oprobe prove`.
 An operator file or the config file does not parse, or has an invalid value (an unknown key, a
 size that does not parse). The message names the key.
 
+"`op.toml` now names …, not the operator the run used": `prove` replays a stored run with the
+secrets of the operator it was run with, and the operator file or configured operator it names
+now has another URL or endpoint. Its keys are not sent to the run's endpoint. Put the file back
+as the run had it, or start a new run with the operator you mean.
+
 <a id="config-unknown_option"></a>
 ### `config.unknown_option` (exit 2)
 
@@ -158,13 +163,15 @@ preset.
 A budget (`--max-requests`, `--max-bytes`, `--max-duration`, or `[defaults.budgets]`) stopped the
 command. Budgets cover the whole command: every operator of `run`, every trial of `prove`, and
 every HTTP request sent to the target before cleanup (the preflight, the dataset upload and
-retries included). The request the budget had no room for was not sent, the operations in flight
+retries included; for `fs://` and `memory://`, every call of the service). The request the budget had no room for was not sent, the operations in flight
 were cut, their multipart uploads aborted, the partial run saved and the test data cleaned up.
 When the budget runs out during the preflight or the dataset upload there is no run to save (and
 nothing is left on the target: the preflight's probe object is deleted outside the budget).
 "the next request (8.0 MiB) does not fit the byte budget: 1 B of 4.0 MiB used" means
 `--max-bytes` is smaller than one request body (a multipart part, an object): raise it above
-that size. Raise the budget or shorten the run; `--dry-run` shows the estimates.
+that size. "the dataset alone (…) does not fit the byte budget" means the objects to upload are
+larger than `--max-bytes`: nothing was uploaded. Lower `--objects` or `--object-size`, or raise
+the budget. Raise the budget or shorten the run; `--dry-run` shows the estimates.
 
 <a id="safety-read_only"></a>
 ### `safety.read_only` (exit 5)

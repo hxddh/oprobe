@@ -270,7 +270,19 @@ impl RunStore {
                         );
                         s
                     }
-                    Err(_) => continue,
+                    // Listed as damaged, not left out: 9.3.3 hid it, and `last` silently
+                    // named the run before it. (A run in progress is a `.tmp` file, never
+                    // listed: a stored run file that does not read is damaged.)
+                    Err(e) => RunSummary {
+                        id: id.clone(),
+                        target_display: "(damaged)".into(),
+                        verdict_level: VerdictLevel::Review,
+                        headline: format!(
+                            "damaged: the run file cannot be read ({}); remove it with `oprobe show --rm {id}`",
+                            format!("{e:#}").lines().next().unwrap_or_default()
+                        ),
+                        ..Default::default()
+                    },
                 },
             };
             out.push(RunSummary {
@@ -320,11 +332,14 @@ impl RunStore {
                 .nth(n)
                 .map(|id| self.run_path(id))
                 .ok_or_else(|| {
-                    unknown(if ids.is_empty() {
-                        "no runs yet".to_owned()
+                    if ids.is_empty() {
+                        // An empty list is no help on the first command (N6).
+                        OprobeError::new(ErrorCode::UsageUnknownRun, "no runs yet")
+                            .with_hint("profile the local lab with `oprobe demo`, or an operator with `oprobe run URL`")
+                            .into()
                     } else {
-                        format!("`{r}`: only {} runs are stored", ids.len())
-                    })
+                        unknown(format!("`{r}`: only {} runs are stored", ids.len()))
+                    }
                 });
         }
         if ids.iter().any(|i| i == r) {
@@ -358,6 +373,12 @@ impl RunStore {
             .find(|s| s.label.as_deref() == Some(r))
         {
             return Ok(self.run_path(&s.id));
+        }
+        // A file is recognised by its content, whatever its name (docs/cli.md): one named like
+        // neither a path nor a run file (`profile`, `trace.bin`) is a file when no run is
+        // (9.3.3 refused it).
+        if p.is_file() {
+            return Ok(p.to_path_buf());
         }
         Err(unknown(format!("no run matches `{r}`")))
     }
@@ -945,6 +966,42 @@ pub(crate) mod tests {
         };
         assert_eq!(gcs.scheme(), Some("gcs"));
         assert_eq!(RunSummary::default().scheme(), None);
+    }
+
+    /// U7: a damaged run file is listed as damaged, and `last` still names it (9.3.3 left it
+    /// out of the list, and `last` moved to the run before it).
+    #[test]
+    fn a_damaged_run_is_listed_as_damaged() {
+        let d = tempfile::tempdir().unwrap();
+        let store = RunStore::new(d.path().join("runs"));
+        store
+            .save(&sample_run("20261120-143005-a1b2", None))
+            .unwrap();
+        std::fs::write(store.run_path("20261121-090000-e5f6"), b"not a run").unwrap();
+        let list = store.list().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, "20261121-090000-e5f6");
+        assert!(
+            list[0].headline.starts_with("damaged:"),
+            "{}",
+            list[0].headline
+        );
+        assert!(
+            store
+                .resolve("last")
+                .unwrap()
+                .ends_with("20261121-090000-e5f6.oprobe")
+        );
+    }
+
+    /// N6: `last` with no runs points at a first run, not at an empty list.
+    #[test]
+    fn no_runs_yet_points_at_a_first_run() {
+        let d = tempfile::tempdir().unwrap();
+        let store = RunStore::new(d.path().join("runs"));
+        let e = store.resolve("last").unwrap_err();
+        let e = e.downcast_ref::<OprobeError>().unwrap();
+        assert!(e.hint.as_deref().unwrap().contains("oprobe demo"), "{e:?}");
     }
 
     #[test]

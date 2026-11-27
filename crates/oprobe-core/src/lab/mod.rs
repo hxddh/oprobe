@@ -109,7 +109,7 @@ pub fn lab_ca_pem() -> &'static str {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum LabProto {
     /// Plain HTTP/1.1 and HTTP/2 with prior knowledge (h2c), detected per connection (the
-    /// default: `--http h1` and `--http h2` both work).
+    /// default: `http.version` `h1` and `h2` both work).
     #[default]
     H2c,
     /// Plain HTTP/1.1 only.

@@ -6,6 +6,7 @@ use anyhow::Result;
 use super::Ctx;
 use super::input::*;
 use crate::config::{DatasetSpec, Profile};
+use crate::errors::{ErrorCode, OprobeError};
 
 use crate::operator::resolve::OperatorSource;
 use crate::util::HumanDuration;
@@ -124,12 +125,54 @@ pub fn apply_sla(p: &mut Profile, a: &SlaInput) -> Result<()> {
         p.sla.enforce = m == SlaMode::Enforce;
     }
     if let Some(v) = &a.max_error_rate {
-        p.sla.max_error_rate = parse_rate("--max-error-ratio", v)?;
+        p.sla.max_error_rate = parse_rate("max_error_rate", v)?;
     }
     if let Some(v) = &a.max_throttle_rate {
-        p.sla.max_throttle_rate = Some(parse_rate("--max-throttle-ratio", v)?);
+        p.sla.max_throttle_rate = Some(parse_rate("max_throttle_rate", v)?);
     }
     p.sla.validate()
+}
+
+/// The workload settings given by a flag in `w`, as `p` has them: `(key, value)`.
+fn flag_values(p: &Profile, w: &WorkloadInput) -> Vec<(&'static str, String)> {
+    let wl = &p.workload;
+    let ds = wl.effective_dataset();
+    let given = [
+        ("preset", w.preset.is_some(), format!("{:?}", wl.preset)),
+        (
+            "concurrency",
+            w.concurrency.is_some(),
+            wl.concurrency.to_string(),
+        ),
+        ("seed", w.seed.is_some(), wl.seed.to_string()),
+        ("duration", w.duration.is_some(), wl.duration.to_string()),
+        ("warmup", w.warmup.is_some(), wl.warmup.to_string()),
+        ("max_ops", w.max_ops.is_some(), format!("{:?}", wl.max_ops)),
+        ("rate", w.rate.is_some(), format!("{:?}", wl.rate)),
+        (
+            "existing",
+            w.existing.is_some(),
+            format!("{:?}", ds.existing_prefix),
+        ),
+        ("objects", w.objects.is_some(), ds.objects.to_string()),
+        (
+            "object_size",
+            w.object_size.is_some(),
+            format!(
+                "{:?}",
+                (
+                    ds.object_size.0,
+                    ds.size_dist.as_ref().map(|d| d.to_string())
+                )
+            ),
+        ),
+        ("access", w.access.is_some(), wl.access.to_string()),
+    ];
+    given
+        .into_iter()
+        .filter(|(_, g, _)| *g)
+        .map(|(k, _, v)| (k, v))
+        .collect()
 }
 
 /// The profile `oprobe run` measures: the operator (a URL, an `op.toml` file or a configured
@@ -148,8 +191,34 @@ pub fn run_profile(ctx: &Ctx, a: &ProfileRequest) -> Result<(Profile, OperatorSo
     }
     let sets = crate::model::Overrides::parse(&a.set)?;
     let mut label = p.name.clone();
+    let flagged = flag_values(&p, &a.workload);
     sets.apply(&mut p, &mut label)?;
+    // N2: a flag and a `--set` of the same setting that disagree are refused (9.3.3 ran
+    // `-c 4 --set concurrency=8` with 8, saying nothing).
+    for (key, before) in &flagged {
+        if sets.workload.contains_key(*key)
+            && let Some((_, after)) = flag_values(&p, &a.workload)
+                .into_iter()
+                .find(|(k, _)| k == key)
+            && &after != before
+        {
+            return Err(OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!("`--set {key}` ({after}) disagrees with its flag ({before})"),
+            )
+            .with_hint(format!("give {key} once: the flag or `--set {key}=…`"))
+            .into());
+        }
+    }
     p.name = label;
+    // A warm-up nobody set takes at most half the window (N1): 9.3.3 warmed up its 2 s before
+    // a `-d 1s` window, and such a run could not be proved.
+    if w.warmup.is_none() && !sets.workload.contains_key("warmup") {
+        let half = p.workload.duration.0 / 2;
+        if p.workload.warmup.0 > half {
+            p.workload.warmup = crate::util::HumanDuration(half);
+        }
+    }
     p.validate()?;
     Ok((p, source))
 }
@@ -163,9 +232,12 @@ pub fn spec_profile(ctx: &Ctx, spec: crate::model::RunSpec) -> Result<Profile> {
     // Secrets were redacted: take them from where the operator came from when that still
     // resolves (a configured operator, an operator file), else drop them (the environment's
     // credentials apply).
-    let known = crate::operator::resolve::resolve(&spec.operator_ref, &*ctx.config()?)
-        .ok()
-        .map(|(o, _)| o.options);
+    let known = crate::operator::resolve::replayed_operator(
+        &spec.operator_ref,
+        &spec.profile.operator,
+        &*ctx.config()?,
+    )?
+    .map(|o| o.options);
     p.operator.options = p
         .operator
         .options

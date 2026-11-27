@@ -92,9 +92,9 @@ pub struct Cli {
     )]
     pub output: Option<OutputArg>,
 
-    /// When to use colors
-    #[arg(long, value_enum, default_value_t = ColorChoice::Auto, global = true)]
-    pub color: ColorChoice,
+    /// When to use colors [default: `[defaults] color`, else auto]
+    #[arg(long, value_enum, global = true)]
+    pub color: Option<ColorChoice>,
 
     /// No progress or informational messages on stderr
     #[arg(short, long, global = true)]
@@ -319,13 +319,7 @@ pub struct ShowArgs {
     #[arg(long, value_name = "DURATION", value_parser = parse::duration, conflicts_with_all = ["list", "rm"])]
     pub until: Option<String>,
     /// Show at most N runs (`--list`)
-    #[arg(
-        short = 'n',
-        long,
-        default_value_t = 20,
-        requires = "list",
-        hide = true
-    )]
+    #[arg(short = 'n', long, default_value_t = 20, requires = "list")]
     pub limit: usize,
 }
 

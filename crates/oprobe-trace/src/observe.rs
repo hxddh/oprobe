@@ -41,6 +41,15 @@ const MAX_PARKED: usize = 4096;
 /// completes as failed after this long.
 const STALE_RETRY: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// A parked call still not marked retrying this long after it failed never will be (the
+/// notification follows a failure at once): the next operation started on any task completes
+/// it as failed. 9.3.3 completed it only at the next call on its own task or at a snapshot,
+/// so an exporter (OpenTelemetry) saw failed operations late, or not until a snapshot.
+const NOT_RETRIED: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How often the parked calls of every task are swept for [`NOT_RETRIED`] ones, at most.
+const SWEEP_EVERY_MS: u64 = 100;
+
 /// The key an embedded operation records (design v7 B1, docs/privacy.md): the first path
 /// segment (at most 32 bytes, so prefixes still slice the traffic) and a 48-bit hash of the
 /// whole key (so hot keys and repeated reads are still told apart), never the key itself:
@@ -125,6 +134,42 @@ struct ReadGroup {
     calls: usize,
     last_end: Option<Instant>,
     error: Option<Error>,
+    /// A read of the group was dropped before it returned (a timeout, the application).
+    cancelled: bool,
+}
+
+impl ReadGroup {
+    /// Complete the group's operation, as cancelled when one of its reads was dropped.
+    fn finish(self, obs: &Observer) {
+        let end = self.last_end.unwrap_or_else(Instant::now);
+        if self.cancelled {
+            complete(&obs.recorder, self.st, end, Some("cancelled".into()));
+        } else {
+            obs.finish_at(self.st, end, self.error.as_ref(), self.calls == 1);
+        }
+    }
+}
+
+/// One read of a [`ReadGroup`] in flight: dropped before it returned, it leaves the group,
+/// which then completes as cancelled. (9.3.3 left the group's count of reads above zero, and
+/// the operation never completed: it stayed live and in flight, and held its intervals open.)
+struct ActiveRead<'a> {
+    slot: &'a ReadSlot,
+    returned: bool,
+}
+
+impl Drop for ActiveRead<'_> {
+    fn drop(&mut self) {
+        if self.returned {
+            return;
+        }
+        let mut g = self.slot.group.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(x) = g.as_mut() {
+            x.active = x.active.saturating_sub(1);
+            x.last_end = Some(Instant::now());
+            x.cancelled = true;
+        }
+    }
 }
 
 /// Shared slot registered with [`Linker`] while an [`OpReader`] holds a coalesced [`ReadGroup`],
@@ -146,8 +191,7 @@ impl ReadSlot {
             }
         };
         if let Some(g) = done {
-            let end = g.last_end.unwrap_or_else(Instant::now);
-            self.obs.finish_at(g.st, end, g.error.as_ref(), g.calls == 1);
+            g.finish(&self.obs);
         }
     }
 }
@@ -188,7 +232,13 @@ pub struct Linker {
     parked: Mutex<HashMap<Key, Vec<Parked>>>,
     /// Multi-call operations (writers, listers, …) whose last call failed temporarily: the
     /// scope a retry notification on that task belongs to.
-    scopes: Mutex<HashMap<Key, Arc<OpScope>>>,
+    /// Each with when its call failed. An entry leaves when its retry comes, when its
+    /// operation ends on the task, or, once the map is full, oldest first.
+    scopes: Mutex<HashMap<Key, (Arc<OpScope>, Instant)>>,
+    /// Entries in `scopes`, read without its lock.
+    held_scopes: std::sync::atomic::AtomicUsize,
+    /// When the parked calls were last swept ([`Linker::expire`]): ms since [`origin`].
+    last_sweep_ms: std::sync::atomic::AtomicU64,
     /// Active [`OpReader`] slots holding coalesced chunked/range reads.
     readers: Mutex<Vec< std::sync::Weak<ReadSlot> >>,
 }
@@ -204,8 +254,47 @@ impl Linker {
         self.parked.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn scopes(&self) -> std::sync::MutexGuard<'_, HashMap<Key, Arc<OpScope>>> {
+    fn scopes(&self) -> std::sync::MutexGuard<'_, HashMap<Key, (Arc<OpScope>, Instant)>> {
         self.scopes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The scope a retry notification on task `id` belongs to, taken out.
+    fn take_scope(&self, id: Key) -> Option<Arc<OpScope>> {
+        if self.held_scopes.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let mut s = self.scopes();
+        let out = s.remove(&id).map(|(scope, _)| scope);
+        self.held_scopes.store(s.len(), Ordering::Relaxed);
+        out
+    }
+
+    /// `scope` failed a call on task `id`: a retry notification there belongs to it. A full
+    /// map makes room by evicting its oldest entry (9.3.3 refused new entries instead, and
+    /// once 4 096 operations had left theirs behind no retry was linked again).
+    fn hold_scope(&self, id: Key, scope: Arc<OpScope>) {
+        let mut s = self.scopes();
+        if s.len() >= MAX_PARKED
+            && !s.contains_key(&id)
+            && let Some(oldest) = s.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k)
+        {
+            s.remove(&oldest);
+        }
+        s.insert(id, (scope, Instant::now()));
+        self.held_scopes.store(s.len(), Ordering::Relaxed);
+    }
+
+    /// `scope`'s operation ended: its entry on this task, if any, goes.
+    fn forget_scope(&self, scope: &Arc<OpScope>) {
+        if self.held_scopes.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut s = self.scopes();
+        let id = key();
+        if s.get(&id).is_some_and(|(held, _)| Arc::ptr_eq(held, scope)) {
+            s.remove(&id);
+        }
+        self.held_scopes.store(s.len(), Ordering::Relaxed);
     }
 
     fn enabled(&self) -> bool {
@@ -249,6 +338,39 @@ impl Linker {
         }
     }
 
+    /// Complete the parked calls of every task that were not retried by now, or whose retry
+    /// never came; at most every [`SWEEP_EVERY_MS`].
+    fn expire(&self, rec: &Recorder) {
+        let now = origin().elapsed().as_millis() as u64;
+        let last = self.last_sweep_ms.load(Ordering::Relaxed);
+        if now < last + SWEEP_EVERY_MS
+            || self
+                .last_sweep_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        let done: Vec<Parked> = {
+            let mut p = self.parked();
+            if p.is_empty() {
+                return;
+            }
+            let mut done = Vec::new();
+            for calls in p.values_mut() {
+                done.extend(take_where(calls, |x| {
+                    let age = x.ended.elapsed();
+                    (!x.retrying && age > NOT_RETRIED) || age > STALE_RETRY
+                }));
+            }
+            p.retain(|_, calls| !calls.is_empty());
+            done
+        };
+        for x in done {
+            complete(rec, x.op, x.ended, Some(x.error));
+        }
+    }
+
     /// Take the parked calls of task `id` that were not retried: the retry notification
     /// follows a failure at once, so a call still not marked retrying never will be.
     fn take_not_retried(&self, id: Key) -> Vec<Parked> {
@@ -262,6 +384,12 @@ impl Linker {
         }
         done
     }
+}
+
+/// The origin of [`Linker::last_sweep_ms`].
+fn origin() -> Instant {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *ORIGIN.get_or_init(Instant::now)
 }
 
 /// Remove and return the elements of `v` matching `f`, keeping the order of the others.
@@ -314,7 +442,7 @@ impl RetryNotify {
                 .record_retry_with_cut(backoff, throttled, tail_cut);
             return;
         }
-        if let Some(s) = self.linker.scopes().remove(&id) {
+        if let Some(s) = self.linker.take_scope(id) {
             s.record_retry_with_cut(backoff, throttled, tail_cut);
             return;
         }
@@ -378,6 +506,7 @@ impl Observer {
         }
         let key_of_path = private_key(path);
         if self.linker.enabled() {
+            self.linker.expire(&self.recorder);
             let id = key();
             for p in self.linker.take_not_retried(id) {
                 complete(&self.recorder, p.op, p.ended, Some(p.error));
@@ -424,7 +553,7 @@ impl Observer {
         if may_park && e.is_temporary() && self.linker.enabled() {
             let id = key();
             // An earlier failure of a multi-call operation on this task was not retried.
-            self.linker.scopes().remove(&id);
+            self.linker.take_scope(id);
             let mut done = self.linker.take_not_retried(id);
             {
                 let mut p = self.linker.parked();
@@ -479,10 +608,7 @@ impl Observer {
             for p in self.linker.take_not_retried(key()) {
                 complete(&self.recorder, p.op, p.ended, Some(p.error));
             }
-            let mut s = self.linker.scopes();
-            if s.len() < MAX_PARKED {
-                s.insert(key(), st.scope.clone());
-            }
+            self.linker.hold_scope(key(), st.scope.clone());
         }
     }
 }
@@ -750,6 +876,8 @@ impl Service for OpService {
 /// by a success.
 fn end_multi(obs: &Observer, st: &mut Option<OpState>, error: Option<String>) {
     if let Some(st) = st.take() {
+        // A retry notification can no longer be this operation's.
+        obs.linker.forget_scope(&st.scope);
         complete(&obs.recorder, st, Instant::now(), error);
     }
 }
@@ -842,6 +970,7 @@ impl oio::Read for OpReader {
                     calls: 1,
                     last_end: None,
                     error: None,
+                    cancelled: false,
                 });
                 (flushed, Some(sc))
             } else {
@@ -849,15 +978,20 @@ impl oio::Read for OpReader {
             }
         };
         if let Some(prev) = flushed {
-            let end = prev.last_end.unwrap_or_else(Instant::now);
-            self.obs
-                .finish_at(prev.st, end, prev.error.as_ref(), prev.calls == 1);
+            prev.finish(&self.obs);
         }
+        let mut active = scope.as_ref().map(|_| ActiveRead {
+            slot,
+            returned: false,
+        });
         let r = match &scope {
             Some(s) => s.run(self.inner.read(range)).await,
             None => self.inner.read(range).await,
         };
         let end = Instant::now();
+        if let Some(a) = active.as_mut() {
+            a.returned = true;
+        }
         {
             let mut g = slot.group.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(x) = g.as_mut() {
@@ -1216,6 +1350,152 @@ mod tests {
 
     fn slow_down() -> Error {
         Error::new(ErrorKind::RateLimited, "slow down").set_temporary()
+    }
+
+    /// T5: a read dropped before it returns (a timeout) completes its operation, as
+    /// cancelled. 9.3.3 never decremented the group's count of reads in flight, and the
+    /// operation stayed live and in flight for good.
+    #[tokio::test]
+    async fn a_dropped_read_completes_as_cancelled() {
+        struct Hang;
+        impl oio::Read for Hang {
+            async fn open(&self, _: BytesRange) -> Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+                futures::future::pending().await
+            }
+            async fn read(&self, _: BytesRange) -> Result<(RpRead, Buffer)> {
+                futures::future::pending().await
+            }
+        }
+        let (rec, obs, _) = linked();
+        let reader = OpReader {
+            inner: Box::new(Hang),
+            obs: obs.clone(),
+            path: "a/b".into(),
+            slot: std::sync::OnceLock::new(),
+        };
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            oio::Read::read(&reader, BytesRange::new(0, Some(10))),
+        )
+        .await;
+        assert!(cut.is_err(), "the read hangs");
+        drop(reader);
+        let s = rec.snapshot();
+        assert_eq!(s.summary.ops, 1, "{:?}", s.summary);
+        assert_eq!(s.summary.failed_ops, 1);
+        assert_eq!(s.resilience.error_classes.get("cancelled"), Some(&1));
+        assert_eq!(s.summary.inflight_ops, 0);
+    }
+
+    /// T6: operations that leave a retry scope behind never fill the map. 9.3.3 kept the
+    /// scope of every multi-call operation whose last failure was not retried; after 4 096
+    /// of them no new scope was held, and a later operation's retry was counted in the
+    /// totals but not under its verb.
+    #[test]
+    fn ended_operations_leave_no_retry_scope_behind() {
+        let (rec, obs, notify) = linked();
+        // Writers that fail a write temporarily, are not retried, and end.
+        for i in 0..5_000 {
+            let st = obs.start("write", &format!("w/{i}")).unwrap();
+            obs.failed_call(&st, &slow_down());
+            end_multi(&obs, &mut Some(st), Some("rate_limited".into()));
+        }
+        assert_eq!(obs.linker.scopes().len(), 0, "every ended operation's scope left");
+        // Scopes left by operations that never end (on other tasks) are evicted oldest first.
+        for i in 0..(MAX_PARKED + 10) {
+            let st = obs.start("list", &format!("l/{i}")).unwrap();
+            obs.linker.hold_scope(Key::Task(fake_task(i)), st.scope.clone());
+        }
+        assert!(obs.linker.scopes().len() <= MAX_PARKED);
+        // A later writer's retry is still linked to it, and counted under its verb.
+        let st = obs.start("write", "w/late").unwrap();
+        obs.failed_call(&st, &slow_down());
+        notify.retrying(&slow_down(), std::time::Duration::from_millis(1));
+        end_multi(&obs, &mut Some(st), None);
+        let s = rec.snapshot();
+        let write = s.verbs.iter().find(|v| v.verb == "write").unwrap();
+        assert_eq!(write.retries, 1, "{:?}", s.verbs);
+    }
+
+    /// A task id for the tests: ids of tasks spawned and finished.
+    fn fake_task(_i: usize) -> tokio::task::Id {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async { tokio::spawn(async { tokio::task::id() }).await.unwrap() })
+    }
+
+    /// T4: an exporter sees a failed request as it happens, and a failed call that is not
+    /// retried soon after, without a snapshot. 9.3.3 exported requests with their completed
+    /// operation, and completed a parked call only at the next call on its own task or at a
+    /// snapshot: before one, an exporter saw neither.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_exporter_sees_failures_as_they_happen() {
+        #[derive(Default)]
+        struct Seen {
+            requests: std::sync::atomic::AtomicU64,
+            failed: std::sync::atomic::AtomicU64,
+        }
+        impl crate::Exporter for Seen {
+            fn on_request(&self, _: &crate::RequestRecord) {
+                self.requests.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_op(&self, _: &'static str, _: u64, failed: bool) {
+                if failed {
+                    self.failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let (rec, obs, _notify) = linked();
+        let seen = Arc::new(Seen::default());
+        rec.set_exporter(seen.clone());
+        let r503 = crate::RequestRecord {
+            operation: None,
+            api: crate::Api::HeadObject,
+            method: "HEAD".into(),
+            status: 503,
+            protocol: crate::Protocol::Http1,
+            reused: true,
+            conn_id: 1,
+            start_offset_us: 0,
+            timing: Default::default(),
+            bytes_up: 0,
+            bytes_down: 0,
+            request_id: None,
+            retry_after_ms: None,
+            error: None,
+            remote: None,
+            server: None,
+            service_op: None,
+            service: None,
+            tls: None,
+            tcp: None,
+            detail: None,
+        };
+        // A call that fails temporarily on its own task, and is never retried.
+        let failing = {
+            let obs = obs.clone();
+            tokio::spawn(async move {
+                let st = obs.start("stat", "a/b").unwrap();
+                st.scope.push_request(r503);
+                obs.finish(st, Some(&slow_down()));
+            })
+        };
+        failing.await.unwrap();
+        assert_eq!(seen.requests.load(Ordering::Relaxed), 1, "the 503 at once");
+        assert_eq!(seen.failed.load(Ordering::Relaxed), 0, "parked: a retry may follow");
+        // Later, any operation on another task completes it.
+        tokio::time::sleep(NOT_RETRIED + std::time::Duration::from_millis(200)).await;
+        let other = {
+            let obs = obs.clone();
+            tokio::spawn(async move {
+                let st = obs.start("stat", "a/c").unwrap();
+                obs.finish(st, None);
+            })
+        };
+        other.await.unwrap();
+        assert_eq!(seen.failed.load(Ordering::Relaxed), 1, "completed without a snapshot");
+        // Each request is exported once.
+        obs.linker.flush(&rec);
+        assert_eq!(seen.requests.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

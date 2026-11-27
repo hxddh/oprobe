@@ -146,7 +146,14 @@ impl CommandOutput for RunSet {
                 );
             }
         }
-        o += &dim("  each run: oprobe show RUN --detail\n");
+        // Each run by its id (N3): 9.3.3 printed `oprobe show RUN --detail`, and the ids were
+        // to be looked up with `show --list`.
+        for r in &self.runs {
+            o += &dim(&format!(
+                "  oprobe show {} --detail   # {}\n",
+                r.report.run.id, r.report.spec.operator_ref
+            ));
+        }
         o
     }
 

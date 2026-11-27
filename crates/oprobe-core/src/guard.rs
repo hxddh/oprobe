@@ -138,6 +138,11 @@ fn take_room(counter: &AtomicU64, room: impl Fn(u64) -> Option<u64>) -> Result<u
 }
 
 impl Guard {
+    /// The byte budget, if any.
+    pub fn max_bytes(&self) -> Option<u64> {
+        self.budgets.max_bytes
+    }
+
     pub fn new(budgets: Budgets) -> Arc<Self> {
         Arc::new(Self {
             budgets,
@@ -512,8 +517,14 @@ pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budg
         Some(n) => n,
         None => conc * window / op_latency_s,
     };
+    // The warm-up and the window, as long as they run: `max_ops` ends the window early
+    // (9.3.3's ETA counted the whole window whatever `max_ops` said).
+    let mut window = window;
     if let Some(m) = w.max_ops {
         ops = ops.min(m as f64 + conc * w.warmup.get().as_secs_f64() / op_latency_s);
+        if w.expected_arrivals(w.duration.get()).is_none() {
+            window = window.min(w.warmup.get().as_secs_f64() + m as f64 * op_latency_s / conc);
+        }
     }
     let ops = ops.max(0.0).round() as u64;
 
@@ -898,6 +909,8 @@ mod sec_tests {
         assert!(pl.estimated_ops_count <= 100);
         assert!(pl.estimated_requests_count >= ds.objects as u64);
         assert!(pl.eta_s > 0.0);
+        // N5: 100 operations end the window long before its 10 s.
+        assert!(pl.eta_s < 1.0, "{}", pl.eta_s);
         assert!(pl.warnings.iter().all(|w| !w.contains("budget")), "{pl:?}");
     }
 

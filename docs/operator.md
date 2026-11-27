@@ -179,7 +179,8 @@ takes the same paths. The paths: `url`, `options.KEY`, `layers.NAME` (`on`/`off`
 (`unset` goes back to the environment's).
 
 `--set` also takes the workload's keys, the ones without a flag of their own included:
-`concurrency`, `preset`, `duration`, `warmup` (e.g. `--set warmup=2s`), `max_ops`, `rate`,
+`concurrency`, `preset`, `duration`, `warmup` (e.g. `--set warmup=2s`; unset, it is 2 s or half the
+window, whichever is shorter), `max_ops`, `rate`,
 `arrivals`, `shape`, `access`, `objects`, `object_size`, `partitions`, `existing`, `persist`,
 `verify`, `cleanup`, `seed` and `mix`; and the run's `label`. There are no limits to set: the
 findings judge a run, an open loop that stalled fails its checks by itself (see
