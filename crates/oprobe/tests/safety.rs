@@ -987,3 +987,50 @@ fn a_local_service_never_passes_a_request_budget() {
         );
     }
 }
+
+/// A persisted dataset is not refused up front by its size: a later run reuses it without
+/// uploading anything.
+#[test]
+fn a_persisted_dataset_is_reused_whatever_the_byte_budget() {
+    let home = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let run = |extra: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oprobe"))
+            .env("OPROBE_DATA_DIR", home.path().join("data"))
+            .env("OPROBE_CONFIG", home.path().join("config.toml"))
+            .args(["run", &format!("fs://{}", target.path().display())])
+            .args([
+                "--objects",
+                "4",
+                "--object-size",
+                "1MiB",
+                "--set",
+                "persist=on",
+            ])
+            .args([
+                "-d",
+                "1s",
+                "--set",
+                "warmup=0s",
+                "--set",
+                r#"mix=[{"op":"stat"}]"#,
+                "-o",
+                "json",
+            ])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let o = run(&[]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    // 4 MiB of objects, a budget of 1 MiB: the stats move no body bytes.
+    let o = run(&["--max-bytes", "1MiB"]);
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(!stderr.contains("does not fit the byte budget"), "{stderr}");
+    assert_eq!(o.status.code(), Some(0), "{stderr}");
+}

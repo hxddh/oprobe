@@ -311,8 +311,11 @@ impl Session {
         }
         // A dataset that cannot fit the byte budget is refused before anything is uploaded
         // (9.3.3 started uploading it, and a large enough object aborted the process first).
+        // A persisted dataset may already be there, and is then reused, not uploaded: its
+        // upload, if it happens, is stopped by the budget call by call.
         if needs_objects
             && spec.existing_prefix.is_none()
+            && !spec.persist
             && let Some(max) = opts.guard.as_ref().and_then(|g| g.max_bytes())
         {
             let planned: u64 = (0..spec.objects.max(1))
