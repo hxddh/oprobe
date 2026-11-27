@@ -288,6 +288,16 @@ fn the_release_is_tagged_only_after_it_was_built() {
         );
     }
     // The tag comes before the GitHub release that names it, after every asset step.
+    // The status of `if x=$(a | b)` is `b`'s: a test of a pipeline's output must read it first
+    // (v9.3.3's first run took a missing tag for one on "" and stopped the release).
+    for line in yml.lines().filter(|l| l.trim_start().starts_with("if ")) {
+        let tested = line.split_once("$(").map(|(_, rest)| rest);
+        assert!(
+            !(line.contains("=$(") && tested.is_some_and(|r| r.contains('|'))),
+            "a pipeline's status tested in `{}`",
+            line.trim()
+        );
+    }
     let tag_at = publish.find("git tag").unwrap();
     assert!(tag_at < publish.find("softprops/action-gh-release").unwrap());
     assert!(tag_at > publish.find("attest-build-provenance").unwrap());
