@@ -1,3 +1,5 @@
+<p align="center"><img src="packaging/desktop/oprobe.svg" width="112" alt="oprobe"></p>
+
 # oprobe
 
 > **oprobe is a profiler for OpenDAL operators.**
@@ -53,7 +55,7 @@ each with its remedy as an `op.toml` path, and the next command:
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.2/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.3/docs/concepts.md#glossary
 ```
 
 `prove last` runs trials of the current operator (A) and of the remedy (B), interleaved, and ends
@@ -114,7 +116,7 @@ operators renders as Rust and as TOML. [The reference →](docs/operator.md)
 | `throttling` | a service that queues beyond what it serves at once, with no 429/503 | a cap on the requests in flight, as advice: it moves the wait, there is nothing to prove |
 | `rate_limit` | a request-rate ceiling | `layers.concurrent_limit.http` |
 | `key_limit` | a hot prefix or key | the key layout (advice, not a layer) |
-| `bandwidth_cap` | a bytes-per-second ceiling | `layers.throttle.bandwidth` on writes; on reads not a layer |
+| `bandwidth_cap` | a bytes-per-second ceiling | `layers.throttle.bandwidth` on a capped uplink (writes); on a capped downlink not a layer |
 | `tail_stragglers` | a few very slow server responses | `layers.tail_cut` |
 | `hung_requests` | requests that never finish | `layers.timeout.io` |
 | `small_ranges` | many small range reads | `read.gap` / `read.concurrent` |
@@ -131,6 +133,11 @@ operators renders as Rust and as TOML. [The reference →](docs/operator.md)
 ## Profile production: `oprobe-trace`
 
 Add one layer to your own operator and save a profile the workbench opens like any other run:
+
+```toml
+[dependencies]
+oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.3" }   # not on crates.io yet
+```
 
 ```rust
 let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
@@ -175,7 +182,7 @@ oprobe prove last --with layers.retry.max_times=5 --max-duration 5m -o json > pr
 | macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` (`-s -- --cli` for the CLI without the app) |
 | Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` or the `.msi` |
 | Debian / Ubuntu, Fedora / RHEL | `.deb` / `.rpm` from the release page |
-| Rust (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.2 oprobe` (`--no-default-features --features cli` for the CLI only, `--features gui` for native windows on Linux) |
+| Rust (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.3 oprobe` (`--no-default-features --features cli` for the CLI only, `--features gui` for native windows on Linux) |
 
 The macOS and Windows packages are **not code-signed**: the first open needs one confirmation
 ([how](docs/install.md#first-open-of-unsigned-packages)). Every asset has a SHA-256 in `SHA256SUMS`

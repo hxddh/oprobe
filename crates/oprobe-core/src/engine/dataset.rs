@@ -119,6 +119,28 @@ async fn remove_partial(admin: &Operator, paths: Vec<String>, manifest: &str, pe
     .await;
 }
 
+/// What the read of a persisted dataset's manifest says: `Some` a complete dataset to reuse,
+/// `None` that there is none yet (the manifest does not exist, or does not parse: the dataset
+/// is uploaded again). Any other failure, the run's gate refusing the read (a spent budget,
+/// a cancellation) or the service failing, says nothing about the dataset, and stops the run
+/// with the dataset left as it is: 9.3.2 took every failed read for an incomplete dataset,
+/// uploaded it again over the shared objects, and when the same gate stopped that upload,
+/// deleted them and the manifest with the ungated cleaner.
+fn persisted_manifest(
+    read: opendal::Result<opendal::Buffer>,
+    path: &str,
+    cancel: &crate::engine::Cancel,
+) -> Result<Option<Manifest>> {
+    match read {
+        Ok(buf) => Ok(serde_json::from_slice::<Manifest>(&buf.to_vec()).ok()),
+        Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+        Err(_) if cancel.is_cancelled() => bail!(CANCELLED),
+        Err(e) => Err(anyhow::Error::new(e).context(format!(
+            "cannot read the persisted dataset's manifest `{path}`; the dataset is left as it is"
+        ))),
+    }
+}
+
 /// What a dataset is prepared through.
 #[derive(Clone, Copy)]
 pub struct Via<'a> {
@@ -174,10 +196,12 @@ impl Dataset {
             (format!("{run_prefix}data/"), false)
         };
         let manifest_path = format!("{base}_manifest.json");
-        if persisted
-            && let Ok(buf) = admin.read(&manifest_path).await
-            && let Ok(m) = serde_json::from_slice::<Manifest>(&buf.to_vec())
-        {
+        let reusable = if persisted {
+            persisted_manifest(admin.read(&manifest_path).await, &manifest_path, cancel)?
+        } else {
+            None
+        };
+        if let Some(m) = reusable {
             progress(format!(
                 "reusing persisted dataset {base} ({} objects)",
                 m.objects.len()
@@ -435,5 +459,68 @@ mod tests {
         assert!((8500..9500).contains(&hot), "{hot}");
         let u = Picker::new(10, Access::Uniform);
         assert!((0..1000).all(|_| u.pick(&mut rng) < 10));
+    }
+
+    fn spec() -> DatasetSpec {
+        DatasetSpec {
+            objects: 3,
+            object_size: crate::util::ByteSize(1024),
+            partitions: 1,
+            persist: true,
+            ..Default::default()
+        }
+    }
+
+    async fn prepare(op: &Operator, cancel: &crate::engine::Cancel) -> Result<Dataset> {
+        let aborts = super::super::upload::Aborts::new();
+        let via = Via {
+            admin: op,
+            cleaner: op,
+            aborts: &aborts,
+        };
+        Dataset::prepare(via, &spec(), 7, "oprobe-run-x/", true, cancel, &|_| {}).await
+    }
+
+    /// Only a manifest that does not exist sends a persisted dataset back to upload; a read
+    /// the gate refused, or the service failed, stops the run without touching it.
+    #[test]
+    fn only_a_missing_manifest_is_an_incomplete_dataset() {
+        let cancel = crate::engine::Cancel::default();
+        let read = |kind, msg: &str| Err(opendal::Error::new(kind, msg.to_owned()));
+        let missing = persisted_manifest(read(opendal::ErrorKind::NotFound, "no"), "m", &cancel);
+        assert!(missing.unwrap().is_none());
+        let garbled = persisted_manifest(Ok(opendal::Buffer::from("{")), "m", &cancel);
+        assert!(garbled.unwrap().is_none());
+        // The gate's refusals are `Unexpected`, persistent errors.
+        let refused = read(opendal::ErrorKind::Unexpected, "request budget spent");
+        let e = persisted_manifest(refused, "m", &cancel).err().unwrap();
+        assert!(format!("{e:#}").contains("left as it is"), "{e:#}");
+        cancel.cancel();
+        let stopped = read(opendal::ErrorKind::Unexpected, "the run was cancelled");
+        let e = persisted_manifest(stopped, "m", &cancel).err().unwrap();
+        assert!(format!("{e:#}").contains("cancelled"), "{e:#}");
+    }
+
+    /// End to end on a filesystem: a persisted dataset whose manifest cannot be read (here
+    /// it is a directory, an error that is not "not found") is neither uploaded again nor
+    /// deleted.
+    #[tokio::test]
+    async fn an_unreadable_manifest_leaves_the_persisted_dataset_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(opendal::services::Fs::default().root(dir.path().to_str().unwrap()))
+            .unwrap();
+        let cancel = crate::engine::Cancel::default();
+        let first = prepare(&op, &cancel).await.unwrap();
+        assert_eq!(first.objects.len(), 3);
+        let manifest = format!("{}_manifest.json", first.prefix);
+        let local = dir.path().join(&manifest);
+        std::fs::remove_file(&local).unwrap();
+        std::fs::create_dir(&local).unwrap();
+        let e = prepare(&op, &cancel).await.unwrap_err();
+        assert!(format!("{e:#}").contains("left as it is"), "{e:#}");
+        for o in &first.objects {
+            assert!(op.exists(&o.path).await.unwrap(), "{} was removed", o.path);
+        }
+        assert!(local.is_dir());
     }
 }

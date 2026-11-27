@@ -744,3 +744,117 @@ fn nothing_prints_to_stderr_with_a_macro_that_can_panic() {
     }
     assert!(found.is_empty(), "use `stderr_line`:\n{}", found.join("\n"));
 }
+
+/// The exit status of `child` if it ends within `within`; `None` (and it is killed) if not.
+#[cfg(unix)]
+fn exits_within(
+    child: &mut std::process::Child,
+    within: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+/// A pipe whose buffer is full: (its read end, kept open and never read; its write end, in
+/// blocking mode).
+#[cfg(unix)]
+fn full_pipe() -> (std::fs::File, std::fs::File) {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    let mut fds = [0; 2];
+    // SAFETY: plain libc calls on descriptors this function has just opened and owns.
+    unsafe {
+        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+        for fd in fds {
+            assert_eq!(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC), 0);
+        }
+        let flags = libc::fcntl(fds[1], libc::F_GETFL);
+        assert_eq!(
+            libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK),
+            0
+        );
+        let mut w = std::fs::File::from_raw_fd(fds[1]);
+        let chunk = [b'x'; 4096];
+        while w.write(&chunk).is_ok() {}
+        assert_eq!(libc::fcntl(fds[1], libc::F_SETFL, flags), 0);
+        (std::fs::File::from_raw_fd(fds[0]), w)
+    }
+}
+
+/// A stderr that is open but read by nobody (a terminal paused with Ctrl-S) fills up, and
+/// the write that fills it blocks. 9.3.2 wrote the signal handler's "stopping…" behind it: the
+/// handler blocked, the second Ctrl-C was never seen, and nothing but SIGKILL ended the
+/// process. Lines for stderr are queued now, and a stop always goes through.
+#[cfg(unix)]
+#[test]
+fn a_full_stderr_never_blocks_a_stop() {
+    let rt = binary::runtime();
+    let home = tempfile::tempdir().unwrap();
+    let lab = rt.block_on(lab(Some(PartFaultKind::Stall)));
+    // A pipe already full, that nobody reads: the first line oprobe writes to stderr
+    // blocks, for as long as the process lives.
+    let (reader, writer) = full_pipe();
+    let mut child = binary::run(home.path(), &lab, &binary::reads_and_multipart_writes())
+        .args(["-c", "2"])
+        .stdout(std::process::Stdio::null())
+        .stderr(writer)
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    binary::signal(&child, libc::SIGINT);
+    std::thread::sleep(Duration::from_millis(500));
+    binary::signal(&child, libc::SIGINT);
+    let status = exits_within(&mut child, Duration::from_secs(20));
+    drop(reader);
+    let status = status.expect("oprobe was still running 20 s after two Ctrl-C");
+    assert_eq!(status.code(), Some(130), "{status:?}");
+}
+
+/// SIGTERM stops the terminal app as Ctrl+C does, with exit code 130 (and the terminal
+/// restored). 9.3.2 handled stop signals in the commands only: the app was killed where it
+/// stood, its jobs' test data and the terminal's raw mode left behind.
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_the_terminal_app() {
+    use std::io::Read;
+    let home = tempfile::tempdir().unwrap();
+    let (mut master, slave) = binary::pty();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oprobe"))
+        .env("OPROBE_DATA_DIR", home.path().join("data"))
+        .env("OPROBE_CONFIG", home.path().join("config.toml"))
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .env("TERM", "xterm-256color")
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave)
+        .spawn()
+        .unwrap();
+    // The terminal shows what the app draws.
+    let drawn = std::thread::spawn(move || {
+        let mut all = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = master.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            all.extend_from_slice(&buf[..n]);
+        }
+        all.len()
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(child.try_wait().unwrap().is_none(), "the app is open");
+    binary::signal(&child, libc::SIGTERM);
+    let status = exits_within(&mut child, Duration::from_secs(20))
+        .expect("the app was still open 20 s after SIGTERM");
+    assert_eq!(status.code(), Some(130), "{status:?}");
+    drop(drawn);
+}

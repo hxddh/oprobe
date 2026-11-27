@@ -4,6 +4,120 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v9.3.3 — 2026-11-27
+
+A correctness pass on what 9.3.2 left: memory an idle embedded operator could take, uploads a
+stop could still leave behind, a release workflow that tagged before it tested, and two
+variance estimates that cost `prove` most of its power. No command, flag or file format
+changed (`oprobe.trace/9`, `oprobe.run/7`, `oprobe.report/7`, `oprobe.prove/9`,
+`oprobe.events/9`, `oprobe.operator/6`).
+
+### Fixed
+
+#### `oprobe-trace`
+
+- **An operator idle for days no longer allocates gigabytes when it wakes.** The recorder
+  pushed one interval, each with a 184 KiB latency histogram, for every 10 s of silence before
+  it archived any: about 260 000 histograms (≈ 47 GiB) after 30 idle days. An idle gap is now
+  one archived span, and an interval allocates its histogram with its first operation: memory
+  and time stay `O(MAX_INTERVALS)` however long the silence.
+- **Redaction no longer truncates Hive-partitioned keys**, and catches escaped headers. A
+  `name=value` path segment (`s3://b/dt=2026-11-27/session_id=abc/part-0.parquet`) is a place,
+  not a parameter, and stays whole; an `Authorization` header escaped inside a JSON string
+  (`{\"Authorization\": \"Bearer …\"}`) is redacted.
+- **A response with an unparsable `Content-Length` or `Content-Encoding` through a kept
+  transport** (`Config::keep_http_transport`) is recorded as a failed request that would fail
+  again, as the instrumented transport records it, instead of passing through and being
+  recorded as a body its reader aborted.
+- **Retransmits of a fresh connection's first request are charged to it.** The socket lookup
+  runs off the worker thread and can finish while the first request is in flight; its counter
+  was then taken as the baseline and those retransmits were lost.
+- **A GCS resumable session's DELETE (and any `upload_id` DELETE) is an abort**, not an upload
+  part: a stopped run's gate counted, refused and cut it like any other request.
+
+#### Stopping and cleaning up
+
+- **A measured timer can no longer cut an abort, and a throttle or backoff no longer outlasts a
+  stop.** `TimeoutLayer` and `TailCutLayer` wrap `Writer::abort` like any call: an abort slower
+  than `layers.timeout.io` was dropped half-way and the upload stayed. And a write waiting in
+  `ThrottleLayer` (or a retry's backoff) when the run was cancelled sent nothing the gate could
+  stop: the session waited out its 45 s grace, then reported the upload as left behind. A layer
+  beneath the measured ones now runs the abort on a task of its own (the next attempt waits for
+  it), and once the run is cancelled aborts every upload whose writer waits between two calls.
+- **Conditional writes are owned like every other writer**, so a write session behind
+  `if_not_exists` / `if_match` is aborted unless it completes.
+- **A persisted dataset is never deleted by a run its gate stopped.** With `persist`, any failed
+  read of `_manifest.json` (a spent budget, a cancellation) was taken for an incomplete dataset:
+  the run uploaded it again over the shared objects and, stopped by the same gate, deleted them
+  with the ungated cleaner. Only a manifest that does not exist sends the dataset back to upload.
+- **A full stderr no longer blocks a stop.** A stderr open but read by nobody (a terminal paused
+  with Ctrl-S, a pipe nobody drains) blocked the write that filled it, and the signal handler's
+  "stopping…" waited behind it: the second Ctrl-C, SIGTERM or SIGHUP was never seen and only
+  SIGKILL ended the process. One thread now writes stderr; everyone else queues.
+- **The app stops on SIGTERM, SIGHUP and SIGINT** as on Quit, in a window and in the terminal:
+  the jobs stop and remove their test data, and the exit code is 130. A second signal leaves at
+  once. The app was killed where it stood, its jobs' data and the terminal's raw mode left behind.
+
+#### Run files
+
+- **Thinning no longer runs away on large operations.** An operation with more rows than a
+  thinning level holds (a multipart upload of many parts) raised the level at every call until
+  each kept row stood for 2^62 operations, corrupting every weighted quantile. A level now rises
+  once a kept operation fills it. A decoded weight that is not a number between 1 and 2^53 is a
+  damaged file, and a report block is refused by its count of values (at most 2^20) before it is
+  built, so a crafted report of `[0,0,…]` cannot take many times its bytes.
+
+#### Findings
+
+- **`bandwidth_cap` offers `layers.throttle.bandwidth` only for a capped uplink.** The throttle
+  shapes writes; on capped response bodies it is no remedy, also when the workload writes
+  beside its reads (9.3.2 offered it then).
+- **A token bucket with a large burst reads its own rate.** The fit tried bursts up to 0.3 s of
+  the rate and rates from 0.85 of what was served while throttled: a bucket of 50/s with a burst
+  of 200 read as 64/s. It now tries bursts up to 10 s and rates from 0.7: over 64 simulated
+  buckets the median error fell from 11.6 % to 4.5 % (54 within 10 %, against 23), and all are
+  found (one was missed).
+- **`tail_stragglers` exempts uploads through a kept transport**, as `hung_requests` already
+  did: there connecting and sending the body are inside the time to first byte.
+
+#### `prove`
+
+- **The spread is order-adjusted, and the noise floor paired.** The crossover estimate cancels an
+  order effect (the second trial of every pair running better or worse), but its spread was the
+  SD of all pairs, which took the effect in; and the noise floor came from each arm's
+  consecutive trials, which took in any drift both arms share although the pairs cancel it. The
+  spread is now the pooled within-order SD (from the fourth pair; the third look keeps the SD of
+  all three) and the floor comes from consecutive paired differences of the same order. The
+  sequential boundary was recalibrated for the new statistic (4 000 000 simulated proofs per
+  plan, crossing rate 4.0 %; 3.98 to 4.00 % on fresh ones). On seeded simulations a +15 % change
+  at a 5 % trial noise was found in six pairs in 78.6 % of proofs without an order effect, but
+  in 1.1 % under one and 2.0 % under a common drift; now in 66 to 70 % under either, and in
+  99.5 % with twelve pairs (27.9 % and 4.5 % before). The price is the pooled spread's degree of
+  freedom: without either effect a six-pair proof finds that change in 69.8 % instead of 78.6 %.
+  A change that is none is called in at most 2.4 % of proofs under order effects and drifts,
+  for every plan from 3 to 12 pairs.
+- **The generated Rust reads every `${NAME}` from the environment and registers its services.**
+  A reference in a plain URL or in `http.proxy` was written literally (only option values were
+  read); and `build_operator()` now calls `opendal::init_default_registry()`, without which
+  `Operator::from_uri` finds no service under `opendal` with `default-features = false`.
+
+### Release
+
+- **A version is tagged only after its tests and every build passed.** The `plan` job created and
+  pushed the tag before anything was tested (what burned `v9.3.1`); the tag is now created in the
+  `publish` job, after every asset is built and attested, and a failed run leaves no tag.
+- **No green crates.io job that published nothing.** Without `CARGO_REGISTRY_TOKEN` the publish
+  steps show as skipped, with a warning and a line in the run summary.
+- **The `oprobe-trace` dependency line works when pasted.** `oprobe-trace` is not on crates.io
+  yet: `README.md`, `README.zh-CN.md` and `docs/embedding.md` give the git dependency on the
+  release tag (a docs test keeps it on the current version).
+
+### Changed
+
+- **A new logo** (`packaging/desktop/oprobe.{svg,png,ico}`, the app icon and the README): the
+  operator as an open ring, and the probe at its centre reaching out through the gap. One shape,
+  one accent, legible from 16 px to the Dock. It replaces the waterfall-and-magnifier tile.
+
 ## v9.3.2 — 2026-11-26
 
 9.3.1 was tagged and never released: the release workflow tags before it runs the tests, and

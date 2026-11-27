@@ -20,6 +20,7 @@ mod kit;
 mod menus;
 pub mod plots;
 // A notification or a trash request answers once done; nothing waits for it.
+pub mod stop;
 #[allow(clippy::let_underscore_future)]
 pub mod store;
 mod term;
@@ -51,6 +52,20 @@ pub fn run_gui() -> std::process::ExitCode {
     use nsh_platform_macos as platform;
     #[cfg(target_os = "windows")]
     use nsh_platform_windows as platform;
+    // SIGTERM, SIGHUP, SIGINT: stop the jobs as Quit does, then leave (`stop`); a second
+    // signal leaves at once.
+    stop::watch(|n| {
+        if n == 1 {
+            std::thread::spawn(|| {
+                store::finish_jobs(crate::app::STOP_GRACE);
+                oprobe_core::output::flush_stderr(std::time::Duration::from_secs(1));
+                std::process::exit(stop::EXIT_SIGNALLED.into());
+            });
+        } else {
+            oprobe_core::output::flush_stderr(std::time::Duration::from_millis(200));
+            std::process::exit(stop::EXIT_SIGNALLED.into());
+        }
+    });
     platform::set_ui_sets(ui_sets());
     #[cfg_attr(target_os = "macos", allow(unused_mut))]
     let mut options = platform::AppOptions {

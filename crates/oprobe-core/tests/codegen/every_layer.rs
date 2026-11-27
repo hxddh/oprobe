@@ -6,6 +6,7 @@ use opendal::{Operator, Reader, Writer};
 
 /// The operator as oprobe measured it.
 pub async fn build_operator() -> Result<Operator, Box<dyn std::error::Error + Send + Sync>> {
+    opendal::init_default_registry();
     let op = Operator::from_uri("memory://")?
         // Innermost first: each layer wraps the ones before it.
         // The HTTP permits are taken inside the service: waiting for one counts against

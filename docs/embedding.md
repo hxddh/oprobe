@@ -17,10 +17,12 @@ meter).
 
 ```toml
 [dependencies]
-oprobe-trace = "9"                      # once it is on crates.io
-# until then:
-# oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.2" }
+oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.3" }
 ```
+
+`oprobe-trace` is not on crates.io yet: the git dependency above is the one that resolves today
+(pin the tag of the release you read this from). Once a release publishes it, the same version
+is `oprobe-trace = "9"`.
 
 ```rust
 let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default());

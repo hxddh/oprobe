@@ -28,6 +28,8 @@ fixtures! {
     concurrent_limit_http,
     concurrent_limit_operations,
     defaults,
+    env_proxy,
+    env_uri,
     every_layer,
     fs_relative,
     http_every_option,
@@ -63,7 +65,7 @@ async fn round_trip(op: &Operator) {
 
 #[test]
 fn every_generated_operator_compiles() {
-    assert_eq!(builders(), 24);
+    assert_eq!(builders(), 26);
     // The reader of the operator that sets an HTTP client too (not built: it needs S3).
     let _ = http_every_option::reader;
 }

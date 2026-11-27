@@ -308,6 +308,8 @@ fn install_ctrl_c(cancel: crate::engine::Cancel) {
                     "{} aborted; test data may be left under oprobe-run-*/",
                     red("■")
                 ));
+                // Queued, never blocking: a stderr nobody reads does not hold the exit.
+                crate::output::flush_stderr(std::time::Duration::from_millis(200));
                 std::process::exit(EXIT_INTERRUPTED.into());
             }
         }

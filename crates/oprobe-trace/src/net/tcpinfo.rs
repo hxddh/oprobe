@@ -94,6 +94,19 @@ impl RetransLedger {
         }
     }
 
+    /// The ledger of a connection found while it may already be carrying its first request
+    /// (the socket lookup runs off the worker thread and can finish mid-flight). A connection
+    /// this transport dialed (`warm` false) has retransmitted nothing before it: its counter
+    /// starts at zero, so what its first request retransmitted before the lookup finished is
+    /// charged to that request rather than taken for a baseline (9.3.2 seeded it with the
+    /// counter as read then, and lost them). The SYN retransmits of its handshake go with
+    /// the first request too, whose connect they slowed. A pooled connection found again
+    /// (`warm`) starts from its counter now: what it retransmitted before belongs to nobody
+    /// still in flight.
+    pub fn for_connection(now: Option<u64>, warm: bool) -> Self {
+        Self::seeded(if warm { now } else { Some(0) })
+    }
+
     /// A request starts using the connection (its response headers arrived): its stream.
     pub fn open(&mut self) -> u64 {
         self.join(false)
@@ -191,9 +204,9 @@ pub struct TcpProbe {
 
 impl TcpProbe {
     /// Create a probe for `id`. When `warm` is false (a freshly dialed connection), `last_rx`
-    /// and `last_tx` start at 0 so handshake bytes count once, and the retransmit ledger is
-    /// seeded from the socket's post-handshake counter so retransmits on the first request
-    /// are seen.
+    /// and `last_tx` start at 0 so handshake bytes count once, and so does the retransmit
+    /// ledger ([`RetransLedger::for_connection`]), so retransmits on the first request are
+    /// seen even when the probe is created after they happened.
     /// When `warm` is true (an already-pooled connection re-discovered after table eviction),
     /// `last_rx` and `last_tx` are seeded from the socket's current totals so prior bytes are
     /// never double-counted.
@@ -205,7 +218,10 @@ impl TcpProbe {
         };
         Self {
             id,
-            retrans: Mutex::new(RetransLedger::seeded(initial.map(|r| r.retrans))),
+            retrans: Mutex::new(RetransLedger::for_connection(
+                initial.map(|r| r.retrans),
+                warm,
+            )),
             last_rx: AtomicU64::new(last_rx),
             last_tx: AtomicU64::new(last_tx),
         }
@@ -1026,6 +1042,19 @@ mod tests {
     /// Whatever the order in which the requests of a shared connection start, send and end,
     /// and however the readings of its counter interleave, the retransmits charged to them
     /// add up to what the counter grew by: nothing is charged twice, nothing is lost.
+    #[test]
+    fn retransmits_before_a_late_lookup_go_to_the_first_request() {
+        // The lookup of a fresh connection finishes while its first request is in flight,
+        // after 3 retransmits: they are that request's, not a baseline.
+        let mut cold = RetransLedger::for_connection(Some(3), false);
+        let s = cold.open();
+        assert_eq!(cold.close(s, Some(4)), 4);
+        // A pooled connection found again: what it retransmitted before is nobody's.
+        let mut warm = RetransLedger::for_connection(Some(3), true);
+        let s = warm.open();
+        assert_eq!(warm.close(s, Some(4)), 1);
+    }
+
     #[test]
     fn retransmits_of_a_shared_connection_are_charged_exactly_once() {
         use rand::{Rng, SeedableRng};

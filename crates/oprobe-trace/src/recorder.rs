@@ -332,9 +332,13 @@ struct Bucket {
     verbs: Vec<VerbBucket>,
     /// Open-loop arrivals due in this interval that never started.
     missed: u64,
-    /// Latencies of the interval while it is open; dropped (and its quantiles kept) once every
-    /// operation that started in it finished, so a long run holds a few numbers per interval,
-    /// not a histogram each, and a snapshot does not recompute quantiles over the whole run.
+    /// Whether the interval is still open: an operation that started in it may still finish.
+    open: bool,
+    /// Latencies of the interval while it is open, allocated by its first operation (an open
+    /// interval nothing started in costs no histogram); dropped (and its quantiles kept) once
+    /// every operation that started in it finished, so a long run holds a few numbers per
+    /// interval, not a histogram each, and a snapshot does not recompute quantiles over the
+    /// whole run.
     latency: Option<Histogram<u64>>,
     /// p50, p90, p99, p99.9, max (µs) of a closed interval, at full histogram precision.
     q_us: [u64; 5],
@@ -361,7 +365,8 @@ impl Bucket {
             retries: 0,
             verbs: Vec::new(),
             missed: 0,
-            latency: Some(hist()),
+            open: true,
+            latency: None,
             q_us: [0; 5],
             heat: [0; 20],
             inflight_peak: 0,
@@ -384,6 +389,7 @@ impl Bucket {
     }
 
     fn close(&mut self) {
+        self.open = false;
         if let Some(h) = self.latency.take() {
             self.q_us = Self::qs(&h);
         }
@@ -519,7 +525,7 @@ impl Agg {
         let closed = self
             .buckets
             .iter()
-            .take_while(|b| b.latency.is_none())
+            .take_while(|b| !b.open)
             .count()
             .min(self.buckets.len().saturating_sub(1));
         let base = self.base;
@@ -1459,10 +1465,11 @@ impl Recorder {
             }
             // Requests whose rows were dropped (more than the scope keeps) count at the start.
             b.requests += c.data.dropped_requests;
-            match b.latency.as_mut() {
-                Some(h) => rec(h, c.latency_us),
+            if b.open {
+                rec(b.latency.get_or_insert_with(hist), c.latency_us);
+            } else {
                 // A late completion in an interval closed while it ran: its maximum stays exact.
-                None => b.q_us[4] = b.q_us[4].max(c.latency_us.min(HIST_MAX_US)),
+                b.q_us[4] = b.q_us[4].max(c.latency_us.min(HIST_MAX_US));
             }
             b.heat[heat] += 1;
             let v = b.verb(c.verb);
@@ -1603,6 +1610,34 @@ impl Recorder {
         for b in a.buckets.iter_mut().take(first_open.saturating_sub(a.base)) {
             b.close();
         }
+        // An idle gap: the intervals more than `MAX_OPEN_INTERVALS` back saw nothing, and
+        // events land there no more (they go to the oldest live interval). One archived span
+        // stands for all of them, so waking up after 30 days of silence costs the same as
+        // after 10 seconds (9.3.2 pushed one interval per 10 s of the gap, each with a
+        // histogram: about 47 GiB after a month). The recent ones stay: the operation being
+        // recorded may have events in them (a retry, a throttled answer).
+        let end = a.base + a.buckets.len();
+        let keep_from = idx.saturating_sub(MAX_OPEN_INTERVALS);
+        if keep_from > end {
+            let base = a.base;
+            a.archive
+                .extend(a.buckets.drain(..).enumerate().map(|(i, mut b)| {
+                    b.close();
+                    let (t_s, len_s) = bucket_span(base + i);
+                    Archived { t_s, len_s, b }
+                }));
+            let (t_s, _) = bucket_span(end);
+            let (t_end, _) = bucket_span(keep_from);
+            let mut gap = Bucket::new();
+            gap.close();
+            a.archive.push(Archived {
+                t_s,
+                len_s: t_end - t_s,
+                b: gap,
+            });
+            a.base = keep_from;
+        }
+        // At most `MAX_OPEN_INTERVALS + 1` new intervals, none with a histogram yet.
         while a.base + a.buckets.len() <= idx {
             a.buckets.push(Bucket::new());
         }
@@ -2155,6 +2190,58 @@ mod tests {
         assert_eq!(t.iter().map(|p| p.ops_count).sum::<u64>(), n + 1);
         assert_eq!(snap.summary.ops, n + 1);
         assert!(t.iter().any(|p| p.max_ms > 1_000.0));
+    }
+
+    /// An embedded operator idle for 30 days wakes up: the recorder neither allocates one
+    /// interval (and histogram) per 10 s of silence nor keeps them, and the timeline still
+    /// covers the gap contiguously (9.3.2: about 260 000 histograms, ~47 GiB).
+    #[test]
+    fn a_thirty_day_idle_gap_costs_constant_memory() {
+        fn histograms(a: &Agg) -> usize {
+            a.buckets.iter().filter(|b| b.latency.is_some()).count()
+                + a.archive.iter().filter(|x| x.b.latency.is_some()).count()
+        }
+        for held in [false, true] {
+            let rec = Recorder::always_on(0);
+            let start = rec.window_start();
+            let at = |s: u64| start + std::time::Duration::from_secs(s);
+            let op = |id: u64, s: u64| OpCompletion {
+                verb: "stat",
+                op_id: id,
+                started: at(s),
+                latency_us: 2_000,
+                logical_read: 0,
+                logical_write: 0,
+                error: None,
+                key: String::new(),
+                data: Default::default(),
+                schedule_us: None,
+            };
+            if held {
+                // A writer left open across the whole gap.
+                rec.op_started_at(u64::MAX, at(3));
+            }
+            rec.op_started_at(1, at(1));
+            rec.complete_op(true, op(1, 1));
+            let month_s: u64 = 30 * 86_400;
+            rec.op_started_at(2, at(month_s));
+            rec.complete_op(true, op(2, month_s));
+            {
+                let a = rec.agg();
+                let n = a.archive.len() + a.buckets.len();
+                assert!(n <= MAX_OPEN_INTERVALS + 8, "{n} intervals after the gap");
+                assert!(histograms(&a) <= 2, "{} histograms", histograms(&a));
+            }
+            rec.op_started_at(3, at(month_s + 20));
+            rec.complete_op(true, op(3, month_s + 20));
+            let t = rec.snapshot().timeline;
+            assert_eq!(t.iter().map(|p| p.ops_count).sum::<u64>(), 3);
+            for w in t.windows(2) {
+                assert!((w[0].t_s + w[0].len_s - w[1].t_s).abs() < 1e-6);
+            }
+            let last = t.last().unwrap();
+            assert!(last.t_s + last.len_s >= (month_s + 20) as f64);
+        }
     }
 
     /// Windows saved while operations complete on other threads: each window's rows are the

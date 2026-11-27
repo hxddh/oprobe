@@ -79,6 +79,8 @@ fn open(cli: &Cli, terminal: bool, file: Option<PathBuf>, show: &str) -> ExitCod
         }
     };
     match crate::ui::run_tui(monochrome) {
+        // Stopped by a signal, as a command is.
+        Ok(()) if crate::ui::stop::seen() > 0 => ExitCode::from(crate::ui::stop::EXIT_SIGNALLED),
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             crate::cli::print_error(&anyhow::Error::new(e).context("the app failed"), "s3");

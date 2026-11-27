@@ -368,7 +368,12 @@ pub fn classify_http(method: &http::Method, path: &str, query: Option<&str>) -> 
     }
     if path_l.starts_with("/storage/v1/") || path_l.starts_with("/upload/storage/v1/") {
         if path_l.starts_with("/upload/") {
-            return if has("upload_id") {
+            // A resumable session's requests carry `upload_id`: a DELETE cancels the session
+            // (9.3.2 took it for a chunk, so the run's gate counted, refused and cut the abort
+            // of a stopped upload like any other request).
+            return if has("upload_id") && *method == Method::DELETE {
+                Api::AbortMultipart
+            } else if has("upload_id") {
                 Api::UploadPart
             } else if q.contains("uploadType=resumable") {
                 Api::CreateMultipart
@@ -445,7 +450,7 @@ pub fn classify_http(method: &http::Method, path: &str, query: Option<&str>) -> 
             }
         }
         Method::DELETE => {
-            if has("uploadId") {
+            if has("uploadId") || has("upload_id") {
                 Api::AbortMultipart
             } else {
                 Api::DeleteObject
@@ -459,6 +464,30 @@ pub fn classify_http(method: &http::Method, path: &str, query: Option<&str>) -> 
 mod tests {
     use super::*;
     use http::Method;
+
+    /// The abort of an upload is told from its chunks whatever the parameter's spelling: a
+    /// GCS resumable session (`upload_id`, cancelled by a DELETE) and S3's `uploadId`.
+    #[test]
+    fn an_upload_session_delete_is_an_abort() {
+        let gcs = "/upload/storage/v1/b/bk/o";
+        let q = Some("uploadType=resumable&upload_id=ADPycd");
+        assert_eq!(classify_http(&Method::DELETE, gcs, q), Api::AbortMultipart);
+        assert_eq!(classify_http(&Method::PUT, gcs, q), Api::UploadPart);
+        assert_eq!(
+            classify_http(&Method::POST, gcs, Some("uploadType=resumable&name=k")),
+            Api::CreateMultipart
+        );
+        assert_eq!(
+            classify_http(&Method::DELETE, "/bk/k", Some("upload_id=1")),
+            Api::AbortMultipart
+        );
+        assert_eq!(
+            classify_http(&Method::DELETE, "/bk/k", Some("uploadId=1")),
+            Api::AbortMultipart
+        );
+        // Without a ServiceOperation the gate resolves it the same way.
+        assert_eq!(Api::resolve(None, &Method::DELETE, gcs, q).0, Api::AbortMultipart);
+    }
 
     /// S3 answers "reduce your request rate" with `503 SlowDown` or `503 ServiceUnavailable`:
     /// both are throttling. Only `503 InternalError` is a server error.

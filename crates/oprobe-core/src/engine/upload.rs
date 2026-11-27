@@ -59,6 +59,9 @@ struct State {
     next_task: AtomicU64,
     idle: Notify,
     failed: Mutex<Vec<String>>,
+    /// The writers of the session's uploads, where a cancelled run aborts those waiting
+    /// between two calls ([`super::shield`]).
+    shields: Arc<super::shield::Shields>,
 }
 
 /// One running task; the last to end wakes [`Aborts::settle`].
@@ -80,6 +83,12 @@ impl Aborts {
         Self::default()
     }
 
+    /// The layer to put beneath the measured layers of every operator whose writers these
+    /// uploads own ([`super::shield`]).
+    pub fn shield_layer(&self) -> super::shield::AbortShieldLayer {
+        super::shield::AbortShieldLayer::new(self.0.shields.clone())
+    }
+
     /// Keep what is wrong with the upload of `path`: it could not be aborted.
     pub(super) fn note_failure(&self, path: &str, failure: impl std::fmt::Display) {
         self.0
@@ -91,8 +100,25 @@ impl Aborts {
 
     /// Abort `writer`'s upload of `path` and keep what went wrong. A writer with nothing to
     /// abort (no multipart upload was started, or the service has none) is fine.
+    ///
+    /// A temporary failure is tried again until [`ABORT_TIMEOUT`]: beneath the measured
+    /// layers the abort runs on a task of its own ([`super::shield`]), so an attempt that a
+    /// timer above cut (`layers.timeout.io`, a tail cut) left it running, and the next attempt
+    /// waits for it.
     async fn abort(&self, writer: &mut Writer, path: &str) {
-        match tokio::time::timeout(ABORT_TIMEOUT, writer.abort()).await {
+        let attempts = async {
+            let mut backoff = Duration::from_millis(20);
+            loop {
+                match writer.abort().await {
+                    Err(e) if e.is_temporary() => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(1));
+                    }
+                    res => return res,
+                }
+            }
+        };
+        match tokio::time::timeout(ABORT_TIMEOUT, attempts).await {
             Ok(Ok(())) => {}
             Ok(Err(e))
                 if matches!(
@@ -147,6 +173,18 @@ impl Aborts {
         };
         let given_up = async {
             cancel.cancelled().await;
+            // The gate stops every request now. A task still running either is in a call
+            // the gate is stopping, or waits above the transport (a throttle, a backoff)
+            // with its writer between two calls: that upload is aborted here, and its task
+            // is no longer waited for (it fails without sending anything when it wakes).
+            let aborted = self.0.shields.abort_idle(ABORT_TIMEOUT).await;
+            if !aborted.is_empty() {
+                let mut running = self.running();
+                running.retain(|_, path| !aborted.contains(path));
+                if running.is_empty() {
+                    self.0.idle.notify_waiters();
+                }
+            }
             tokio::time::sleep(SETTLE_GRACE).await;
         };
         tokio::select! {
@@ -387,6 +425,84 @@ mod tests {
         assert_eq!(lab.open_uploads(), 0);
         let c = lab.multipart_counts();
         assert_eq!((c.created, c.completed, c.aborted), (1, 0, 1), "{c:?}");
+    }
+
+    /// An abort slower than `layers.timeout.io` is not cut: beneath the timer it runs on a
+    /// task of its own, and the session's next attempt waits for it. 9.3.2 lost every abort
+    /// the I/O timeout cut (without a retry layer above it), and left the upload.
+    #[tokio::test]
+    async fn a_timer_above_cannot_cut_an_abort() {
+        let faults = LabConfig {
+            part_fault: Some(PartFault {
+                from_part: 2,
+                kind: PartFaultKind::Deny,
+            }),
+            abort_delay: Duration::from_millis(800),
+            ..Default::default()
+        };
+        let lab = LabServer::spawn("127.0.0.1:0", faults).await.unwrap();
+        let target = lab.profile("b").operator.target().unwrap();
+        let aborts = Aborts::new();
+        let op = base_operator(&target)
+            .unwrap()
+            .layer(trace_layer(&target, &Default::default(), None, None).unwrap())
+            .layer(aborts.shield_layer())
+            .layer(TimeoutLayer::new().with_io_timeout(Duration::from_millis(300)));
+        let w = op.writer_with("k").chunk(PART).await.unwrap();
+        let mut upload = Upload::new(&op, w, "k", &aborts);
+        let data = bytes::Bytes::from(vec![7u8; 5 * PART]);
+        assert!(upload.write_in_pieces(data, PART).await.is_err());
+        aborts.settle(&Cancel::new()).await;
+        assert_eq!(aborts.failure(), None);
+        assert_eq!(lab.open_uploads(), 0);
+        assert_eq!(lab.multipart_counts().aborted, 1);
+    }
+
+    /// An upload whose next write waits in `ThrottleLayer` (or a retry's backoff) when the
+    /// run is cancelled has sent nothing the gate could stop: it is aborted at once, and the
+    /// session does not wait for the throttle (9.3.2 waited out `SETTLE_GRACE`, then reported
+    /// the upload as left behind).
+    #[tokio::test]
+    async fn a_cancelled_run_aborts_an_upload_waiting_in_a_throttle() {
+        let lab = LabServer::spawn("127.0.0.1:0", LabConfig::default())
+            .await
+            .unwrap();
+        let target = lab.profile("b").operator.target().unwrap();
+        let aborts = Aborts::new();
+        // The first two parts and a byte pass on the burst; the next part waits ~80 s.
+        let op = base_operator(&target)
+            .unwrap()
+            .layer(trace_layer(&target, &Default::default(), None, None).unwrap())
+            .layer(aborts.shield_layer())
+            .layer(opendal::layers::ThrottleLayer::new(
+                64 << 10,
+                (2 * PART + (1 << 20)) as u32,
+            ));
+        let w = op.writer_with("k").chunk(PART).await.unwrap();
+        let mut upload = Upload::new(&op, w, "k", &aborts);
+        let write = tokio::spawn(async move {
+            let first = bytes::Bytes::from(vec![7u8; 2 * PART + 1]);
+            upload.write_in_pieces(first, PART).await?;
+            upload.write(vec![7u8; PART]).await?;
+            upload.close().await.map(|_| ())
+        });
+        while lab.open_uploads() < 1 {
+            assert!(!write.is_finished());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!write.is_finished(), "the next write waits in the throttle");
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let t = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(10), aborts.settle(&cancel))
+            .await
+            .expect("settle does not wait for the throttle");
+        assert!(t.elapsed() < Duration::from_secs(10));
+        assert_eq!(aborts.failure(), None);
+        assert_eq!(lab.open_uploads(), 0);
+        assert_eq!(lab.multipart_counts().aborted, 1);
+        write.abort();
     }
 
     /// K1-5: a task that never ends does not keep a cancelled run from its cleanup: `settle`

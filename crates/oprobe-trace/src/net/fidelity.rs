@@ -1035,6 +1035,26 @@ pub(super) struct Finisher {
 }
 
 impl Finisher {
+    /// The body length the response declares, or the request recorded as failed when its
+    /// `Content-Length` or `Content-Encoding` does not parse: a response OpenDAL cannot use is
+    /// a failed request, not a missing one (until 9.2 this returned before anything was
+    /// recorded), nor one aborted by its reader. The same response would fail again: not
+    /// temporary. Both transports answer through this.
+    pub(super) fn declared_length(self, parsed: Result<Option<u64>>) -> Result<(Self, Option<u64>)> {
+        match parsed {
+            Ok(declared) => Ok((self, declared)),
+            Err(err) => {
+                let mut fin = self;
+                fin.record
+                    .detail
+                    .get_or_insert_with(Default::default)
+                    .temporary = Some(false);
+                fin.finish(Duration::ZERO, Some(format!("response headers: {err}")));
+                Err(err)
+            }
+        }
+    }
+
     pub(super) fn emit(
         record: RequestRecord,
         scope: &Option<Arc<OpScope>>,
@@ -1051,7 +1071,7 @@ impl Finisher {
     }
 
     /// `stall`: how long the body waited on its consumer.
-    fn finish(mut self, stall: Duration, error: Option<String>) {
+    pub(super) fn finish(mut self, stall: Duration, error: Option<String>) {
         let now = Instant::now();
         let body_total = now.saturating_duration_since(self.t_headers);
         let stall = stall.min(body_total);
@@ -1720,21 +1740,7 @@ impl HttpTransport for FidelityTransport {
             _inflight: inflight,
             sniff,
         };
-        let content_length = match content_length {
-            Ok(declared) => declared,
-            // A response OpenDAL cannot use is a failed request, not a missing one (until 9.2
-            // this returned before anything was recorded: the operation failed with no request
-            // in the trace). The same response would fail again: not temporary.
-            Err(err) => {
-                let mut fin = fin;
-                fin.record
-                    .detail
-                    .get_or_insert_with(Default::default)
-                    .temporary = Some(false);
-                fin.finish(Duration::ZERO, Some(format!("response headers: {err}")));
-                return Err(err);
-            }
-        };
+        let (fin, content_length) = fin.declared_length(content_length)?;
         let chunks = futures::StreamExt::map(resp.bytes_stream(), move |chunk| {
             chunk.map(Buffer::from).map_err(|err| {
                 let temporary = is_temporary_error(&err);
