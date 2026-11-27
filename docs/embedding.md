@@ -17,7 +17,7 @@ meter).
 
 ```toml
 [dependencies]
-oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.3" }
+oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.4" }
 ```
 
 `oprobe-trace` is not on crates.io yet: the git dependency above is the one that resolves today

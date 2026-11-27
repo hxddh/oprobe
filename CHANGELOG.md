@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## v9.3.4 — 2026-11-27
 
 The fixes of the fresh review of 9.3.3 (`docs/design/v9.3-review.md`): credentials a replay
 could send to the wrong place, budgets and rates that did not hold, data `oprobe-trace` could
@@ -56,6 +56,13 @@ lose, numbers that were wrong. No command or flag was added; the file formats ar
   own hint, a JSON usage error names the missing argument, and the app no longer offers a
   remedy the core does not have.
 - `--save` writes through a symlinked `op.toml` and keeps its mode.
+
+### Changed
+
+- Runs of `fs://` and `memory://` count every call against `--max-requests`, the dataset
+  upload included (about 260 requests by default): a budget that left room for the window in
+  9.3.3 may now stop the run before it measures.
+- `-c 4 --set concurrency=8` is refused instead of running with 8.
 
 ## v9.3.3 — 2026-11-27
 
