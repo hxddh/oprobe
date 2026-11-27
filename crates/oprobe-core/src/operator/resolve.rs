@@ -48,11 +48,13 @@ pub fn same_operator(given: &OperatorSpec, used: &OperatorSpec) -> bool {
             .is_none_or(|e| used.options.get("endpoint") == Some(e))
 }
 
-/// The reference a run stores for `arg`: an operator file by its canonical absolute path (a
-/// relative path would name another file from another directory), anything else as given.
+/// The reference a run stores for `arg`: an operator file by its absolute path (a relative
+/// path would name another file from another directory), anything else as given. Absolute,
+/// not canonical: a canonical path is `\\?\C:\…` on Windows and leaves `/var` for
+/// `/private/var` on macOS, which is not the path the user gave.
 pub fn stored_ref(arg: &str) -> String {
     operator_file_path(arg)
-        .and_then(|p| std::fs::canonicalize(p).ok())
+        .and_then(|p| std::path::absolute(p).ok())
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| arg.to_owned())
 }

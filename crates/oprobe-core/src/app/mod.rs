@@ -689,15 +689,14 @@ mod tests {
             .unwrap();
         };
         write("s3://mine/data", "MYKEY");
-        // A relative reference is stored as the file's canonical path.
-        let rel = d.path().join("sub/../keys.toml").display().to_string();
-        std::fs::create_dir_all(d.path().join("sub")).unwrap();
-        let run = app.resolve(&RunRequest::new([rel])).unwrap().remove(0);
+        // The reference is stored as an absolute path.
+        let run = app
+            .resolve(&RunRequest::new([file.display().to_string()]))
+            .unwrap()
+            .remove(0);
         let spec = run.spec();
-        assert_eq!(
-            spec.operator_ref,
-            std::fs::canonicalize(&file).unwrap().display().to_string()
-        );
+        assert!(std::path::Path::new(&spec.operator_ref).is_absolute());
+        assert_eq!(spec.operator_ref, file.display().to_string());
         let ctx = app.ctx(&EventSink::silent());
         // The same operator: its secrets come back.
         let p = profile::spec_profile(&ctx, spec.clone()).unwrap();
