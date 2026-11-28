@@ -326,6 +326,38 @@ enum ErrMsg {
 /// Texts for stderr waiting for the writer thread, at most.
 const STDERR_QUEUE: usize = 1024;
 
+/// Kept texts ([`stderr_line_kept`]) that found the queue full, at most.
+const STDERR_KEPT: usize = 64;
+
+/// Kept texts that found the queue full: written once the queue has drained, before a flush
+/// answers. 9.3.4 dropped them like any text, so under backpressure (a slow terminal, a pipe
+/// read late) a command's final error could be lost behind its progress lines.
+static STDERR_OVERFLOW: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Write what [`STDERR_OVERFLOW`] holds.
+fn write_overflow() {
+    let kept = std::mem::take(&mut *STDERR_OVERFLOW.lock().unwrap_or_else(|e| e.into_inner()));
+    for text in kept {
+        STDERR.write(&mut std::io::stderr().lock(), &text);
+    }
+}
+
+/// The writer thread's next message: the queued ones in order, and the kept overflow once the
+/// queue is empty. `None` once every sender is gone.
+fn next_message(rx: &std::sync::mpsc::Receiver<ErrMsg>) -> Option<ErrMsg> {
+    match rx.try_recv() {
+        Ok(m) => Some(m),
+        Err(std::sync::mpsc::TryRecvError::Empty) => {
+            write_overflow();
+            rx.recv().ok()
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            write_overflow();
+            None
+        }
+    }
+}
+
 /// The one thread that writes to stderr, and its queue (`None`: it could not start; texts
 /// are then written where they are produced).
 ///
@@ -341,10 +373,11 @@ static STDERR_QUEUE_TX: std::sync::LazyLock<Option<std::sync::mpsc::SyncSender<E
         std::thread::Builder::new()
             .name("oprobe-stderr".into())
             .spawn(move || {
-                for msg in rx {
+                while let Some(msg) = next_message(&rx) {
                     match msg {
                         ErrMsg::Text(text) => STDERR.write(&mut std::io::stderr().lock(), &text),
                         ErrMsg::Flush(done) => {
+                            write_overflow();
                             let _ = done.try_send(());
                         }
                     }
@@ -397,6 +430,29 @@ pub fn flush_stderr(timeout: std::time::Duration) -> bool {
 /// Write one line to stderr. Never panics and never fails: see the module documentation.
 pub fn stderr_line(line: impl std::fmt::Display) {
     stderr_text(&format!("{line}\n"));
+}
+
+/// [`stderr_line`] for a line that must not be dropped when the queue is full (a command's
+/// error and its hint): it waits beside the queue and is written once the queue drains, or at
+/// the next [`flush_stderr`]. Still never blocks.
+pub fn stderr_line_kept(line: impl std::fmt::Display) {
+    let text = format!("{line}\n");
+    match &*STDERR_QUEUE_TX {
+        Some(tx) => send_kept(tx, text),
+        None => STDERR.write(&mut std::io::stderr().lock(), &text),
+    }
+}
+
+/// Queue `text`, or keep it in [`STDERR_OVERFLOW`] when the queue is full.
+fn send_kept(tx: &std::sync::mpsc::SyncSender<ErrMsg>, text: String) {
+    if let Err(std::sync::mpsc::TrySendError::Full(ErrMsg::Text(text))) =
+        tx.try_send(ErrMsg::Text(text))
+    {
+        let mut kept = STDERR_OVERFLOW.lock().unwrap_or_else(|e| e.into_inner());
+        if kept.len() < STDERR_KEPT {
+            kept.push(text);
+        }
+    }
 }
 
 /// Run `hook` once when a write to stderr is refused because its reader is gone (at once when
@@ -469,6 +525,26 @@ mod tests {
     /// 9.2 printed with `eprintln!`, which panics there, and the panic skipped cleanup. The
     /// refused write is no error to the caller; it runs the hooks once, and later lines are
     /// dropped.
+    /// A kept line (a command's final error) that finds the queue full waits beside it and is
+    /// written once the queue has drained. 9.3.4 dropped it like a progress line.
+    #[test]
+    fn a_kept_line_survives_a_full_queue() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ErrMsg>(1);
+        tx.try_send(ErrMsg::Text(String::new())).unwrap();
+        assert!(tx.try_send(ErrMsg::Text("dropped".into())).is_err(), "full");
+        send_kept(&tx, String::new());
+        assert_eq!(
+            STDERR_OVERFLOW.lock().unwrap().len(),
+            1,
+            "kept beside the queue"
+        );
+        // The queued text first, then (the queue empty) the kept one is written.
+        assert!(matches!(next_message(&rx), Some(ErrMsg::Text(_))));
+        drop(tx);
+        assert!(next_message(&rx).is_none());
+        assert!(STDERR_OVERFLOW.lock().unwrap().is_empty(), "written");
+    }
+
     #[test]
     fn a_closed_stderr_runs_its_hooks_once_and_never_fails() {
         use std::sync::Arc;

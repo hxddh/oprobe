@@ -1158,7 +1158,14 @@ async fn handle_s3_request<'a>(
     let method = req.method().clone();
     let uri = req.uri().clone();
     let qmap = parse_query_map(uri.query());
-    let is_delete_cleanup = method == Method::DELETE || qmap.contains_key("delete");
+    // Cleanup is spared the faults and limits below, so teardown and its verification stay
+    // clean: the run's cleaner (it marks its requests) and the abort of a multipart upload.
+    // A workload's deletes are faulted and throttled like any request (9.3.4 spared every
+    // DELETE and batch delete, so delete-heavy mixes looked clean on the fault labs).
+    let is_delete_cleanup = req
+        .headers()
+        .contains_key(crate::engine::operator::CLEANUP_HEADER)
+        || (method == Method::DELETE && qmap.contains_key("uploadId"));
 
     // 1. Optional 429 / 503 SlowDown Rate-Limit Injection (never block cleanup DELETEs so teardown verify stays clean)
     if !is_delete_cleanup {

@@ -78,14 +78,36 @@ fn open(cli: &Cli, terminal: bool, file: Option<PathBuf>, show: &str) -> ExitCod
             std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
         }
     };
-    match crate::ui::run_tui(monochrome) {
-        // Stopped by a signal, as a command is.
-        Ok(()) if crate::ui::stop::seen() > 0 => ExitCode::from(crate::ui::stop::EXIT_SIGNALLED),
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            crate::cli::print_error(&anyhow::Error::new(e).context("the app failed"), "s3");
+    let result = crate::ui::run_tui(monochrome);
+    match tui_exit(&result, crate::ui::stop::seen() > 0) {
+        TuiExit::Failed => {
+            if let Err(e) = result {
+                crate::cli::print_error(&anyhow::Error::new(e).context("the app failed"), "s3");
+            }
             ExitCode::FAILURE
         }
+        TuiExit::Signalled => ExitCode::from(crate::ui::stop::EXIT_SIGNALLED),
+        TuiExit::Done => ExitCode::SUCCESS,
+    }
+}
+
+/// How the terminal app ended.
+#[derive(Debug, PartialEq, Eq)]
+enum TuiExit {
+    Done,
+    /// Stopped by a signal, as a command is (130).
+    Signalled,
+    Failed,
+}
+
+/// The exit of the terminal app that returned `result`, a signal `signalled` or not. A signal
+/// wins over an error: a terminal that hangs up (SIGHUP) answers the app's next read or write
+/// with `EIO`, and 9.3.4 then printed "the app failed" and exited 1 instead of 130.
+fn tui_exit(result: &std::io::Result<()>, signalled: bool) -> TuiExit {
+    match (result, signalled) {
+        (_, true) => TuiExit::Signalled,
+        (Ok(()), false) => TuiExit::Done,
+        (Err(_), false) => TuiExit::Failed,
     }
 }
 
@@ -190,7 +212,18 @@ fn refuse(cli: &Cli, message: &str, hint: &str) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::started_with;
+    use super::{TuiExit, started_with, tui_exit};
+
+    /// SIGHUP or SIGTERM while the app runs exits 130 even when the terminal's hangup made the
+    /// app's I/O fail (`EIO`).
+    #[test]
+    fn a_signal_wins_over_the_hangups_io_error() {
+        let eio = || Err(std::io::Error::from_raw_os_error(5));
+        assert_eq!(tui_exit(&eio(), true), TuiExit::Signalled);
+        assert_eq!(tui_exit(&Ok(()), true), TuiExit::Signalled);
+        assert_eq!(tui_exit(&eio(), false), TuiExit::Failed);
+        assert_eq!(tui_exit(&Ok(()), false), TuiExit::Done);
+    }
 
     #[test]
     fn a_desktop_launch_is_read_from_the_starting_environment() {

@@ -356,6 +356,45 @@ fn transport_layer(
     })
 }
 
+/// The header the run's cleaner marks its requests with, on a local endpoint only (the lab):
+/// the lab spares cleanup from its faults and limits, and only cleanup. 9.3.4's lab spared
+/// every delete, so a delete-heavy workload looked clean on the fault labs.
+pub const CLEANUP_HEADER: &str = "x-oprobe-cleanup";
+
+/// A transport that marks every request as cleanup ([`CLEANUP_HEADER`]).
+struct CleanupMark<T>(T);
+
+impl<T: opendal::HttpTransport> opendal::HttpTransport for CleanupMark<T> {
+    async fn fetch(
+        &self,
+        mut req: http::Request<opendal::Buffer>,
+    ) -> opendal::Result<http::Response<opendal::HttpBody>> {
+        req.headers_mut()
+            .insert(CLEANUP_HEADER, http::HeaderValue::from_static("1"));
+        self.0.fetch(req).await
+    }
+}
+
+/// [`trace_layer`] of an ungated cleaner: its requests carry [`CLEANUP_HEADER`] when the
+/// endpoint is local (a real service never sees the header).
+fn cleaner_trace_layer(target: &TargetSpec) -> Result<TraceContextLayer> {
+    let local = target.endpoint().is_some_and(|e| {
+        url::Url::parse(&e).ok().is_some_and(|u| match u.host() {
+            Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        })
+    });
+    if !local {
+        return trace_layer(target, &HttpOptions::default(), None, None);
+    }
+    let cfg = transport_config(target, &HttpOptions::default())?;
+    let https = target.endpoint().is_some_and(|e| e.starts_with("https"));
+    let transport = FidelityTransport::new(cfg, https, None)?;
+    Ok(TraceContextLayer::new(CleanupMark(transport)))
+}
+
 /// The measured operator: the service through the instrumented `HttpTransport` (every request is
 /// traced into `recorder`), wrapped in `spec`'s layers.
 pub async fn measured_operator(
@@ -834,9 +873,11 @@ pub fn preflight_operator(
     target: &TargetSpec,
     gate: Option<&Gate>,
 ) -> Result<Operator> {
-    let mut op = base
-        .clone()
-        .layer(trace_layer(target, &HttpOptions::default(), None, gate)?);
+    let mut op = base.clone().layer(match gate {
+        Some(g) => trace_layer(target, &HttpOptions::default(), None, Some(g))?,
+        // Ungated: the probe's cleaner.
+        None => cleaner_trace_layer(target)?,
+    });
     if let Some(g) = gate {
         op = op.layer(g.shield_layer());
         // A service without an HTTP transport has no gate in it: its calls are charged here.
@@ -873,9 +914,11 @@ pub fn admin_operator_with(
     target: &TargetSpec,
     gate: Option<&Gate>,
 ) -> Result<Operator> {
-    let mut op = base
-        .clone()
-        .layer(trace_layer(target, &HttpOptions::default(), None, gate)?);
+    let mut op = base.clone().layer(match gate {
+        Some(g) => trace_layer(target, &HttpOptions::default(), None, Some(g))?,
+        // Ungated: the run's cleaner.
+        None => cleaner_trace_layer(target)?,
+    });
     if let Some(g) = gate {
         op = op.layer(g.shield_layer());
         // A service without an HTTP transport has no gate in it: its calls are charged here.
@@ -901,6 +944,48 @@ pub fn admin_operator_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lab spares the run's cleaner, and only it: a workload's deletes meet its faults.
+    /// 9.3.4's lab spared every DELETE and batch delete.
+    #[tokio::test]
+    async fn the_lab_spares_the_cleaner_and_faults_workload_deletes() {
+        let faults = crate::lab::LabConfig {
+            throttle_every_n_requests: Some(1),
+            ..Default::default()
+        };
+        let lab = crate::lab::LabServer::spawn("127.0.0.1:0", faults)
+            .await
+            .unwrap();
+        let target = lab.profile("b").operator.target().unwrap();
+        let base = base_operator(&target).unwrap();
+        let cleaner = admin_operator(&base, &target).unwrap();
+        cleaner.write("k1", vec![1u8; 8]).await.unwrap();
+        cleaner.write("k2", vec![1u8; 8]).await.unwrap();
+        let workload = base
+            .clone()
+            .layer(trace_layer(&target, &HttpOptions::default(), None, None).unwrap());
+        assert!(
+            workload.delete("k1").await.is_err(),
+            "a workload delete is throttled"
+        );
+        assert!(
+            workload
+                .delete_iter(["k1".to_owned(), "k2".to_owned()])
+                .await
+                .is_err(),
+            "and a batch delete"
+        );
+        cleaner.delete("k1").await.unwrap();
+        cleaner.delete_iter(["k2".to_owned()]).await.unwrap();
+        assert!(
+            cleaner
+                .list("")
+                .await
+                .unwrap()
+                .iter()
+                .all(|e| e.path().ends_with('/'))
+        );
+    }
 
     #[test]
     fn backend_config_hints_name_flags_and_only_missing_options() {
