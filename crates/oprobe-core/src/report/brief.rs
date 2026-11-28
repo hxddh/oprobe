@@ -119,6 +119,17 @@ pub fn render_width(r: &Report, width: usize) -> String {
             lines.push(format!("      {} {c}", dim("next:")));
         }
     }
+    if let Some(c) = &v.ceiling_command {
+        // A clean run: nothing to add at this load, and where to look for the ceiling.
+        prose(
+            &mut lines,
+            "no layer to add at this load; to look for the ceiling:",
+            "  ",
+            "  ",
+            dim,
+        );
+        lines.push(format!("  {} {c}", dim("next:")));
+    }
     if findings.len() > 3 {
         lines.push(dim(&format!(
             "  … {} more findings: oprobe show {} --detail",
@@ -156,6 +167,30 @@ pub fn render_width(r: &Report, width: usize) -> String {
 mod tests {
     use super::*;
     use crate::model::Finding;
+
+    /// A clean run says there is nothing to add at this load and names one next step: the
+    /// same run at four times the concurrency, or twice the rate of an open loop (9.4: it
+    /// ended at "No finding").
+    #[test]
+    fn a_clean_run_names_where_to_look_for_the_ceiling() {
+        set(false);
+        let mut r = crate::report::fixture::report();
+        r.findings.clear();
+        r.run.partial = None;
+        r.summary.ops = 1000;
+        r.spec = crate::model::RunSpec::new(&crate::config::Profile::from_url("memory://"), "memory://");
+        r.spec.profile.workload.concurrency = 8;
+        let out = render_width(&r, 100);
+        assert!(out.contains("no layer to add at this load"), "{out}");
+        let next = out.lines().find(|l| l.contains("next:")).unwrap();
+        assert!(next.contains("oprobe run memory://") && next.contains("-c 32"), "{next}");
+        r.spec.profile.workload.rate = Some(500.0);
+        let next = render_width(&r, 100).lines().find(|l| l.contains("next:")).map(str::to_owned).unwrap();
+        assert!(next.contains("--rate 1000"), "{next}");
+        // A finding: its own next step, no ceiling line.
+        r.findings.push(Finding::default());
+        assert!(!render_width(&r, 100).contains("no layer to add"));
+    }
 
     #[test]
     fn brief_wraps_to_the_width_and_never_truncates() {

@@ -138,6 +138,8 @@ impl Secondary {
             "goodput_ops_per_s" => "metric.goodput",
             "throttled_request_ratio" => "metric.throttled",
             "error_ratio" => "metric.errors",
+            "requests_per_op" => "metric.requests_per_op",
+            "backend_bytes_per_logical_byte" => "metric.bytes_moved",
             other => return other.to_owned(),
         };
         super::i18n::tr(key).to_owned()

@@ -367,6 +367,27 @@ fn served_rate_median(obs: &[Obs]) -> f64 {
     super::stats::median(&rates)
 }
 
+/// Requests per second the service served from the first throttled request to the last:
+/// while a token bucket is empty it serves exactly what refills, so over its throttled stretch
+/// this is its rate (plus what it refilled in the stretch's lulls). `None` for a stretch too
+/// short or too sparse to tell (under 0.5 s or 10 served requests).
+///
+/// A3 (open since 9.3.3): the likelihood fit with a free threshold read `lab://ratelimit`
+/// (100/s, burst 30) as ≈172/s. The fit assumes a full bucket at the window's start, while
+/// the warm-up runs on into the window and leaves it partly drained, and a free threshold
+/// trades the rate for an earlier cut-off. Widening its search did not move it (9.3.4); the
+/// served rate over the stretch does not depend on either.
+fn stretch_rate(obs: &[Obs]) -> Option<f64> {
+    let t0 = obs.iter().find(|o| o.thr)?.t;
+    let t1 = obs.iter().rev().find(|o| o.thr)?.t;
+    let span_s = (t1 - t0) as f64 / 1e6;
+    let served = obs
+        .iter()
+        .filter(|o| !o.thr && o.t >= t0 && o.t <= t1)
+        .count();
+    (span_s >= 0.5 && served >= 10).then(|| served as f64 / span_s)
+}
+
 /// The best token bucket over `obs`: `(rate, burst, split)`.
 fn best_rate(
     obs: &[Obs],
@@ -594,8 +615,11 @@ fn throttle_family(
             )],
         });
     }
-    // Rate: a sliding-window limiter over all requests.
-    let global = best_rate(obs, None, 0);
+    // Rate: a sliding-window limiter over all requests. The likelihood picks the model and
+    // the burst; the rate it reports is at most what the service served from the first
+    // throttled request to the last (A3).
+    let global = best_rate(obs, None, 0)
+        .map(|(r, b, s)| (stretch_rate(obs).map_or(r, |st| st.min(r)), b, s));
     if let Some((r, b, s)) = &global {
         fits.push(Fit {
             kind: HypothesisKind::RateLimit,

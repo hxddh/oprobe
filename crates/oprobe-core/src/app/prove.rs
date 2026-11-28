@@ -226,10 +226,21 @@ pub struct ProveTrial {
     /// sits on a cliff. Absent when 0, and in results of 9.2 and earlier.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub p99_spread_ratio: f64,
+    /// Bytes the service sent and received in request and response bodies (9.4; absent in
+    /// earlier results): what a remedy costs in transfer, against `logical_bytes`.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub backend_bytes: u64,
+    /// Bytes the application read and wrote (9.4; absent in earlier results).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub logical_bytes: u64,
 }
 
 fn is_zero(v: &f64) -> bool {
     *v == 0.0
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// The sizing step: the path, the values tried and the knee.
@@ -358,6 +369,8 @@ impl ProveOutput {
             "goodput_ops_per_s" => "goodput",
             "throttled_request_ratio" => "throttled",
             "error_ratio" => "errors",
+            "requests_per_op" => "requests/op",
+            "backend_bytes_per_logical_byte" => "bytes moved/byte",
             other => other,
         }
     }
@@ -1661,6 +1674,8 @@ impl Trials<'_> {
                 requests as f64 / r.run.window_s.max(1e-3),
             ),
             p99_spread_ratio: p99_spread_of(&r.latency_histogram),
+            backend_bytes: r.bytes.backend_down + r.bytes.backend_up,
+            logical_bytes: r.bytes.logical_read + r.bytes.logical_write,
         };
         self.ctx
             .out
@@ -2197,6 +2212,22 @@ fn secondary(
             ));
         }
     }
+    // The cost side (9.4): what the change sends per operation, and what it transfers per
+    // byte the application asked for. A hedge or a tail cut sends more requests; a cache
+    // that fetches whole objects for small ranges transfers more bytes.
+    v.push(positive(
+        "requests_per_op",
+        |t| if t.ops_count == 0 { 0.0 } else { t.requests_count as f64 / t.ops_count as f64 },
+        0.0,
+    ));
+    if a.iter().chain(b).all(|t| t.logical_bytes > 0) {
+        v.push(positive(
+            "backend_bytes_per_logical_byte",
+            |t| if t.logical_bytes == 0 { 0.0 } else { t.backend_bytes as f64 / t.logical_bytes as f64 },
+            0.0,
+        ));
+    }
+
     let sum =
         |ts: &[&ProveTrial], f: fn(&ProveTrial) -> u64| ts.iter().map(|t| f(t)).sum::<u64>() as f64;
     let (ka, na) = (sum(a, |t| t.throttled_count), sum(a, |t| t.requests_count));
@@ -2966,7 +2997,36 @@ mod tests {
             error_ratio: 0.0,
             feasible,
             p99_spread_ratio: 0.0,
+            backend_bytes: 0,
+            logical_bytes: 0,
         }
+    }
+
+    /// The decision shows the cost side (9.4): a change that sends twice the requests per
+    /// operation and transfers three times the bytes says so beside its latency.
+    #[test]
+    fn secondary_metrics_show_the_cost_side() {
+        use TrialKind::{Baseline, Candidate};
+        let mk = |kind, pair: u64, requests: u64, backend: u64| ProveTrial {
+            kind,
+            pair: Some(pair),
+            requests_count: requests,
+            backend_bytes: backend,
+            logical_bytes: 1000,
+            ..trial(300.0, 50.0, true)
+        };
+        let a = [mk(Baseline, 0, 100, 1000), mk(Baseline, 1, 102, 1010)];
+        let b = [mk(Candidate, 0, 200, 3000), mk(Candidate, 1, 204, 3030)];
+        let (a, b): (Vec<&ProveTrial>, Vec<&ProveTrial>) = (a.iter().collect(), b.iter().collect());
+        let sec = secondary(ProveObjective::P99, &a, &b, &[false, true]);
+        let get = |m: &str| sec.iter().find(|x| x.metric == m).unwrap().change.estimate;
+        assert!((get("requests_per_op") - 1.0).abs() < 1e-9);
+        assert!((get("backend_bytes_per_logical_byte") - 2.0).abs() < 1e-9);
+        // Results of 9.3 carry no bytes: no bytes row, rather than a made-up one.
+        let old = [trial(300.0, 50.0, true)];
+        let old: Vec<&ProveTrial> = old.iter().collect();
+        let sec = secondary(ProveObjective::P99, &old, &old, &[false]);
+        assert!(sec.iter().all(|x| x.metric != "backend_bytes_per_logical_byte"));
     }
 
     /// S7: a value best at its start (a 20 ms retry backoff) was sized 20 → 40 → 28 → 33 ms,

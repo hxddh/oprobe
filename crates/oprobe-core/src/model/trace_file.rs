@@ -103,8 +103,9 @@ pub fn custom_endpoint(r: &Report) -> Option<String> {
 
 /// The run that profiles the service a trace recorded, to prove a remedy on (`oprobe run
 /// s3://bucket/root`, with `--set options.endpoint=…` when the requests went to a custom
-/// endpoint, and `--preset …` when the recorded operations match a non-default preset);
-/// `None` when the file does not name the service.
+/// endpoint, `--preset …` when the recorded operations match a non-default preset, `-c` the
+/// operations the application kept in flight and `--object-size` the size it read or wrote
+/// whole); `None` when the file does not name the service.
 pub fn run_command(r: &Report) -> Option<String> {
     let url = &r.spec.operator_ref;
     if url.is_empty() || url.starts_with("unknown://") {
@@ -117,10 +118,54 @@ pub fn run_command(r: &Report) -> Option<String> {
             super::spec::shell_quote(&format!("options.endpoint={e}"))
         );
     }
-    if let Some(preset) = inferred_preset(r) {
+    let preset = inferred_preset(r);
+    if let Some(preset) = preset {
         c += &format!(" --preset {preset}");
     }
+    // The traffic's shape, so the run reproduces it (9.4: the preset alone said nothing of
+    // the application's concurrency or object sizes).
+    if let Some(n) = observed_concurrency(r) {
+        c += &format!(" -c {n}");
+    }
+    if preset != Some("range-reads")
+        && preset != Some("list-stat")
+        && let Some(size) = observed_object_size(r)
+    {
+        c += &format!(" --object-size {size}");
+    }
     Some(c)
+}
+
+/// The operations the application kept in flight on average (Little's law: the rate of each
+/// verb times its mean latency, summed), at least 1 and at most 1 024. `None` without
+/// operations.
+fn observed_concurrency(r: &Report) -> Option<u64> {
+    let busy: f64 = r
+        .verbs
+        .iter()
+        .map(|v| v.ops_per_s * v.latency.mean / 1000.0)
+        .filter(|x| x.is_finite())
+        .sum();
+    (busy > 0.0).then(|| (busy.ceil() as u64).clamp(1, 1024))
+}
+
+/// The size of the objects the application read or wrote whole: the bytes per operation of
+/// its most frequent whole read or write, rounded to a KiB (to a MiB from 1 MiB). `None` when
+/// it moved no data that way.
+fn observed_object_size(r: &Report) -> Option<crate::util::ByteSize> {
+    let v = r
+        .verbs
+        .iter()
+        .filter(|v| v.verb == "read.full" || v.verb.starts_with("write"))
+        .filter(|v| v.bytes_per_op >= 1.0)
+        .max_by_key(|v| v.count)?;
+    let unit = if v.bytes_per_op >= (1u64 << 20) as f64 {
+        1u64 << 20
+    } else {
+        1u64 << 10
+    };
+    let n = (v.bytes_per_op / unit as f64).round().max(1.0) as u64;
+    Some(crate::util::ByteSize(n * unit))
 }
 
 fn inferred_preset(r: &Report) -> Option<&'static str> {
@@ -510,6 +555,45 @@ mod tests {
         assert_eq!(operator_url(Some(&s("s3", "bkt", "/a/b/"))), "s3://bkt/a/b");
         assert_eq!(operator_url(Some(&s("memory", "0x1", "/"))), "memory://");
         assert_eq!(operator_url(Some(&s("fs", "", "/tmp/x/"))), "fs:///tmp/x");
+    }
+
+    /// The command reproduces the traffic: the application's concurrency (rate × latency) and
+    /// the size of what it read whole. 9.3 named only the preset.
+    #[test]
+    fn the_run_command_reproduces_the_traffic() {
+        let mut r = crate::report::fixture::report();
+        r.spec.operator_ref = "s3://bkt/data".into();
+        r.network.remotes.clear();
+        let verb = |name: &str, count: u64, ops_per_s: f64, mean_ms: f64, bytes: f64| {
+            crate::trace::VerbStats {
+                verb: name.into(),
+                count,
+                ops_per_s,
+                latency: crate::trace::Quantiles {
+                    mean: mean_ms,
+                    ..Default::default()
+                },
+                bytes_per_op: bytes,
+                ..Default::default()
+            }
+        };
+        // 400 reads/s of 30 ms and 50 stats/s of 20 ms: 13 in flight; ~1.5 MiB objects.
+        r.verbs = vec![
+            verb("read.full", 4000, 400.0, 30.0, 1.6e6),
+            verb("stat", 500, 50.0, 20.0, 0.0),
+        ];
+        assert_eq!(
+            run_command(&r).unwrap(),
+            "oprobe run s3://bkt/data -c 13 --object-size 2MiB"
+        );
+        r.verbs[0].bytes_per_op = 60_000.0;
+        assert!(run_command(&r).unwrap().ends_with("--object-size 59KiB"));
+        // Range reads: what moved is the range, not the object.
+        r.verbs = vec![verb("read.range", 900, 90.0, 10.0, 8192.0)];
+        assert_eq!(
+            run_command(&r).unwrap(),
+            "oprobe run s3://bkt/data --preset range-reads -c 1"
+        );
     }
 
     #[test]
