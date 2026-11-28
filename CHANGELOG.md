@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v9.3.5 — 2026-11-28
+
+The confirmed bugs left by 9.3.4 (`docs/design/v9.3-review.md`, "9.3.5"): retries a reader
+split in two, a save a full disk could empty, a replay that lent its keys to another endpoint,
+budgets and lab faults that missed deletes, and a pairing slip in `prove`. No command or flag
+was added; the file formats are unchanged.
+
+### Fixed
+
+#### Safety
+
+- **A replay re-attaches an operator file's secrets only for the endpoint the file names.**
+  The endpoint is compared both ways, with `${NAME}` references expanded: the keys of an
+  `op.toml` without an endpoint are no longer sent to a run's custom endpoint. Such a run is
+  replayed by putting its endpoint in the file.
+- **`fs://` and `memory://` charge one request per deleted path and per list page** (1 000
+  entries), not one per deleter or lister.
+
+#### `oprobe-trace`
+
+- **A read whose first attempt failed and was retried is one operation**, also with a
+  snapshot taken during the backoff (it was two, one of them failed).
+- **`save` and `save_and_reset` reserve the file's room before they take anything**, and
+  refuse a directory: a full disk or a directory destination leaves the window and its rows
+  in memory.
+- A `Range: bytes=0-18446744073709551615` header no longer overflows the range length.
+- An object path with an encoded slash (`dt=2026-01-01%2Fsession_id=abc`) is not redacted as
+  a query parameter.
+
+#### Numbers
+
+- **`prove` pairs its trials before it leaves out a missing value**: a zero in two different
+  pairs shifted every later pair onto its neighbour.
+- A secondary metric's noise floor reads the order each pair ran in.
+- **The lab faults and throttles a workload's deletes**; only the run's cleaner and multipart
+  aborts are spared.
+
+#### Usability
+
+- A command's final error and hint are never dropped behind a full stderr queue.
+- SIGHUP or SIGTERM while the terminal app runs exits 130, also when the hangup made the
+  app's I/O fail.
+
 ## v9.3.4 — 2026-11-27
 
 The fixes of the fresh review of 9.3.3 (`docs/design/v9.3-review.md`): credentials a replay

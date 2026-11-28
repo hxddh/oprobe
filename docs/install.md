@@ -8,7 +8,7 @@
 | macOS, Linux (CLI only) | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh -s -- --cli` |
 | Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, or the `.msi` |
 | Debian, Ubuntu, Fedora, RHEL | the `.deb` / `.rpm` from the release page |
-| Rust ≥ 1.97 (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.4 oprobe` |
+| Rust ≥ 1.97 (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.5 oprobe` |
 
 Then try it with no account: `oprobe demo` ([getting started](getting-started.md)).
 
@@ -97,9 +97,9 @@ sudo dnf install ./oprobe-<ver>-1.x86_64.rpm
 ## From source
 
 ```bash
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.4 oprobe                                         # the app in the terminal
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.4 oprobe --features gui                          # plus native windows (Linux: libgtk-4-dev)
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.4 oprobe --no-default-features --features cli    # the CLI only
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.5 oprobe                                         # the app in the terminal
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.5 oprobe --features gui                          # plus native windows (Linux: libgtk-4-dev)
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.5 oprobe --no-default-features --features cli    # the CLI only
 ```
 
 oprobe is not on crates.io. To embed oprobe's instrumentation in your own program use
