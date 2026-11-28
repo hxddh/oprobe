@@ -92,6 +92,7 @@ fn open(cli: &Cli, terminal: bool, file: Option<PathBuf>, show: &str) -> ExitCod
 }
 
 /// How the terminal app ended.
+#[cfg(feature = "app")]
 #[derive(Debug, PartialEq, Eq)]
 enum TuiExit {
     Done,
@@ -103,6 +104,7 @@ enum TuiExit {
 /// The exit of the terminal app that returned `result`, a signal `signalled` or not. A signal
 /// wins over an error: a terminal that hangs up (SIGHUP) answers the app's next read or write
 /// with `EIO`, and 9.3.4 then printed "the app failed" and exited 1 instead of 130.
+#[cfg(feature = "app")]
 fn tui_exit(result: &std::io::Result<()>, signalled: bool) -> TuiExit {
     match (result, signalled) {
         (_, true) => TuiExit::Signalled,
@@ -212,12 +214,14 @@ fn refuse(cli: &Cli, message: &str, hint: &str) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{TuiExit, started_with, tui_exit};
+    use super::started_with;
 
     /// SIGHUP or SIGTERM while the app runs exits 130 even when the terminal's hangup made the
     /// app's I/O fail (`EIO`).
+    #[cfg(feature = "app")]
     #[test]
     fn a_signal_wins_over_the_hangups_io_error() {
+        use super::{TuiExit, tui_exit};
         let eio = || Err(std::io::Error::from_raw_os_error(5));
         assert_eq!(tui_exit(&eio(), true), TuiExit::Signalled);
         assert_eq!(tui_exit(&Ok(()), true), TuiExit::Signalled);
