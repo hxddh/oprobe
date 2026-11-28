@@ -436,6 +436,7 @@ impl std::fmt::Debug for RetryNotify {
 impl RetryNotify {
     pub(crate) fn new(recorder: Arc<Recorder>, linker: Arc<Linker>) -> Self {
         linker.enabled.store(true, Ordering::Relaxed);
+        recorder.set_retries_linked(true);
         Self { recorder, linker }
     }
 
@@ -443,13 +444,29 @@ impl RetryNotify {
     pub fn retrying(&self, err: &Error, backoff: std::time::Duration) {
         let throttled = err.kind() == ErrorKind::RateLimited;
         let tail_cut = err.message().contains("tail cut");
-        // The trace layer above the retry layer: the operation is the current scope.
+        let scope = self.retried_scope();
+        if let Some(e) = self.recorder.exporter() {
+            // The status of the attempt that failed tells 503 from a network error.
+            let last = scope
+                .as_ref()
+                .and_then(|s| s.with(|d| d.requests.last().map(|r| r.status)));
+            e.on_retry(retry_reason(err, last), backoff);
+        }
+        match scope {
+            Some(s) => s.record_retry_with_cut(backoff, throttled, tail_cut),
+            None => self.recorder.record_unscoped_retry(backoff),
+        }
+    }
+
+    /// The operation a retry notification on this task belongs to: the current scope (the
+    /// trace layer above the retry layer); else the call that just failed on this task (the
+    /// last one parked and not yet retrying, now marked retrying); else the multi-call
+    /// operation whose call failed last.
+    fn retried_scope(&self) -> Option<Arc<OpScope>> {
         if let Some(s) = OpScope::current() {
-            s.record_retry_with_cut(backoff, throttled, tail_cut);
-            return;
+            return Some(s);
         }
         let id = key();
-        // The call that just failed on this task: the last one parked and not yet retrying.
         if let Some(p) = self
             .linker
             .parked()
@@ -457,15 +474,9 @@ impl RetryNotify {
             .and_then(|calls| calls.iter_mut().rev().find(|p| !p.retrying))
         {
             p.retrying = true;
-            p.op.scope
-                .record_retry_with_cut(backoff, throttled, tail_cut);
-            return;
+            return Some(p.op.scope.clone());
         }
-        if let Some(s) = self.linker.take_scope(id) {
-            s.record_retry_with_cut(backoff, throttled, tail_cut);
-            return;
-        }
-        self.recorder.record_unscoped_retry(backoff);
+        self.linker.take_scope(id)
     }
 }
 
@@ -629,6 +640,19 @@ impl Observer {
             }
             self.linker.hold_scope(key(), st.scope.clone());
         }
+    }
+}
+
+/// The reason of a retry after `e` (the status of the last request, when known), as the
+/// exporter labels it: a few values, whatever the error.
+fn retry_reason(e: &Error, last_status: Option<u16>) -> &'static str {
+    match error_class(e, last_status).as_str() {
+        "rate_limited" => "throttled",
+        "server_error" => "server_error",
+        "timeout" => "timeout",
+        "tail_cut" => "tail_cut",
+        "network" => "network",
+        _ => "other",
     }
 }
 

@@ -49,6 +49,10 @@ pub struct VerdictView {
     /// SLA breaches (reported, never an exit code).
     pub sla_breaches: Vec<String>,
     pub warnings: Vec<String>,
+    /// A clean run's one next step (9.4): the same run at four times the concurrency (twice
+    /// the rate of an open loop), to look for the ceiling. `None` when the run found
+    /// something, stopped early, or is a trace.
+    pub ceiling_command: Option<String>,
 }
 
 impl VerdictView {
@@ -71,7 +75,40 @@ impl VerdictView {
                 .map(|p| format!("{} after {:.1} s", p.reason.describe(), p.measured_s)),
             sla_breaches: r.verdict.sla.breaches.clone(),
             warnings: r.warnings.clone(),
+            ceiling_command: ceiling_command(r),
         }
+    }
+}
+
+/// [`VerdictView::ceiling_command`].
+fn ceiling_command(r: &Report) -> Option<String> {
+    if !r.findings.is_empty()
+        || r.run.partial.is_some()
+        || r.is_trace()
+        || r.spec.operator_ref.is_empty()
+        || r.summary.ops == 0
+    {
+        return None;
+    }
+    let mut spec = r.spec.clone();
+    let w = &mut spec.profile.workload;
+    match w.rate {
+        Some(rate) => w.rate = Some(rate * 2.0),
+        None => w.concurrency = (w.concurrency.saturating_mul(4)).clamp(2, 1024),
+    }
+    Some(spec.command())
+}
+
+/// Whether a finding's evidence value says something the others do not (9.4): the share of
+/// time a finding costs is not repeated beside the same share in retry backoff, and a count
+/// of operations that ran out of retries is shown only when some did.
+fn shown(values: &std::collections::BTreeMap<String, f64>, key: &str, v: f64) -> bool {
+    match key {
+        crate::analysis::findings::COST_KEY => values
+            .get("retry_pct")
+            .is_none_or(|pct| (pct / 100.0 - v).abs() > 0.005),
+        "rate_limited_failures_count" => v > 0.0,
+        _ => true,
     }
 }
 
@@ -197,6 +234,7 @@ impl FindingView {
                 .into_iter()
                 .zip(f.evidence.values.keys())
                 .zip(f.evidence.values.values())
+                .filter(|((_, key), v)| shown(&f.evidence.values, key.as_str(), **v))
                 .map(|(((label, value), key), v)| {
                     let (unit, amount) = EvidenceUnit::of(key, *v);
                     EvidenceItem {
@@ -216,6 +254,36 @@ impl FindingView {
             next: f.remedy.next.clone(),
             op_ids: f.evidence.op_ids.clone(),
         }
+    }
+
+    /// What the remedy costs besides what it fixes, when it costs something (9.4): `cache`,
+    /// `tail_cut` or `concurrent_chunks`, the key of [`FindingView::trade_off_text`] (and of
+    /// the app's `tradeoff.*` catalog entries). `prove` measures the cost: requests per
+    /// operation and bytes moved per byte read.
+    pub fn trade_off(&self) -> Option<&'static str> {
+        let p = self.remedy_path.as_deref()?;
+        if p.starts_with("layers.cache") {
+            Some("cache")
+        } else if p.starts_with("layers.tail_cut") {
+            Some("tail_cut")
+        } else if p == "read.concurrent" {
+            Some("concurrent_chunks")
+        } else {
+            None
+        }
+    }
+
+    /// [`FindingView::trade_off`] in words.
+    pub fn trade_off_text(&self) -> Option<&'static str> {
+        Some(match self.trade_off()? {
+            "cache" => {
+                "FoyerLayer caches whole objects: a small range read fetches its whole object once, and a change written by another process is seen only after the entry is evicted"
+            }
+            "tail_cut" => {
+                "each cut request is sent again: more requests per operation, and more bytes when the cut one had started its body"
+            }
+            _ => "each read becomes several range requests: more requests per operation",
+        })
     }
 
     /// `layers.concurrent_limit.http + layers.retry.jitter`, or the remedy in words.
@@ -2709,6 +2777,9 @@ pub struct RetryView {
     pub failed_ops_count: u64,
     /// Failure classes, most frequent first.
     pub classes: Vec<(String, u64)>,
+    /// The trace's retries were not linked (an embedded layer without
+    /// `Handle::retry_notify()`): its retry count is not a count of retries.
+    pub unlinked: bool,
 }
 
 impl RetryView {
@@ -2732,7 +2803,15 @@ impl RetryView {
             network_errors_count: x.network_errors,
             failed_ops_count: x.failed_ops,
             classes,
+            unlinked: x.retry_linking == crate::trace::RetryLinking::Unlinked,
         }
+    }
+
+    /// What an unlinked trace's retry numbers mean, and how to link them; `None` otherwise.
+    pub fn unlinked_note(&self) -> Option<&'static str> {
+        self.unlinked.then_some(
+            "retries were not linked: each attempt is an operation and none is counted as a retry; pass handle.retry_notify() to RetryLayer::with_notify",
+        )
     }
 
     /// The resilience in one line, as the app's Retries section reads it: `12 retries ·
@@ -3682,6 +3761,26 @@ mod tests {
         assert!(!w.line().contains("no multipart"), "{}", w.line());
     }
 
+    /// A finding's evidence says each fact once: a cost share equal to the retry share it
+    /// comes from is not repeated, and no failures from the rate limit is not a value.
+    #[test]
+    fn evidence_says_each_fact_once() {
+        let mut f = crate::model::Finding::default();
+        f.evidence.values = [
+            ("retry_pct".to_owned(), 91.0),
+            (crate::analysis::findings::COST_KEY.to_owned(), 0.91),
+            ("rate_limited_failures_count".to_owned(), 0.0),
+            ("throttled_request_ratio".to_owned(), 0.13),
+        ]
+        .into_iter()
+        .collect();
+        let keys: Vec<String> = FindingView::of(&f).items.into_iter().map(|i| i.key).collect();
+        assert_eq!(keys, ["retry_pct", "throttled_request_ratio"]);
+        f.evidence.values.insert("rate_limited_failures_count".into(), 3.0);
+        f.evidence.values.insert(crate::analysis::findings::COST_KEY.into(), 0.4);
+        assert_eq!(FindingView::of(&f).items.len(), 4);
+    }
+
     #[test]
     fn the_resilience_line_reads_like_the_retries_section() {
         let mut r = crate::report::fixture::report();
@@ -3696,6 +3795,7 @@ mod tests {
         r.resilience.error_classes = [("throttled".to_owned(), 10), ("timeout".to_owned(), 2)]
             .into_iter()
             .collect();
+        assert_eq!(RetryView::of(&r).unlinked_note(), None);
         let l = RetryView::of(&r).line();
         for s in [
             "12 retries",

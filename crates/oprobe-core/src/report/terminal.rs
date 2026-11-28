@@ -569,6 +569,9 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         let line = view.retry.line();
         if view.retry.quiet() { dim(&line) } else { line }
     });
+    if let Some(note) = view.retry.unlinked_note() {
+        let _ = writeln!(out, "  {}", dim(note));
+    }
     // A corrupted object, too many failed operations, a stalled open loop (the run's checks).
     if !r.verdict.sla.breaches.is_empty() {
         kv(
@@ -619,6 +622,11 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
                 .enumerate()
             {
                 let _ = writeln!(out, "    {} {l}", if i == 0 { "→" } else { " " });
+            }
+            if let Some(note) = f.trade_off_text() {
+                for (i, l) in wrap_text(note, WIDTH - 10).iter().enumerate() {
+                    let _ = writeln!(out, "    {} {l}", dim(if i == 0 { "note:" } else { "     " }));
+                }
             }
             if let Some(next) = &f.next {
                 let _ = writeln!(out, "    {} {next}", dim("next:"));

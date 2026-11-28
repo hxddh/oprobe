@@ -1,7 +1,6 @@
 //! OpenTelemetry metrics (feature `otel`), following the HTTP semantic conventions.
 //!
-//! [`OtelExporter`] records every HTTP request the operator issues into two histograms
-//! (seconds):
+//! [`OtelExporter`] records every HTTP request the operator issues:
 //!
 //! - **`http.client.request.duration`** ([`REQUEST_DURATION`]): the standard metric, recorded
 //!   exactly once per request with the whole request's duration and only attributes of the
@@ -12,7 +11,8 @@
 //!   or a sum over it is the number or the time of the requests, as any HTTP dashboard assumes.
 //! - **`oprobe.http.client.request.stage.duration`** ([`REQUEST_STAGE_DURATION`]): where the
 //!   request's time went, once per stage that took time. `oprobe.stage` is one of `queue`,
-//!   `connect`, `send`, `ttfb`, `body`, `stall`; the stages of a request add up to its
+//!   `dns`, `tcp`, `proxy`, `tls` (a new connection's dial, 9.4: one `connect` until 9.3),
+//!   `send`, `ttfb`, `body`, `stall`; the stages of a request add up to its
 //!   duration. Besides `oprobe.stage` it carries `oprobe.api` (`GetObject`, …),
 //!   `http.request.method`, `http.response.status_code` and OpenDAL's own metric labels
 //!   (`opendal-layer-otelmetrics`), so both layers' series join: `scheme`, `namespace` (the
@@ -20,8 +20,15 @@
 //!   (a layer applied to several operators labels each one's requests with its own), and
 //!   `operation` (`read`, `write`, `stat`, …) when the service attached it.
 //!
+//! - **`http.client.request.body.size`** and **`http.client.response.body.size`** (bytes,
+//!   9.4): the standard body-size metrics, with the attributes of the duration metric.
+//! - **`oprobe.http.client.retries`** (counter) and
+//!   **`oprobe.http.client.retry.backoff.duration`** (seconds, 9.4): each retry a
+//!   `RetryLayer` with `Handle::retry_notify()` makes, by `oprobe.retry.reason`: `throttled`
+//!   (429/503), `server_error`, `timeout`, `tail_cut`, `network` or `other`.
+//!
 //! The backend calls of in-process services (`memory`, `fs`) are not HTTP requests and are in
-//! neither; operation durations are OpenDAL's own metrics (`opendal-layer-otelmetrics`).
+//! none of them; operation durations are OpenDAL's own metrics (`opendal-layer-otelmetrics`).
 //!
 //! ```no_run
 //! let meter = opentelemetry::global::meter("my-app");
@@ -32,7 +39,7 @@
 use std::sync::Arc;
 
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Histogram, Meter};
+use opentelemetry::metrics::{Counter, Histogram, Meter};
 
 use crate::record::{Protocol, RequestRecord};
 use crate::recorder::Exporter;
@@ -42,6 +49,18 @@ pub const REQUEST_DURATION: &str = "http.client.request.duration";
 
 /// oprobe's breakdown of a request by stage (`oprobe.stage`).
 pub const REQUEST_STAGE_DURATION: &str = "oprobe.http.client.request.stage.duration";
+
+/// The standard request body size metric (bytes).
+pub const REQUEST_BODY_SIZE: &str = "http.client.request.body.size";
+
+/// The standard response body size metric (bytes).
+pub const RESPONSE_BODY_SIZE: &str = "http.client.response.body.size";
+
+/// Retries, by `oprobe.retry.reason`.
+pub const RETRIES: &str = "oprobe.http.client.retries";
+
+/// The wait before each retry (seconds), by `oprobe.retry.reason`.
+pub const RETRY_BACKOFF_DURATION: &str = "oprobe.http.client.retry.backoff.duration";
 
 /// The bucket boundaries the HTTP semantic conventions advise for request durations.
 const DURATION_BOUNDARIES_S: [f64; 14] = [
@@ -60,6 +79,10 @@ const STAGE_BOUNDARIES_S: [f64; 19] = [
 pub struct OtelExporter {
     duration: Histogram<f64>,
     stage_duration: Histogram<f64>,
+    request_body: Histogram<u64>,
+    response_body: Histogram<u64>,
+    retries: Counter<u64>,
+    retry_backoff: Histogram<f64>,
 }
 
 impl std::fmt::Debug for OtelExporter {
@@ -83,16 +106,40 @@ impl OtelExporter {
                 .with_description("Duration of the stages of HTTP client requests.")
                 .with_boundaries(STAGE_BOUNDARIES_S.to_vec())
                 .build(),
+            request_body: meter
+                .u64_histogram(REQUEST_BODY_SIZE)
+                .with_unit("By")
+                .with_description("Size of HTTP client request bodies.")
+                .build(),
+            response_body: meter
+                .u64_histogram(RESPONSE_BODY_SIZE)
+                .with_unit("By")
+                .with_description("Size of HTTP client response bodies.")
+                .build(),
+            retries: meter
+                .u64_counter(RETRIES)
+                .with_description("Retries of OpenDAL calls, by reason.")
+                .build(),
+            retry_backoff: meter
+                .f64_histogram(RETRY_BACKOFF_DURATION)
+                .with_unit("s")
+                .with_description("Wait before each retry of an OpenDAL call.")
+                .with_boundaries(DURATION_BOUNDARIES_S.to_vec())
+                .build(),
         }
     }
 }
 
-/// The stages of `r` in µs: they add up to the request's duration.
-fn stages(r: &RequestRecord) -> [(&'static str, u64); 6] {
+/// The stages of `r` in µs: they add up to the request's duration. A new connection's dial
+/// is its parts (9.4), as the profile shows them.
+fn stages(r: &RequestRecord) -> [(&'static str, u64); 9] {
     let t = &r.timing;
     [
         ("queue", t.queue_us),
-        ("connect", t.connect_us()),
+        ("dns", t.dns_us),
+        ("tcp", t.tcp_us),
+        ("proxy", t.proxy_us),
+        ("tls", t.tls_us),
         ("send", t.send_us),
         ("ttfb", t.ttfb_us),
         ("body", t.body_us),
@@ -156,6 +203,11 @@ impl Exporter for OtelExporter {
             attrs.push(KeyValue::new("error.type", error));
         }
         self.duration.record(r.timing.total_us as f64 / 1e6, &attrs);
+        // The body sizes, with the same attributes (the semantic conventions' own).
+        self.request_body.record(r.bytes_up, &attrs);
+        if status.is_some() {
+            self.response_body.record(r.bytes_down, &attrs);
+        }
 
         // oprobe's own: the stages, with what tells them apart and OpenDAL's labels.
         let mut attrs = Vec::with_capacity(9);
@@ -186,6 +238,12 @@ impl Exporter for OtelExporter {
             attrs[0] = KeyValue::new("oprobe.stage", stage);
             self.stage_duration.record(us as f64 / 1e6, &attrs);
         }
+    }
+
+    fn on_retry(&self, reason: &'static str, backoff: std::time::Duration) {
+        let attrs = [KeyValue::new("oprobe.retry.reason", reason)];
+        self.retries.add(1, &attrs);
+        self.retry_backoff.record(backoff.as_secs_f64(), &attrs);
     }
 }
 
@@ -263,6 +321,99 @@ mod tests {
         }
     }
 
+    impl Meters {
+        /// An integer metric (a `u64` histogram or counter): its unit, its observations (a
+        /// histogram's count, a counter's sum), its total (a histogram's sum), and every
+        /// attribute with its values.
+        fn integers(&self, name: &str) -> (String, u64, u64, BTreeMap<String, BTreeSet<String>>) {
+            self.exporter.reset();
+            self.provider.force_flush().unwrap();
+            let (mut unit, mut n, mut total, mut attrs) =
+                (String::new(), 0, 0, BTreeMap::<String, BTreeSet<String>>::new());
+            for rm in &self.exporter.get_finished_metrics().unwrap() {
+                for m in rm.scope_metrics().flat_map(|sm| sm.metrics()) {
+                    if m.name() != name {
+                        continue;
+                    }
+                    unit = m.unit().to_owned();
+                    let mut add = |kvs: &mut dyn Iterator<Item = &KeyValue>| {
+                        for kv in kvs {
+                            attrs
+                                .entry(kv.key.to_string())
+                                .or_default()
+                                .insert(kv.value.to_string());
+                        }
+                    };
+                    match m.data() {
+                        AggregatedMetrics::U64(MetricData::Histogram(h)) => {
+                            for p in h.data_points() {
+                                n += p.count();
+                                total += p.sum();
+                                add(&mut p.attributes());
+                            }
+                        }
+                        AggregatedMetrics::U64(MetricData::Sum(c)) => {
+                            for p in c.data_points() {
+                                n += p.value();
+                                add(&mut p.attributes());
+                            }
+                        }
+                        _ => panic!("{name} is not an integer metric"),
+                    }
+                }
+            }
+            (unit, n, total, attrs)
+        }
+    }
+
+    /// The body sizes are recorded per request (bytes, with the duration's attributes), and
+    /// each retry `RetryNotify` hears of is counted by reason with its wait (9.4: neither was
+    /// exported, so an OTel-only user saw no retries at all).
+    #[tokio::test]
+    async fn body_sizes_and_retries_are_exported() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = {
+            let calls = calls.clone();
+            testserver::serve(move |_req| {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { testserver::respond(if n < 2 { 503 } else { 200 }, "hello") }
+            })
+            .await
+        };
+        let meters = Meters::new();
+        let cfg = config(&meters.meter()).https(false).proxy(None);
+        let (layer, handle) = crate::layer(cfg);
+        let op = opendal_core::Operator::new(
+            opendal_service_http::Http::default().endpoint(&format!("http://{}", server.addr)),
+        )
+        .unwrap()
+        .layer(layer)
+        .layer(
+            opendal_layer_retry::RetryLayer::new()
+                .with_min_delay(std::time::Duration::from_millis(1))
+                .with_max_delay(std::time::Duration::from_millis(2))
+                .with_notify(handle.retry_notify()),
+        );
+        assert_eq!(op.read("k").await.unwrap().to_vec(), b"hello");
+
+        let (unit, n, total, attrs) = meters.integers(RESPONSE_BODY_SIZE);
+        assert_eq!(unit, "By");
+        assert_eq!(n, 3, "three responses");
+        assert_eq!(total, 15, "5 bytes each");
+        assert!(attrs.contains_key("http.response.status_code"), "{attrs:?}");
+        let (unit, n, _, _) = meters.integers(REQUEST_BODY_SIZE);
+        assert_eq!((unit.as_str(), n), ("By", 3));
+
+        let (_, retries, _, attrs) = meters.integers(RETRIES);
+        assert_eq!(retries, 2);
+        assert_eq!(
+            attrs.get("oprobe.retry.reason").map(|v| v.iter().cloned().collect::<Vec<_>>()),
+            Some(vec!["throttled".to_owned()]),
+            "a 503 is throttling"
+        );
+        assert_eq!(meters.histogram(RETRY_BACKOFF_DURATION).count, 2);
+    }
+
     fn values<'a>(c: &'a Collected, key: &str) -> Vec<&'a str> {
         c.attributes
             .get(key)
@@ -327,7 +478,9 @@ mod tests {
         // The stages: every request spent time waiting for its response, and none is `total`.
         let stages = meters.histogram(REQUEST_STAGE_DURATION);
         assert!(stages.count >= requests, "{stages:?}");
-        let known = ["queue", "connect", "send", "ttfb", "body", "stall"];
+        let known = [
+            "queue", "dns", "tcp", "proxy", "tls", "send", "ttfb", "body", "stall",
+        ];
         let seen = values(&stages, "oprobe.stage");
         assert!(seen.contains(&"ttfb"), "{stages:?}");
         assert!(seen.iter().all(|s| known.contains(s)), "{stages:?}");

@@ -126,7 +126,7 @@ pub use rows::{FailureCode, ReqDetail, TcpRow, TlsRow};
 pub use snapshot::{
     ApiStats, ByteStats, CacheStats, ClientStats, ColdStartStats, ConnStats, EffectiveKnobs,
     IntegrityStats, LatencyHistogram, OpBreakdown, OpenLoopStats, Phase, Quantiles,
-    RequestStageMeans, ResilienceStats, SelfObservation, SlowOp, Snapshot, StageStats, Summary,
+    RequestStageMeans, ResilienceStats, RetryLinking, SelfObservation, SlowOp, Snapshot, StageStats, Summary,
     TimelinePoint, VerbInterval, VerbStats,
 };
 
@@ -538,6 +538,8 @@ impl Snapshot {
 /// Instrument an operator: `op.layer(layer)`, then `handle.snapshot()` or `handle.save(path)`.
 pub fn layer(cfg: Config) -> (TraceLayer, Handle) {
     let recorder = Recorder::always_on(cfg.max_rows);
+    // Unlinked until `Handle::retry_notify` makes a notifier (the snapshot says which).
+    recorder.set_retries_linked(false);
     if let Some(e) = cfg.exporter {
         recorder.set_exporter(e);
     }
