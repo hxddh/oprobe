@@ -56,14 +56,14 @@ anyhow.workspace = true
 libc.workspace = true
 schemars = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
-opentelemetry = { version = "0.32", default-features = false, features = ["metrics"], optional = true }
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics"], optional = true }
 
 [target."cfg(windows)".dependencies]
 windows-sys.workspace = true
 
 [dev-dependencies]
 opendal-core = { workspace = true, features = ["executors-tokio", "services-memory"] }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "testing"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 # The overhead bench's HTTP line: OpenDAL's `http` service and its default reqwest client.
 opendal-service-http = "0.59"

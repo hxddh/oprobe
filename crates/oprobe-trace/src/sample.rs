@@ -18,7 +18,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
 
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use crate::rows::{OpRow, ReqRow};
 
@@ -244,7 +244,7 @@ impl OpSampler {
         if self.unscoped.len() < cap {
             self.unscoped.push(row);
         } else if cap > 0 {
-            let j = self.rng.gen_range(0..self.unscoped_seen);
+            let j = self.rng.random_range(0..self.unscoped_seen);
             if (j as usize) < cap {
                 self.unscoped[j as usize] = row;
             }
@@ -267,7 +267,7 @@ impl OpSampler {
             self.kept_rows += w.rows();
             s.items.push(w);
         } else {
-            let j = self.rng.gen_range(0..s.seen);
+            let j = self.rng.random_range(0..s.seen);
             if (j as usize) < cap {
                 let old = std::mem::replace(&mut s.items[j as usize], w);
                 self.kept_rows = self.kept_rows + s.items[j as usize].rows() - old.rows();
@@ -297,7 +297,7 @@ impl OpSampler {
             let cap = self.stratum_cap;
             for s in self.strata.values_mut() {
                 while s.items.len() > cap {
-                    let j = self.rng.gen_range(0..s.items.len());
+                    let j = self.rng.random_range(0..s.items.len());
                     let out = s.items.swap_remove(j);
                     self.kept_rows -= out.rows();
                 }

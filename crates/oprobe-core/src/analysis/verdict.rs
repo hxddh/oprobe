@@ -643,7 +643,7 @@ impl AbTest {
 #[cfg(test)]
 mod tests {
     use rand::rngs::SmallRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     use super::*;
 
@@ -902,7 +902,7 @@ mod tests {
         // Proofs that crossed the boundary of each plan, by its planned pairs.
         let mut crossed: std::collections::BTreeMap<usize, u32> = Default::default();
         for _ in 0..proofs {
-            let seed = rng.r#gen::<u64>();
+            let seed = rng.random::<u64>();
             let d: Vec<f64> = (0..MAX_PAIRS).map(|_| normal(&mut rng)).collect();
             let orders: Vec<bool> = (0..MAX_PAIRS as u64)
                 .map(|p| candidate_first(seed, p))
@@ -991,8 +991,8 @@ mod tests {
 
     /// A standard normal draw (Box–Muller).
     fn normal(rng: &mut SmallRng) -> f64 {
-        let u: f64 = rng.gen_range(f64::MIN_POSITIVE..1.0);
-        (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * rng.r#gen::<f64>()).cos()
+        let u: f64 = rng.random_range(f64::MIN_POSITIVE..1.0);
+        (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * rng.random::<f64>()).cos()
     }
 
     /// What a simulated service does to a pair of trials: each trial's objective is
@@ -1026,7 +1026,7 @@ mod tests {
 
         /// One proof as `prove` runs it: the real schedule, the real test, to its stop.
         fn prove(&self, rng: &mut SmallRng, max_pairs: usize) -> AbTest {
-            let seed = rng.r#gen::<u64>();
+            let seed = rng.random::<u64>();
             let mut t = AbTest::new(true, MIN_DECISIVE_PAIRS, max_pairs);
             let mut level = 0.0;
             loop {
@@ -1069,7 +1069,7 @@ mod tests {
             let proofs = 3000;
             let called = (0..proofs)
                 .filter(|_| {
-                    let seed = rng.r#gen::<u64>();
+                    let seed = rng.random::<u64>();
                     let mut t = AbTest::new(true, MIN_DECISIVE_PAIRS, max_pairs);
                     loop {
                         let first = candidate_first(seed, t.pairs() as u64);
@@ -1167,7 +1167,7 @@ mod tests {
                 drift: 0.0,
             };
             let max_pairs = 3 + i % 10;
-            let seed = rng.r#gen::<u64>();
+            let seed = rng.random::<u64>();
             let mut t = AbTest::new(i % 3 != 0, 3, max_pairs);
             for k in 0..max_pairs {
                 let d = t.push(w.pair(&mut rng, candidate_first(seed, k as u64)));

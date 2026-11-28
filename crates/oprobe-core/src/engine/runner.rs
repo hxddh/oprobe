@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use opendal::Operator;
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinSet};
 
@@ -589,7 +589,7 @@ impl Session {
         let total_w = cum.last().map(|c| c.0).unwrap_or(1);
         let cum = Arc::new(cum);
         let pick_kind = move |rng: &mut SmallRng, cum: &Vec<(u32, OpKind)>| -> OpKind {
-            let x = rng.gen_range(0..total_w);
+            let x = rng.random_range(0..total_w);
             cum.iter()
                 .find(|(c, _)| x < *c)
                 .map(|(_, k)| k.clone())
@@ -836,7 +836,7 @@ impl Session {
                     started.fetch_add(1, Ordering::Relaxed);
                     issued += 1;
                     let job = Job::Mix(pick_kind(&mut rng, &cum));
-                    let mut op_rng = SmallRng::seed_from_u64(rng.r#gen());
+                    let mut op_rng = SmallRng::seed_from_u64(rng.random());
                     let lease = slots.take();
                     let ctx = ctx.clone();
                     let rec = recorder.clone();
