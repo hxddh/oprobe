@@ -3774,10 +3774,18 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let keys: Vec<String> = FindingView::of(&f).items.into_iter().map(|i| i.key).collect();
+        let keys: Vec<String> = FindingView::of(&f)
+            .items
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
         assert_eq!(keys, ["retry_pct", "throttled_request_ratio"]);
-        f.evidence.values.insert("rate_limited_failures_count".into(), 3.0);
-        f.evidence.values.insert(crate::analysis::findings::COST_KEY.into(), 0.4);
+        f.evidence
+            .values
+            .insert("rate_limited_failures_count".into(), 3.0);
+        f.evidence
+            .values
+            .insert(crate::analysis::findings::COST_KEY.into(), 0.4);
         assert_eq!(FindingView::of(&f).items.len(), 4);
     }
 

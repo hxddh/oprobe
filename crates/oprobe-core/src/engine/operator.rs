@@ -955,7 +955,9 @@ mod tests {
             stream_bandwidth_kib_s: Some(256),
             ..Default::default()
         };
-        let lab = crate::lab::LabServer::spawn("127.0.0.1:0", faults).await.unwrap();
+        let lab = crate::lab::LabServer::spawn("127.0.0.1:0", faults)
+            .await
+            .unwrap();
         let target = lab.profile("b").operator.target().unwrap();
         let base = base_operator(&target).unwrap();
         admin_operator(&base, &target)
@@ -970,7 +972,10 @@ mod tests {
         use futures::StreamExt;
         assert!(stream.next().await.is_some(), "the body has started");
         let e = op.stat("big").await.unwrap_err();
-        assert!(e.is_temporary() || e.kind() == opendal::ErrorKind::RateLimited, "{e}");
+        assert!(
+            e.is_temporary() || e.kind() == opendal::ErrorKind::RateLimited,
+            "{e}"
+        );
         drop(stream);
     }
 

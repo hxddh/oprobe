@@ -126,8 +126,8 @@ pub use rows::{FailureCode, ReqDetail, TcpRow, TlsRow};
 pub use snapshot::{
     ApiStats, ByteStats, CacheStats, ClientStats, ColdStartStats, ConnStats, EffectiveKnobs,
     IntegrityStats, LatencyHistogram, OpBreakdown, OpenLoopStats, Phase, Quantiles,
-    RequestStageMeans, ResilienceStats, RetryLinking, SelfObservation, SlowOp, Snapshot, StageStats, Summary,
-    TimelinePoint, VerbInterval, VerbStats,
+    RequestStageMeans, ResilienceStats, RetryLinking, SelfObservation, SlowOp, Snapshot,
+    StageStats, Summary, TimelinePoint, VerbInterval, VerbStats,
 };
 
 internal_use!(file::{ServiceRecord, TRACE_FORMAT, TRACE_FORMATS_READ, TraceFile});

@@ -625,7 +625,11 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             }
             if let Some(note) = f.trade_off_text() {
                 for (i, l) in wrap_text(note, WIDTH - 10).iter().enumerate() {
-                    let _ = writeln!(out, "    {} {l}", dim(if i == 0 { "note:" } else { "     " }));
+                    let _ = writeln!(
+                        out,
+                        "    {} {l}",
+                        dim(if i == 0 { "note:" } else { "     " })
+                    );
                 }
             }
             if let Some(next) = &f.next {

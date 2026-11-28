@@ -787,7 +787,10 @@ fn retries(m: &ProfileModel, cx: Ctx) -> View {
         )
         .child(prop(tr("retry.retries"), n(r.retries_count)))
         // An embedded trace without `retry_notify`: its retry count is not one.
-        .child(r.unlinked.then(|| prop(tr("retry.unlinked"), tr("retry.unlinked_note"))))
+        .child(
+            r.unlinked
+                .then(|| prop(tr("retry.unlinked"), tr("retry.unlinked_note"))),
+        )
         .child((r.tail_cuts_count > 0).then(|| prop(tr("retry.tail_cuts"), n(r.tail_cuts_count))))
         .child(prop(tr("retry.backoff"), fmt::dur_ms(r.backoff_ms)))
         .child(prop(

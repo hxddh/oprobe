@@ -328,8 +328,12 @@ mod tests {
         fn integers(&self, name: &str) -> (String, u64, u64, BTreeMap<String, BTreeSet<String>>) {
             self.exporter.reset();
             self.provider.force_flush().unwrap();
-            let (mut unit, mut n, mut total, mut attrs) =
-                (String::new(), 0, 0, BTreeMap::<String, BTreeSet<String>>::new());
+            let (mut unit, mut n, mut total, mut attrs) = (
+                String::new(),
+                0,
+                0,
+                BTreeMap::<String, BTreeSet<String>>::new(),
+            );
             for rm in &self.exporter.get_finished_metrics().unwrap() {
                 for m in rm.scope_metrics().flat_map(|sm| sm.metrics()) {
                     if m.name() != name {
@@ -407,7 +411,9 @@ mod tests {
         let (_, retries, _, attrs) = meters.integers(RETRIES);
         assert_eq!(retries, 2);
         assert_eq!(
-            attrs.get("oprobe.retry.reason").map(|v| v.iter().cloned().collect::<Vec<_>>()),
+            attrs
+                .get("oprobe.retry.reason")
+                .map(|v| v.iter().cloned().collect::<Vec<_>>()),
             Some(vec!["throttled".to_owned()]),
             "a 503 is throttling"
         );

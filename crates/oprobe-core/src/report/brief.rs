@@ -178,14 +178,22 @@ mod tests {
         r.findings.clear();
         r.run.partial = None;
         r.summary.ops = 1000;
-        r.spec = crate::model::RunSpec::new(&crate::config::Profile::from_url("memory://"), "memory://");
+        r.spec =
+            crate::model::RunSpec::new(&crate::config::Profile::from_url("memory://"), "memory://");
         r.spec.profile.workload.concurrency = 8;
         let out = render_width(&r, 100);
         assert!(out.contains("no layer to add at this load"), "{out}");
         let next = out.lines().find(|l| l.contains("next:")).unwrap();
-        assert!(next.contains("oprobe run memory://") && next.contains("-c 32"), "{next}");
+        assert!(
+            next.contains("oprobe run memory://") && next.contains("-c 32"),
+            "{next}"
+        );
         r.spec.profile.workload.rate = Some(500.0);
-        let next = render_width(&r, 100).lines().find(|l| l.contains("next:")).map(str::to_owned).unwrap();
+        let next = render_width(&r, 100)
+            .lines()
+            .find(|l| l.contains("next:"))
+            .map(str::to_owned)
+            .unwrap();
         assert!(next.contains("--rate 1000"), "{next}");
         // A finding: its own next step, no ceiling line.
         r.findings.push(Finding::default());

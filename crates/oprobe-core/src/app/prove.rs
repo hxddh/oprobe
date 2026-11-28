@@ -2217,13 +2217,25 @@ fn secondary(
     // that fetches whole objects for small ranges transfers more bytes.
     v.push(positive(
         "requests_per_op",
-        |t| if t.ops_count == 0 { 0.0 } else { t.requests_count as f64 / t.ops_count as f64 },
+        |t| {
+            if t.ops_count == 0 {
+                0.0
+            } else {
+                t.requests_count as f64 / t.ops_count as f64
+            }
+        },
         0.0,
     ));
     if a.iter().chain(b).all(|t| t.logical_bytes > 0) {
         v.push(positive(
             "backend_bytes_per_logical_byte",
-            |t| if t.logical_bytes == 0 { 0.0 } else { t.backend_bytes as f64 / t.logical_bytes as f64 },
+            |t| {
+                if t.logical_bytes == 0 {
+                    0.0
+                } else {
+                    t.backend_bytes as f64 / t.logical_bytes as f64
+                }
+            },
             0.0,
         ));
     }
@@ -3026,7 +3038,10 @@ mod tests {
         let old = [trial(300.0, 50.0, true)];
         let old: Vec<&ProveTrial> = old.iter().collect();
         let sec = secondary(ProveObjective::P99, &old, &old, &[false]);
-        assert!(sec.iter().all(|x| x.metric != "backend_bytes_per_logical_byte"));
+        assert!(
+            sec.iter()
+                .all(|x| x.metric != "backend_bytes_per_logical_byte")
+        );
     }
 
     /// S7: a value best at its start (a 20 ms retry backoff) was sized 20 → 40 → 28 → 33 ms,
