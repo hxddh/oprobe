@@ -161,6 +161,21 @@ impl OpSampler {
         }
     }
 
+    /// About how many bytes the kept rows take as JSON (a save reserves room for them
+    /// before it takes them).
+    pub fn json_len(&self) -> u64 {
+        let whole = |w: &WholeOp| crate::file::json_len(&w.op) + crate::file::json_len(&w.reqs);
+        self.always.iter().map(whole).sum::<u64>()
+            + self.slow.iter().map(|Reverse(Slow(w))| whole(w)).sum::<u64>()
+            + self
+                .strata
+                .values()
+                .flat_map(|s| s.items.iter())
+                .map(whole)
+                .sum::<u64>()
+            + crate::file::json_len(&self.unscoped)
+    }
+
     pub fn config(&self) -> SampleConfig {
         self.cfg
     }

@@ -230,6 +230,13 @@ fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '%' | '~' | '+')
 }
 
+/// Whether `name` holds a percent-encoded `/` (`%2F`, `%2f`).
+fn has_encoded_slash(name: &str) -> bool {
+    name.as_bytes()
+        .windows(3)
+        .any(|w| w[0] == b'%' && w[1] == b'2' && w[2].eq_ignore_ascii_case(&b'f'))
+}
+
 /// Where the name that ends at `end` starts (not before `floor`).
 fn name_start(s: &str, floor: usize, end: usize) -> usize {
     s[floor..end]
@@ -403,7 +410,10 @@ fn strip_parameters(s: &str, depth: u8) -> Option<String> {
         // A `name=value` segment of a path (`s3://b/dt=2026-11-27/session_id=abc/part-0.parquet`,
         // a Hive partition) names a place, and its value runs on into the rest of the key: it
         // is no parameter. A parameter list starts at `?`, `#`, a space or a quote, never `/`.
-        if lead.is_none() && s[..start].ends_with('/') {
+        // An object path quoted as one segment encodes its slashes (GCS:
+        // `/o/dt=2026-01-01%2Fsession_id=abc`): a "name" with `%2F` in it runs across a slash,
+        // so it is a path too.
+        if lead.is_none() && (s[..start].ends_with('/') || has_encoded_slash(&s[start..eq])) {
             continue;
         }
         if lead.is_none() && !list.contains('&') {
@@ -596,9 +606,19 @@ mod tests {
             "s3://bucket/t/upload_id=u-17/token=x/part-1.parquet",
             "dt=2026-11-27/session_id=abc123/part-0.parquet not found",
             "read gs://b/warehouse/tbl/session_token=9/f.orc: NotFound",
+            // A GCS object name is one path segment, its slashes encoded (9.3.4 redacted
+            // `session_id`'s value and the query after it).
+            "GET /b/o/dt=2026-01-01%2Fsession_id=abc HTTP/1.1",
+            "https://storage.googleapis.com/storage/v1/b/b/o/dt=1%2fsession_id=abc?alt=media",
         ] {
             assert_eq!(strip_url_credentials(path), path);
         }
+        assert_eq!(
+            strip_url_credentials(
+                "https://storage.googleapis.com/storage/v1/b/b/o/dt=1%2Fsession_id=abc?alt=media&access_token=T"
+            ),
+            "https://storage.googleapis.com/storage/v1/b/b/o/dt=1%2Fsession_id=abc?alt=media"
+        );
         assert_eq!(
             strip_url_credentials(
                 "https://h/b/session_id=abc/part-0.parquet?partNumber=2&X-Amz-Signature=ab"

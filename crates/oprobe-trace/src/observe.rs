@@ -136,11 +136,24 @@ struct ReadGroup {
     error: Option<Error>,
     /// A read of the group was dropped before it returned (a timeout, the application).
     cancelled: bool,
+    /// The last read failed temporarily with a [`RetryNotify`] installed: the scope's retry
+    /// count then. A notification raises it, and the retry layer's next attempt (after a
+    /// backoff far longer than [`READ_COALESCE_IDLE`]) resumes this group.
+    retry_mark: Option<u64>,
 }
 
 impl ReadGroup {
+    /// A retry notification followed the group's failed read, and its retry has not come yet
+    /// (nor gone stale).
+    fn awaiting_retry(&self) -> bool {
+        self.active == 0
+            && self.retry_mark.is_some_and(|m| self.st.scope.with(|d| d.retries) > m)
+            && self.last_end.is_none_or(|t| t.elapsed() <= STALE_RETRY)
+    }
+
     /// Complete the group's operation, as cancelled when one of its reads was dropped.
     fn finish(self, obs: &Observer) {
+        obs.linker.forget_scope(&self.st.scope);
         let end = self.last_end.unwrap_or_else(Instant::now);
         if self.cancelled {
             complete(&obs.recorder, self.st, end, Some("cancelled".into()));
@@ -181,10 +194,16 @@ struct ReadSlot {
 }
 
 impl ReadSlot {
-    fn flush_idle(&self) {
+    /// Complete the group when no read of it is in flight. A group whose retry is pending stays
+    /// (a snapshot between a failed attempt and its retry must not split them), unless `force`
+    /// (the reader is gone: no retry can come).
+    fn flush_idle(&self, force: bool) {
         let done = {
             let mut g = self.group.lock().unwrap_or_else(|e| e.into_inner());
-            if g.as_ref().is_some_and(|x| x.active == 0) {
+            if g
+                .as_ref()
+                .is_some_and(|x| x.active == 0 && (force || !x.awaiting_retry()))
+            {
                 g.take()
             } else {
                 None
@@ -317,7 +336,7 @@ impl Linker {
             live
         };
         for s in slots {
-            s.flush_idle();
+            s.flush_idle(false);
         }
         if !self.enabled() {
             return;
@@ -947,19 +966,25 @@ impl oio::Read for OpReader {
         let (flushed, scope) = {
             let mut g = slot.group.lock().unwrap_or_else(|e| e.into_inner());
             let mut flushed = None;
-            let reuse = g.as_ref().is_some_and(|x| {
-                x.active > 0
-                    || x.last_end
-                        .is_some_and(|t| t.elapsed() <= READ_COALESCE_IDLE)
-            });
+            // The retry layer's next attempt of a failed read: the same call, not another one.
+            let retry = g.as_ref().is_some_and(ReadGroup::awaiting_retry);
+            let reuse = retry
+                || g.as_ref().is_some_and(|x| {
+                    x.active > 0
+                        || x.last_end
+                            .is_some_and(|t| t.elapsed() <= READ_COALESCE_IDLE)
+                });
             if !reuse {
                 flushed = g.take();
             }
             if let Some(x) = g.as_mut() {
                 x.active += 1;
-                x.calls += 1;
-                if verb == "read.range" || x.calls > 1 {
-                    x.st.verb = "read.range";
+                x.retry_mark = None;
+                if !retry {
+                    x.calls += 1;
+                    if verb == "read.range" || x.calls > 1 {
+                        x.st.verb = "read.range";
+                    }
                 }
                 (flushed, Some(x.st.scope.clone()))
             } else if let Some(st) = self.obs.start(verb, &self.path) {
@@ -971,6 +996,7 @@ impl oio::Read for OpReader {
                     last_end: None,
                     error: None,
                     cancelled: false,
+                    retry_mark: None,
                 });
                 (flushed, Some(sc))
             } else {
@@ -1003,8 +1029,12 @@ impl oio::Read for OpReader {
                         x.error = None;
                     }
                     Err(e) => {
-                        if x.calls > 1 {
-                            self.obs.failed_call(&x.st, e);
+                        // Whatever the call count: 9.3.4 linked only the failures of a group's
+                        // later calls, so a first read that failed and was retried after a
+                        // backoff became two operations, one of them failed.
+                        self.obs.failed_call(&x.st, e);
+                        if e.is_temporary() && self.obs.linker.enabled() {
+                            x.retry_mark = Some(x.st.scope.with(|d| d.retries));
                         }
                         x.error = Some(Error::new(e.kind(), e.message().to_owned()));
                         if e.is_temporary()
@@ -1023,7 +1053,7 @@ impl oio::Read for OpReader {
 impl Drop for OpReader {
     fn drop(&mut self) {
         if let Some(slot) = self.slot.get() {
-            slot.flush_idle();
+            slot.flush_idle(true);
         }
     }
 }
@@ -1385,6 +1415,79 @@ mod tests {
         assert_eq!(s.summary.failed_ops, 1);
         assert_eq!(s.resilience.error_classes.get("cancelled"), Some(&1));
         assert_eq!(s.summary.inflight_ops, 0);
+    }
+
+    /// A read whose first attempt fails and is retried after a backoff (OpenDAL's default
+    /// starts at 1 s, far past the 5 ms that coalesces a reader's reads) is one operation,
+    /// also with a snapshot taken during the backoff. 9.3.4 linked only the failures of a
+    /// group's later reads: this was 2 operations, 1 of them failed, and an unscoped retry.
+    #[tokio::test]
+    async fn a_read_retried_after_its_first_attempt_failed_is_one_operation() {
+        struct FailOnce(std::sync::atomic::AtomicUsize);
+        impl oio::Read for FailOnce {
+            async fn open(&self, _: BytesRange) -> Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+                Err(Error::new(ErrorKind::Unsupported, "no streams"))
+            }
+            async fn read(&self, _: BytesRange) -> Result<(RpRead, Buffer)> {
+                if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Err(Error::new(ErrorKind::Unexpected, "reset").set_temporary())
+                } else {
+                    Ok((RpRead::default(), Buffer::from(vec![0u8; 10])))
+                }
+            }
+        }
+        let (rec, obs, notify) = linked();
+        let reader = OpReader {
+            inner: Box::new(FailOnce(Default::default())),
+            obs: obs.clone(),
+            path: "a/b".into(),
+            slot: std::sync::OnceLock::new(),
+        };
+        let first = oio::Read::read(&reader, BytesRange::new(0, None)).await;
+        assert!(first.is_err());
+        notify.retrying(&first.unwrap_err(), std::time::Duration::from_millis(30));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        // A snapshot during the backoff neither completes nor splits the read.
+        obs.linker.flush(&rec);
+        assert_eq!(rec.snapshot().summary.ops, 0);
+        let second = oio::Read::read(&reader, BytesRange::new(0, None)).await;
+        assert!(second.is_ok());
+        drop(reader);
+        let s = rec.snapshot();
+        assert_eq!(s.summary.ops, 1, "{:?}", s.summary);
+        assert_eq!(s.summary.failed_ops, 0);
+        assert_eq!(s.resilience.retries, 1);
+        assert_eq!(s.verbs.len(), 1);
+        assert_eq!(s.verbs[0].verb, "read.full", "a retry is no second range");
+        assert_eq!(s.verbs[0].retries, 1);
+
+        // Retries exhausted (no notification after the last failure): one failed operation.
+        struct Fail;
+        impl oio::Read for Fail {
+            async fn open(&self, _: BytesRange) -> Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+                Err(Error::new(ErrorKind::Unsupported, "no streams"))
+            }
+            async fn read(&self, _: BytesRange) -> Result<(RpRead, Buffer)> {
+                Err(Error::new(ErrorKind::Unexpected, "reset").set_temporary())
+            }
+        }
+        let (rec, obs, notify) = linked();
+        let reader = OpReader {
+            inner: Box::new(Fail),
+            obs: obs.clone(),
+            path: "a/b".into(),
+            slot: std::sync::OnceLock::new(),
+        };
+        let e = oio::Read::read(&reader, BytesRange::new(0, Some(10))).await.unwrap_err();
+        notify.retrying(&e, std::time::Duration::from_millis(10));
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        assert!(oio::Read::read(&reader, BytesRange::new(0, Some(10))).await.is_err());
+        drop(reader);
+        obs.linker.flush(&rec);
+        let s = rec.snapshot();
+        assert_eq!(s.summary.ops, 1, "{:?}", s.summary);
+        assert_eq!(s.summary.failed_ops, 1);
+        assert_eq!(s.resilience.retries, 1);
     }
 
     /// T6: operations that leave a retry scope behind never fill the map. 9.3.3 kept the

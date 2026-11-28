@@ -106,6 +106,23 @@ struct RowsRef<'a> {
     sampling: &'a SamplingStats,
 }
 
+/// The serialized size of `value`, without keeping it.
+pub(crate) fn json_len<T: Serialize + ?Sized>(value: &T) -> u64 {
+    struct Count(u64);
+    impl Write for Count {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0 += b.len() as u64;
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Count(0);
+    let _ = serde_json::to_writer(&mut c, value);
+    c.0
+}
+
 /// Write `snapshot` (and, when given, the sampled rows) to `path`, atomically: the file is
 /// written next to `path` and renamed into place.
 pub(crate) fn write(
@@ -130,6 +147,13 @@ pub(crate) struct Pending {
 
 impl Pending {
     pub(crate) fn create(path: &Path) -> io::Result<Self> {
+        // The rename at the end would fail on a directory, after the rows were taken (9.3.4).
+        if path.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                format!("{} is a directory", path.display()),
+            ));
+        }
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut tmp = path.as_os_str().to_owned();
@@ -144,6 +168,35 @@ impl Pending {
             tmp,
             file: Some(file),
         })
+    }
+
+    /// Allocate `bytes` for the file now, before anything is taken from the recorder: a disk
+    /// without room for the save fails here, with the rows and the window still in memory
+    /// (9.3.4 found out while writing, after `save_and_reset` had reset the window). The file
+    /// is cut to its real length when it is finished. Where the file system cannot allocate
+    /// ahead, nothing is reserved.
+    pub(crate) fn reserve(&mut self, bytes: u64) -> io::Result<()> {
+        let file = self.file.as_ref().expect("not finished");
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let len = libc::off_t::try_from(bytes).unwrap_or(libc::off_t::MAX);
+            // SAFETY: a valid open file descriptor, a non-negative range.
+            match unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) } {
+                0 => Ok(()),
+                libc::EINVAL | libc::EOPNOTSUPP => Ok(()),
+                e => Err(io::Error::from_raw_os_error(e)),
+            }
+        }
+        #[cfg(windows)]
+        {
+            file.set_len(bytes)
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            let _ = (file, bytes);
+            Ok(())
+        }
     }
 
     pub(crate) fn finish(
@@ -169,7 +222,11 @@ impl Pending {
         let mut w = BufWriter::new(file);
         serde_json::to_writer(&mut w, &doc).map_err(io::Error::other)?;
         w.write_all(b"\n")?;
-        w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        let mut file = w.into_inner().map_err(|e| e.into_error())?;
+        // What [`Pending::reserve`] allocated beyond the document goes.
+        let len = io::Seek::stream_position(&mut file)?;
+        file.set_len(len)?;
+        file.sync_all()?;
         std::fs::rename(&self.tmp, &self.path)?;
         self.tmp = std::path::PathBuf::new();
         Ok(())

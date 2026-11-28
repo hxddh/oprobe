@@ -114,6 +114,11 @@ impl TraceLog {
         self.sampler.offer_unscoped(row);
     }
 
+    /// About how many bytes the kept rows take as JSON.
+    pub fn json_len(&self) -> u64 {
+        self.sampler.json_len()
+    }
+
     /// Rows kept now.
     pub fn len(&self) -> usize {
         self.sampler.kept_rows()

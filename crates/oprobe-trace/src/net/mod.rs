@@ -88,7 +88,8 @@ pub(crate) fn range_len(v: &str) -> Option<u64> {
         (true, false) => b.parse().ok(),
         (false, false) => {
             let (a, b): (u64, u64) = (a.parse().ok()?, b.parse().ok()?);
-            b.checked_sub(a).map(|d| d + 1)
+            // `bytes=0-18446744073709551615` is the whole u64 range: its length does not fit.
+            b.checked_sub(a).and_then(|d| d.checked_add(1))
         }
         _ => None,
     }
@@ -106,6 +107,9 @@ mod tests {
         assert_eq!(range_len("bytes=100-"), None);
         assert_eq!(range_len("bytes=0-1,5-9"), None);
         assert_eq!(range_len("bytes=9-0"), None);
+        // 9.3.4 overflowed `end + 1` (a panic in debug builds, a length of 0 in release).
+        assert_eq!(range_len("bytes=0-18446744073709551615"), None);
+        assert_eq!(range_len("bytes=1-18446744073709551615"), Some(u64::MAX));
         assert_eq!(range_len("items=0-9"), None);
     }
 
