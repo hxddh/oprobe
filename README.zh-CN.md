@@ -100,7 +100,7 @@ version = "auto"                # auto | h1 | h2
 
 ```toml
 [dependencies]
-oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.5" }   # 尚未发布到 crates.io
+oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.4.0" }   # 尚未发布到 crates.io
 ```
 
 ```rust
@@ -136,7 +136,7 @@ oprobe prove last --with layers.retry.max_times=5 --max-duration 5m -o json > pr
 | macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh`（`-s -- --cli` 只装命令行，不含应用） |
 | Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` 或 `.msi` |
 | Debian / Ubuntu、Fedora / RHEL | 发布页上的 `.deb` / `.rpm` |
-| Rust（从源码） | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.5 oprobe`（`--no-default-features --features cli` 只装命令行；Linux 上 `--features gui` 启用原生窗口） |
+| Rust（从源码） | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.4.0 oprobe`（`--no-default-features --features cli` 只装命令行；Linux 上 `--features gui` 启用原生窗口） |
 
 macOS 和 Windows 安装包**没有代码签名**：首次打开需要确认一次（[方法](docs/install.md#first-open-of-unsigned-packages)）。每个文件在 `SHA256SUMS` 中都有 SHA-256，并带有 SLSA 构建来源证明；安装脚本会校验 SHA-256，并在 GitHub CLI 已登录时校验来源证明（[校验方法](docs/install.md#verifying-a-download)）。
 

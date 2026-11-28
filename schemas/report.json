@@ -2470,6 +2470,10 @@
           "format": "double",
           "type": "number"
         },
+        "retry_linking": {
+          "$ref": "#/$defs/RetryLinking",
+          "description": "Whether the attempts of a retried call were linked into one operation (9.4). Absent\nwhen it is not known: oprobe's own runs, and files written before 9.4."
+        },
         "server_errors_count": {
           "format": "uint64",
           "minimum": 0,
@@ -2548,6 +2552,26 @@
         "factor"
       ],
       "type": "object"
+    },
+    "RetryLinking": {
+      "description": "Whether retries were linked ([`ResilienceStats::retry_linking`]).",
+      "oneOf": [
+        {
+          "const": "unknown",
+          "description": "Not known (not serialized).",
+          "type": "string"
+        },
+        {
+          "const": "linked",
+          "description": "A `RetryNotify` was installed: the attempts of a retried call are one operation, and\n`retries_count` counts the retries.",
+          "type": "string"
+        },
+        {
+          "const": "unlinked",
+          "description": "An embedded layer without `Handle::retry_notify()`: each attempt is an operation of\nits own (a retried failure is a failed operation), and `retries_count` stays 0\nwhatever was retried.",
+          "type": "string"
+        }
+      ]
     },
     "RunInfo": {
       "description": "Identity and context of the run.",

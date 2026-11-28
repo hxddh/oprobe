@@ -341,6 +341,12 @@
     "ProveTrial": {
       "description": "One trial run of a prove (an event as it finishes, and a row of the result).",
       "properties": {
+        "backend_bytes": {
+          "description": "Bytes the service sent and received in request and response bodies (9.4; absent in\nearlier results): what a remedy costs in transfer, against `logical_bytes`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "error_ratio": {
           "description": "Operations that failed for reasons other than throttling, per operation.",
           "format": "double",
@@ -356,6 +362,12 @@
         },
         "kind": {
           "$ref": "#/$defs/TrialKind"
+        },
+        "logical_bytes": {
+          "description": "Bytes the application read and wrote (9.4; absent in earlier results).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "ops_count": {
           "format": "uint64",
