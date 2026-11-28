@@ -1980,6 +1980,23 @@ fn paired(trials: &[ProveTrial], kind: TrialKind, pairs: u64) -> Vec<&ProveTrial
         .collect()
 }
 
+/// The order each of the first `pairs` complete pairs ran in (the candidate first), aligned
+/// with [`paired`]: the trials are stored as they ran.
+fn pair_orders(trials: &[ProveTrial], pairs: u64) -> Vec<bool> {
+    let position = |kind: TrialKind, pair: u64| {
+        trials
+            .iter()
+            .position(|t| t.kind == kind && t.pair == Some(pair))
+    };
+    paired(trials, TrialKind::Baseline, pairs)
+        .iter()
+        .filter_map(|a| {
+            let pair = a.pair?;
+            Some(position(TrialKind::Candidate, pair)? < position(TrialKind::Baseline, pair)?)
+        })
+        .collect()
+}
+
 /// Whether a share of the changed operator's (`kb` events in `nb`) is the change's own doing:
 /// over `limit`, more than the current operator's (`ka` in `na`) by more than `limit` allows,
 /// and beyond chance (a one-sided two-proportion test, z > 2). `(current, changed)` shares
@@ -2138,7 +2155,14 @@ pub struct Converged {
 /// (K3-5): its own paired noise floor ([`noise_floor_of_pairs`]) over its own resolution
 /// (a count's, or a p99's order-statistic spread). 9.2 gave every metric the objective's
 /// floor: a goodput steady at 300/s printed "[−17 %, +20 %]" beside a noisy p99.
-fn secondary(obj: ProveObjective, a: &[&ProveTrial], b: &[&ProveTrial]) -> Vec<SecondaryMetric> {
+///
+/// `candidate_first[i]` is the order pair `i` ran in (`a[i]`, `b[i]`).
+fn secondary(
+    obj: ProveObjective,
+    a: &[&ProveTrial],
+    b: &[&ProveTrial],
+    candidate_first: &[bool],
+) -> Vec<SecondaryMetric> {
     let mut v = Vec::new();
     let positive = |metric: &str, f: fn(&ProveTrial) -> f64, resolution: f64| {
         let values = |ts: &[&ProveTrial]| ts.iter().map(|t| f(t)).collect::<Vec<_>>();
@@ -2147,7 +2171,12 @@ fn secondary(obj: ProveObjective, a: &[&ProveTrial], b: &[&ProveTrial]) -> Vec<S
             metric: metric.to_owned(),
             baseline: mean(a, f),
             candidate: mean(b, f),
-            change: log_ratio(&va, &vb, true, noise_floor_of_pairs(&va, &vb, resolution)),
+            change: log_ratio(
+                &va,
+                &vb,
+                true,
+                noise_floor_of_pairs(&va, &vb, candidate_first, resolution),
+            ),
         }
     };
     match obj {
@@ -2792,7 +2821,7 @@ async fn prove_run(
     notes.extend(throttle_note);
     let (verdict, error_note) = error_gate(verdict, &a_ran, &b_ran, t.limits.max_error);
     notes.extend(error_note);
-    let secondary = secondary(obj, &a_trials, &b_trials);
+    let secondary = secondary(obj, &a_trials, &b_trials, &pair_orders(&t.out, pairs));
     let base_spec: &OperatorSpec = &run.report.spec.profile.operator;
     // What the result shows and stores: the operator as its file gives it (a relative
     // `http.ca_cert` stays relative, not this machine's absolute path).
@@ -3409,7 +3438,7 @@ mod tests {
         let a = paired(&trials, TrialKind::Baseline, 2);
         let b = paired(&trials, TrialKind::Candidate, 2);
         assert_eq!((a.len(), b.len()), (2, 2));
-        let sec = secondary(ProveObjective::Goodput, &a, &b);
+        let sec = secondary(ProveObjective::Goodput, &a, &b, &pair_orders(&trials, 2));
         let thr = sec
             .iter()
             .find(|m| m.metric == "throttled_request_ratio")
@@ -3670,6 +3699,47 @@ mod tests {
         assert!(free.cool_off(&cancel).await.is_err());
     }
 
+    /// A secondary metric's noise floor reads the order each pair ran in, from the trials as
+    /// stored. 9.3.4 took every pair as run baseline first: an order effect (the second
+    /// trial of a pair running 20 % faster, whichever it was) read as noise.
+    #[test]
+    fn secondary_metrics_read_the_order_pairs_ran_in() {
+        use TrialKind::{Baseline, Candidate};
+        let mk = |kind, pair: u64, p99: f64| ProveTrial {
+            kind,
+            pair: Some(pair),
+            ops_count: 600,
+            ..trial(300.0, p99, true)
+        };
+        // AB, BA, AB, BA: the second trial of each pair is 20 % faster.
+        let trials = vec![
+            mk(Baseline, 0, 100.0),
+            mk(Candidate, 0, 80.0),
+            mk(Candidate, 1, 100.0),
+            mk(Baseline, 1, 80.0),
+            mk(Baseline, 2, 100.0),
+            mk(Candidate, 2, 80.0),
+            mk(Candidate, 3, 100.0),
+            mk(Baseline, 3, 80.0),
+        ];
+        let orders = pair_orders(&trials, 4);
+        assert_eq!(orders, vec![false, true, false, true]);
+        let p99 = |kind| {
+            paired(&trials, kind, 4)
+                .iter()
+                .map(|t| t.p99_ms)
+                .collect::<Vec<_>>()
+        };
+        let (a, b) = (p99(Baseline), p99(Candidate));
+        let floor = noise_floor_of_pairs(&a, &b, &orders, 0.0);
+        let one_order = noise_floor_of_pairs(&a, &b, &[false; 4], 0.0);
+        assert!(
+            floor < 0.05,
+            "within one order the ratios do not move (the minimum): {floor}"
+        );
+        assert!(one_order > 0.2, "{one_order}");
+    }
+
     /// K3-5: on a p99 proof whose p99 moved a lot between trials, a goodput steady at 300/s
     /// printed "[−17 %, +20 %]": the objective's noise floor on another metric.
     #[test]
@@ -3696,8 +3766,9 @@ mod tests {
         let (a, b): (Vec<&ProveTrial>, Vec<&ProveTrial>) = (a.iter().collect(), b.iter().collect());
         // The objective's floor is many times the goodput's.
         let p99 = |ts: &[&ProveTrial]| ts.iter().map(|t| t.p99_ms).collect::<Vec<_>>();
-        assert!(noise_floor_of_pairs(&p99(&a), &p99(&b), 0.0) > 0.05);
-        let sec = secondary(ProveObjective::P99, &a, &b);
+        let orders = [false, true, true, false];
+        assert!(noise_floor_of_pairs(&p99(&a), &p99(&b), &orders, 0.0) > 0.05);
+        let sec = secondary(ProveObjective::P99, &a, &b, &orders);
         let goodput = sec
             .iter()
             .find(|m| m.metric == "goodput_ops_per_s")
@@ -3711,7 +3782,7 @@ mod tests {
         // pairs' ratios are steady (every candidate ≈ 96 % faster) although each arm swings
         // by half: paired, the interval is narrow, and still wider than the goodput's (on the
         // log ratio: near −96 % the relative scale compresses every width).
-        let sec = secondary(ProveObjective::Goodput, &a, &b);
+        let sec = secondary(ProveObjective::Goodput, &a, &b, &orders);
         let p99 = sec.iter().find(|m| m.metric == "p99_ms").unwrap();
         let width = |i: &Interval| i.high.ln_1p() - i.low.ln_1p();
         assert!(

@@ -463,13 +463,24 @@ impl Handle {
     /// successive saves hold the rows recorded since the previous one; the aggregates are
     /// cumulative. Open the file with `oprobe show FILE` or in the workbench.
     ///
-    /// A path that cannot be written (a missing directory, no permission) fails before
-    /// anything is taken: the rows stay for the next save.
+    /// A path that cannot be written (a missing directory, a directory, no permission) or a
+    /// disk without room for the file fails before anything is taken: the rows stay for the
+    /// next save. The room is reserved first, so once the rows are taken only an I/O error of
+    /// the disk itself can still fail the save.
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        let pending = file::Pending::create(path.as_ref())?;
+        let pending = self.prepare_save(path.as_ref())?;
         let snapshot = self.snapshot();
         let rows = self.recorder.take_trace();
         pending.finish(self.service.get(), &snapshot, Some(&rows))
+    }
+
+    /// The file a save writes, with room reserved for what it will hold (an estimate from
+    /// now, with a margin for what is recorded until the save takes it).
+    fn prepare_save(&self, path: &Path) -> std::io::Result<file::Pending> {
+        let mut pending = file::Pending::create(path)?;
+        let now = file::json_len(&self.recorder.snapshot()) + self.recorder.trace_json_len();
+        pending.reserve(now + now / 4 + (1 << 20))?;
+        Ok(pending)
     }
 
     /// [`Handle::save`], then start a fresh window: the aggregates start again from zero, so
@@ -483,10 +494,11 @@ impl Handle {
     /// # Ok(()) }
     /// ```
     ///
-    /// A path that cannot be written (a missing directory, no permission) fails before the
-    /// reset: the window goes on, and the next save holds it.
+    /// A path that cannot be written (a missing directory, a directory, no permission) or a
+    /// disk without room for the file fails before the reset: the window goes on, and the
+    /// next save holds it.
     pub fn save_and_reset(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        let pending = file::Pending::create(path.as_ref())?;
+        let pending = self.prepare_save(path.as_ref())?;
         self.linker.flush(&self.recorder);
         // The rows of the same window as the aggregates (one critical section).
         let (snapshot, rows) = self.recorder.snapshot_and_reset_with_rows();

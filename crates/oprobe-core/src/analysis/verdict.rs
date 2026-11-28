@@ -49,32 +49,47 @@ fn mean_var(v: &[f64]) -> (f64, f64) {
 /// else Welch. `floor_sd` is a known lower bound of the per-pair spread (the A/A noise floor),
 /// so two identical pairs never claim a zero-width interval. The interval is `exp(·) − 1`:
 /// never below −100 %.
+///
+/// Pairs are formed before anything is left out: a pair with a value that is not positive
+/// goes whole. (9.3.4 filtered each side first, so one zero on each side, in different pairs,
+/// paired every later trial with another pair's.)
 pub fn log_ratio(a: &[f64], b: &[f64], paired: bool, floor_sd: f64) -> Interval {
+    if paired && a.len() == b.len() {
+        let diffs: Vec<f64> = a
+            .iter()
+            .zip(b)
+            .filter(|(x, y)| **x > 0.0 && **y > 0.0)
+            .map(|(x, y)| y.ln() - x.ln())
+            .collect();
+        if diffs.is_empty() {
+            return Interval::default();
+        }
+        let (m, v) = mean_var(&diffs);
+        let n = diffs.len() as f64;
+        let v = v.max(floor_sd * floor_sd);
+        return interval(m, t975((n - 1.0).max(1.0)) * (v / n).sqrt());
+    }
     let la: Vec<f64> = a.iter().filter(|x| **x > 0.0).map(|x| x.ln()).collect();
     let lb: Vec<f64> = b.iter().filter(|x| **x > 0.0).map(|x| x.ln()).collect();
     if la.is_empty() || lb.is_empty() {
         return Interval::default();
     }
-    let (d, h) = if paired && la.len() == lb.len() {
-        let diffs: Vec<f64> = la.iter().zip(&lb).map(|(x, y)| y - x).collect();
-        let (m, v) = mean_var(&diffs);
-        let n = diffs.len() as f64;
-        let v = v.max(floor_sd * floor_sd);
-        (m, t975((n - 1.0).max(1.0)) * (v / n).sqrt())
+    let ((ma, va), (mb, vb)) = (mean_var(&la), mean_var(&lb));
+    let (na, nb) = (la.len() as f64, lb.len() as f64);
+    let f = floor_sd * floor_sd;
+    let (va, vb) = (va.max(f), vb.max(f));
+    let se2 = va / na + vb / nb;
+    let den = (va / na).powi(2) / (na - 1.0).max(1.0) + (vb / nb).powi(2) / (nb - 1.0).max(1.0);
+    let df = if den > 0.0 {
+        se2 * se2 / den
     } else {
-        let ((ma, va), (mb, vb)) = (mean_var(&la), mean_var(&lb));
-        let (na, nb) = (la.len() as f64, lb.len() as f64);
-        let f = floor_sd * floor_sd;
-        let (va, vb) = (va.max(f), vb.max(f));
-        let se2 = va / na + vb / nb;
-        let den = (va / na).powi(2) / (na - 1.0).max(1.0) + (vb / nb).powi(2) / (nb - 1.0).max(1.0);
-        let df = if den > 0.0 {
-            se2 * se2 / den
-        } else {
-            na + nb - 2.0
-        };
-        (mb - ma, t975(df) * se2.sqrt())
+        na + nb - 2.0
     };
+    interval(mb - ma, t975(df) * se2.sqrt())
+}
+
+/// The relative change of a log ratio `d` with half-width `h`.
+fn interval(d: f64, h: f64) -> Interval {
     Interval {
         estimate: d.exp() - 1.0,
         low: (d - h).exp() - 1.0,
@@ -441,15 +456,23 @@ pub fn noise_floor_paired(d: &[f64], candidate_first: &[bool], resolution: f64) 
 }
 
 /// [`noise_floor_paired`] of the pairs `a[i]`, `b[i]` (positive values; the log ratios
-/// `ln(b/a)`), in one order: a metric shown beside the objective.
-pub fn noise_floor_of_pairs(a: &[f64], b: &[f64], resolution: f64) -> f64 {
-    let d: Vec<f64> = a
+/// `ln(b/a)`) in the orders they ran (`candidate_first[i]`): a metric shown beside the
+/// objective. 9.3.4 took every pair as run in one order, so an order effect (the second trial
+/// of a pair running warmer) read as noise and widened the metric's interval.
+pub fn noise_floor_of_pairs(
+    a: &[f64],
+    b: &[f64],
+    candidate_first: &[bool],
+    resolution: f64,
+) -> f64 {
+    let (d, first): (Vec<f64>, Vec<bool>) = a
         .iter()
         .zip(b)
-        .filter(|(x, y)| **x > 0.0 && **y > 0.0)
-        .map(|(x, y)| (y / x).ln())
-        .collect();
-    noise_floor_paired(&d, &vec![false; d.len()], resolution)
+        .zip(candidate_first)
+        .filter(|((x, y), _)| **x > 0.0 && **y > 0.0)
+        .map(|((x, y), f)| ((y / x).ln(), *f))
+        .unzip();
+    noise_floor_paired(&d, &first, resolution)
 }
 
 /// The A/B decision of `oprobe prove`, one pair at a time: pure and synchronous, so the whole
@@ -624,6 +647,20 @@ mod tests {
 
     use super::*;
 
+    /// Pairs are formed before values are left out. 9.3.4 filtered each side first: with a
+    /// zero baseline in pair 0 and a zero candidate in pair 3, the sides kept equal lengths and
+    /// every pair in between was compared with its neighbour's.
+    #[test]
+    fn a_missing_value_drops_its_pair_not_the_alignment() {
+        let a = [0.0, 100.0, 200.0, 400.0, 800.0];
+        let b = [50.0, 110.0, 220.0, 0.0, 880.0];
+        let i = log_ratio(&a, &b, true, 0.0);
+        assert!((i.estimate - 0.10).abs() < 1e-9, "{i:?}");
+        assert!(i.low > 0.09 && i.high < 0.11, "{i:?}");
+        // Nothing comparable: no interval.
+        assert_eq!(log_ratio(&[0.0], &[1.0], true, 0.0), Interval::default());
+    }
+
     #[test]
     fn intervals_are_never_impossible() {
         // A ratio cannot fall below −100 % (T9).
@@ -677,7 +714,7 @@ mod tests {
 
     /// The floor of pairs `a[i]`, `b[i]` in one order.
     fn noise_floor(a: &[f64], b: &[f64], resolution: f64) -> f64 {
-        noise_floor_of_pairs(a, b, resolution)
+        noise_floor_of_pairs(a, b, &vec![false; a.len()], resolution)
     }
 
     #[test]

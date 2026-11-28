@@ -128,9 +128,10 @@ fn scheme_of(cmd: &Command, ctx: &Ctx) -> String {
 /// Print an error chain with a hint on stderr (before the CLI runtime exists).
 pub fn print_error(err: &anyhow::Error, scheme: &str) {
     let body = crate::errors::classify(err, scheme);
-    stderr_line(format_args!("{} {}", red(&bold("error:")), body.message));
+    // Kept: a final error is never dropped behind progress lines a slow reader left queued.
+    crate::output::stderr_line_kept(format_args!("{} {}", red(&bold("error:")), body.message));
     if let Some(h) = &body.hint {
-        stderr_line(format_args!("{} {h}", yellow(&bold("hint:"))));
+        crate::output::stderr_line_kept(format_args!("{} {h}", yellow(&bold("hint:"))));
     }
 }
 

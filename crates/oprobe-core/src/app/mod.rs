@@ -651,6 +651,7 @@ mod tests {
         std::fs::write(
             &config_file,
             "[operators.prod]\nurl = \"s3://bkt/data\"\n\n[operators.prod.options]\n\
+             endpoint = \"http://127.0.0.1:9000\"\n\
              region = \"eu-west-2\"\nsecret_access_key = \"hunter2\"\n\n\
              [operators.prod.layers]\nretry = { max_times = 9 }\n",
         )
@@ -721,6 +722,73 @@ mod tests {
             "{:?}",
             replayed.profile.operator.options
         );
+    }
+
+    /// A replay takes an operator file's secrets only for the endpoint the file names, both
+    /// ways. 9.3.4 checked the endpoint only when the file named one, so the keys of an AWS
+    /// `op.toml` (no endpoint) were re-attached to a stored run whose endpoint was another
+    /// service's; and it compared `${NAME}` references unexpanded.
+    #[test]
+    fn a_replay_compares_endpoints_both_ways_and_expanded() {
+        let d = tempfile::tempdir().unwrap();
+        let (app, _) = app_with_operators(d.path());
+        let file = d.path().join("aws.toml");
+        std::fs::write(
+            &file,
+            "url = \"s3://mine/data\"\n\n[options]\nregion = \"us-east-1\"\n\
+             access_key_id = \"AWSKEY\"\nsecret_access_key = \"AWSSECRET\"\n",
+        )
+        .unwrap();
+        let mut req = RunRequest::new([file.display().to_string()]);
+        req.set = vec!["options.endpoint=http://elsewhere.example:9000".into()];
+        let spec = app.resolve(&req).unwrap().remove(0).spec();
+        assert_eq!(
+            spec.profile
+                .operator
+                .options
+                .get("endpoint")
+                .map(String::as_str),
+            Some("http://elsewhere.example:9000")
+        );
+        let ctx = app.ctx(&EventSink::silent());
+        let e = profile::spec_profile(&ctx, spec.clone()).unwrap_err();
+        assert!(
+            e.to_string().contains("not the operator the run used"),
+            "{e}"
+        );
+        let again = app.resolve(&app.replaying(&spec)).unwrap().remove(0);
+        assert!(
+            again
+                .profile
+                .operator
+                .options
+                .values()
+                .all(|v| !v.contains("AWS")),
+            "{:?}",
+            again.profile.operator.options
+        );
+
+        // `${NAME}` on one side and its value on the other: the same endpoint.
+        let mut used = crate::operator::OperatorSpec::from_url("s3://mine/data");
+        used.options = [("endpoint".to_owned(), "http://127.0.0.1:9000/".to_owned())].into();
+        // SAFETY: a variable no other test reads.
+        unsafe { std::env::set_var("OPROBE_TEST_REPLAY_ENDPOINT", "http://127.0.0.1:9000") };
+        let given = crate::operator::OperatorSpec {
+            options: [(
+                "endpoint".to_owned(),
+                "${OPROBE_TEST_REPLAY_ENDPOINT}".to_owned(),
+            )]
+            .into(),
+            ..used.clone()
+        };
+        assert!(crate::operator::resolve::same_operator(&given, &used));
+        assert!(crate::operator::resolve::same_operator(&used, &used));
+        let none = crate::operator::OperatorSpec {
+            options: Default::default(),
+            ..used.clone()
+        };
+        assert!(!crate::operator::resolve::same_operator(&none, &used));
+        assert!(!crate::operator::resolve::same_operator(&used, &none));
     }
 
     /// Every leaf of `v` as `(path, value)`.
@@ -808,7 +876,8 @@ mod tests {
                 ..Default::default()
             },
             // A configured operator: its secret is redacted in the spec and comes from the
-            // config file again.
+            // config file again. It names the endpoint the run used: a secret is re-attached
+            // only for the endpoint its operator names (9.3.5, `same_operator`).
             RunRequest {
                 operators: vec!["prod".into()],
                 workload: WorkloadInput {

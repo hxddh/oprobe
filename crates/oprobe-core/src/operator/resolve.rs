@@ -35,17 +35,25 @@ pub fn operator_file_path(arg: &str) -> Option<PathBuf> {
 }
 
 /// Whether `given`, what a run's operator reference resolves to now, is `used`, the operator
-/// the run used (as its spec stores it): the same service URL, and the same endpoint when
-/// `given` names one (a run may have set the endpoint of a reference that names none). A
-/// replay takes the redacted secrets back from `given` only when it is, so a reference that
-/// now names another operator (an operator file edited since, or a relative path resolved
-/// from another directory) never sends that operator's keys to the run's endpoint.
+/// the run used (as its spec stores it): the same service URL and the same endpoint, both
+/// ways, with `${NAME}` references expanded on either side. A replay takes the redacted
+/// secrets back from `given` only when it is, so a reference that now names another operator
+/// (an operator file edited since, or a relative path resolved from another directory) never
+/// sends that operator's keys to the run's endpoint.
+///
+/// An endpoint the run had and `given` has not is another operator too: 9.3.4 accepted it
+/// (`given` names no endpoint), so the keys of an AWS `op.toml` went to whatever endpoint the
+/// stored run named. A run that set the endpoint on the command line is replayed by putting
+/// the endpoint in the operator file.
 pub fn same_operator(given: &OperatorSpec, used: &OperatorSpec) -> bool {
+    let endpoint = |o: &OperatorSpec| {
+        o.options.get("endpoint").map(|e| {
+            let e = crate::config::expand_env(e).unwrap_or_else(|_| e.clone());
+            e.trim().trim_end_matches('/').to_ascii_lowercase()
+        })
+    };
     crate::util::redact_url(&given.url) == crate::util::redact_url(&used.url)
-        && given
-            .options
-            .get("endpoint")
-            .is_none_or(|e| used.options.get("endpoint") == Some(e))
+        && endpoint(given) == endpoint(used)
 }
 
 /// The reference a run stores for `arg`: an operator file by its absolute path (a relative
@@ -90,7 +98,7 @@ pub fn replayed_operator(
         ),
     )
     .with_hint(format!(
-        "restore `{operator_ref}` to the operator the run used, or start a new run with the operator you mean"
+        "restore `{operator_ref}` to the operator the run used (its URL and its endpoint), or start a new run with the operator you mean"
     )))
 }
 

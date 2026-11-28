@@ -658,6 +658,16 @@ async fn a_failed_save_keeps_what_it_was_saving() {
         .join("p.oprobe");
     assert!(handle.save_and_reset(&nowhere).is_err());
     assert!(handle.save(&nowhere).is_err());
+    // A destination that is a directory: 9.3.4 found out at the final rename, after the
+    // window was reset.
+    let dir = temp_file("a-directory");
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(handle.save_and_reset(&dir).is_err());
+    assert!(handle.save(&dir).is_err());
+    assert!(
+        std::fs::read_dir(&dir).unwrap().next().is_none(),
+        "nothing left inside"
+    );
     assert_eq!(handle.snapshot().summary.ops, 2, "the window was kept");
     let path = temp_file("after-failure");
     handle.save_and_reset(&path).unwrap();

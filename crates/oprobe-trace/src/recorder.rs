@@ -871,6 +871,14 @@ impl Recorder {
         let _ = self.guard.set(guard);
     }
 
+    /// About how many bytes the kept trace rows take as JSON.
+    pub fn trace_json_len(&self) -> u64 {
+        self.trace
+            .iter()
+            .map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).json_len())
+            .sum()
+    }
+
     /// Take the trace rows recorded in the measurement window.
     pub fn take_trace(&self) -> TraceRows {
         let parts: Vec<TraceRows> = self

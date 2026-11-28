@@ -68,8 +68,8 @@ impl std::fmt::Debug for ChargeService {
 impl Service for ChargeService {
     type Reader = ChargeReader;
     type Writer = ChargeWriter;
-    type Lister = oio::Lister;
-    type Deleter = oio::Deleter;
+    type Lister = ChargeLister;
+    type Deleter = ChargeDeleter;
     type Copier = oio::Copier;
     type Composer = oio::Composer;
 
@@ -112,13 +112,23 @@ impl Service for ChargeService {
     }
 
     fn delete(&self, ctx: &OperationContext) -> Result<Self::Deleter> {
-        self.gate.admit_call(0)?;
-        self.inner.delete(ctx)
+        // Each path deleted is a call, charged when it is given (9.3.4 charged the deleter
+        // once, however many paths it deleted).
+        Ok(ChargeDeleter {
+            inner: self.inner.delete(ctx)?,
+            gate: self.gate.clone(),
+        })
     }
 
     fn list(&self, ctx: &OperationContext, path: &str, args: OpList) -> Result<Self::Lister> {
+        // The first page now, one more every [`LIST_PAGE`] entries (9.3.4 charged the lister
+        // once, however many entries it listed).
         self.gate.admit_call(0)?;
-        self.inner.list(ctx, path, args)
+        Ok(ChargeLister {
+            inner: self.inner.list(ctx, path, args)?,
+            gate: self.gate.clone(),
+            listed: 0,
+        })
     }
 
     fn copy(
@@ -165,6 +175,50 @@ impl Service for ChargeService {
         args: OpPresign,
     ) -> Result<RpPresign> {
         self.inner.presign(ctx, path, args).await
+    }
+}
+
+/// The entries of one list page, as an object store returns them (S3's `ListObjectsV2`
+/// default): an in-process listing is charged one request per page of this many.
+pub const LIST_PAGE: u64 = 1000;
+
+/// A deleter whose paths are charged, one request each.
+pub struct ChargeDeleter {
+    inner: oio::Deleter,
+    gate: Gate,
+}
+
+impl oio::Delete for ChargeDeleter {
+    async fn delete(&mut self, path: &str, args: opendal::raw::OpDelete) -> Result<()> {
+        self.gate.admit_call(0)?;
+        oio::Delete::delete(&mut self.inner, path, args).await
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        oio::Delete::close(&mut self.inner).await
+    }
+}
+
+/// A lister charged one request per page of [`LIST_PAGE`] entries.
+pub struct ChargeLister {
+    inner: oio::Lister,
+    gate: Gate,
+    /// Entries returned so far.
+    listed: u64,
+}
+
+impl oio::List for ChargeLister {
+    async fn next(&mut self) -> Result<Option<oio::Entry>> {
+        let e = oio::List::next(&mut self.inner).await?;
+        if e.is_some() {
+            // The first entry of a page after the first (charged when the lister was made):
+            // a listing of exactly one page costs one request, as on a store.
+            if self.listed > 0 && self.listed.is_multiple_of(LIST_PAGE) {
+                self.gate.admit_call(0)?;
+            }
+            self.listed += 1;
+        }
+        Ok(e)
     }
 }
 
@@ -233,5 +287,66 @@ impl oio::ReadStream for ChargeStream {
         let buf = self.inner.read_dyn().await?;
         self.gate.received_call(buf.len() as u64)?;
         Ok(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use opendal::Operator;
+    use opendal::services::Memory;
+
+    use super::LIST_PAGE;
+    use crate::engine::gate::Gate;
+    use crate::guard::{Budgets, Guard};
+
+    fn charged() -> (Operator, Arc<Guard>) {
+        let guard = Guard::new(Budgets::default());
+        let cancel = crate::engine::runner::Cancel::new();
+        guard.arm(cancel.clone());
+        let gate = Gate::new(
+            Some(guard.clone()),
+            cancel,
+            crate::engine::upload::Aborts::new(),
+        );
+        let op = Operator::new(Memory::default())
+            .unwrap()
+            .layer(gate.charge_layer());
+        (op, guard)
+    }
+
+    /// A batch delete is a request per path and a listing a request per page, as on an object
+    /// store. 9.3.4 charged a `Deleter` or a `Lister` once, whatever it deleted or listed, so
+    /// `--max-requests` did not bound a delete-heavy run on `fs://` or `memory://`.
+    #[tokio::test]
+    async fn deletes_are_charged_per_path_and_listings_per_page() {
+        let (op, guard) = charged();
+        let n = LIST_PAGE + 1;
+        for i in 0..n {
+            op.write(&format!("d/k{i}"), vec![0u8; 1]).await.unwrap();
+        }
+        let (written, _) = guard.usage();
+        assert_eq!(written, n);
+        let entries = op.list_with("d/").recursive(true).await.unwrap();
+        assert_eq!(entries.len() as u64, n);
+        assert_eq!(guard.usage().0 - written, 2, "two pages");
+
+        let before = guard.usage().0;
+        let mut d = op.deleter().await.unwrap();
+        for i in 0..10 {
+            d.delete(format!("d/k{i}")).await.unwrap();
+        }
+        d.close().await.unwrap();
+        assert_eq!(guard.usage().0 - before, 10, "one request per path");
+
+        // Exactly one page is one request.
+        let (op, guard) = charged();
+        for i in 0..LIST_PAGE {
+            op.write(&format!("e/k{i}"), vec![0u8; 1]).await.unwrap();
+        }
+        let before = guard.usage().0;
+        op.list_with("e/").recursive(true).await.unwrap();
+        assert_eq!(guard.usage().0 - before, 1);
     }
 }

@@ -17,7 +17,7 @@ meter).
 
 ```toml
 [dependencies]
-oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.4" }
+oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.5" }
 ```
 
 `oprobe-trace` is not on crates.io yet: the git dependency above is the one that resolves today
@@ -136,6 +136,10 @@ future) is recorded as `cancelled`. Keys are recorded hashed: see [The file](#th
   aggregates alone.
 - **`handle.save_and_reset(path)`**: the same, then a fresh window: the aggregates start again
   from zero (atomically with the snapshot), so hourly files are hourly profiles.
+- A save that cannot be written (a missing directory, a directory, no permission, a disk
+  without room for the file) fails before it takes anything: the rows and the window stay in
+  memory for the next save. The file's room is reserved first, and the file appears whole or
+  not at all.
 - **`Exporter`**: called for every request as it completes, on the request path (keep it cheap).
 
 ```rust
