@@ -17,8 +17,7 @@ was added; the file formats are unchanged.
 
 - **A replay re-attaches an operator file's secrets only for the endpoint the file names.**
   The endpoint is compared both ways, with `${NAME}` references expanded: the keys of an
-  `op.toml` without an endpoint are no longer sent to a run's custom endpoint. Such a run is
-  replayed by putting its endpoint in the file.
+  `op.toml` without an endpoint are no longer sent to a run's custom endpoint.
 - **`fs://` and `memory://` charge one request per deleted path and per list page** (1 000
   entries), not one per deleter or lister.
 
@@ -46,6 +45,12 @@ was added; the file formats are unchanged.
 - A command's final error and hint are never dropped behind a full stderr queue.
 - SIGHUP or SIGTERM while the terminal app runs exits 130, also when the hangup made the
   app's I/O fail.
+
+### Changed
+
+- A run that set `--set options.endpoint=…` on an operator file or a configured operator
+  without an endpoint is replayed (`prove`, Run Again) without that operator's secrets: the
+  environment's credentials apply. Put the endpoint in the operator to keep them.
 
 ## v9.3.4 — 2026-11-27
 

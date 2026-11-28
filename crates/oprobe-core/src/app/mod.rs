@@ -651,6 +651,7 @@ mod tests {
         std::fs::write(
             &config_file,
             "[operators.prod]\nurl = \"s3://bkt/data\"\n\n[operators.prod.options]\n\
+             endpoint = \"http://127.0.0.1:9000\"\n\
              region = \"eu-west-2\"\nsecret_access_key = \"hunter2\"\n\n\
              [operators.prod.layers]\nretry = { max_times = 9 }\n",
         )
@@ -875,7 +876,8 @@ mod tests {
                 ..Default::default()
             },
             // A configured operator: its secret is redacted in the spec and comes from the
-            // config file again.
+            // config file again. It names the endpoint the run used: a secret is re-attached
+            // only for the endpoint its operator names (9.3.5, `same_operator`).
             RunRequest {
                 operators: vec!["prod".into()],
                 workload: WorkloadInput {
