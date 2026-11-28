@@ -1054,6 +1054,35 @@ impl Drop for ServerInflightGuard {
     }
 }
 
+/// A response body that holds its request's [`ServerInflightGuard`] until the body is sent
+/// (or dropped): a request is in flight while its body streams. 9.3.5 released it with the
+/// response headers, so a large shaped GET left room for another request under
+/// `max_inflight_before_503`, and the in-flight labs throttled less than they said.
+struct InflightBody {
+    inner: BoxBody,
+    _guard: ServerInflightGuard,
+}
+
+impl http_body::Body for InflightBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Bytes>, Infallible>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 async fn build_shaped_body(
     payload: Bytes,
     bandwidth_kib_s: Option<u64>,
@@ -1107,13 +1136,22 @@ async fn serve_s3_request(
     req: Request<Incoming>,
     store: Arc<S3Store>,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
-    // In flight until the response leaves (a sleeping straggler counts).
+    // In flight until the response body has been sent (a sleeping straggler counts).
     let cur_inflight = store.active_inflight.fetch_add(1, Ordering::AcqRel) + 1;
     store
         .peak_inflight
         .fetch_max(cur_inflight, Ordering::Relaxed);
-    let _inflight_guard = ServerInflightGuard {
+    let inflight_guard = ServerInflightGuard {
         store: store.clone(),
+    };
+    let hold = |resp: Response<BoxBody>| {
+        resp.map(|inner| {
+            InflightBody {
+                inner,
+                _guard: inflight_guard,
+            }
+            .boxed()
+        })
     };
     let req_version = req.version();
     let upload_guard = match caps::admit(&store, req.method(), req.headers()) {
@@ -1132,7 +1170,7 @@ async fn serve_s3_request(
                     http::HeaderValue::from_static("close"),
                 );
             }
-            return Ok(resp);
+            return Ok(hold(resp));
         }
     };
     let mut straggle = Duration::ZERO;
@@ -1140,7 +1178,7 @@ async fn serve_s3_request(
     if !straggle.is_zero() {
         tokio::time::sleep(straggle).await;
     }
-    resp
+    resp.map(hold)
 }
 
 async fn handle_s3_request<'a>(
