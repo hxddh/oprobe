@@ -945,6 +945,40 @@ pub fn admin_operator_with(
 mod tests {
     use super::*;
 
+    /// A request is in flight in the lab until its response body has been sent: a second
+    /// request while a slow body streams is over `max_inflight_before_503: 1`. 9.3.5 released
+    /// the count with the headers, and the second request was served.
+    #[tokio::test]
+    async fn the_lab_counts_a_streaming_body_in_flight() {
+        let faults = crate::lab::LabConfig {
+            max_inflight_before_503: Some(1),
+            stream_bandwidth_kib_s: Some(256),
+            ..Default::default()
+        };
+        let lab = crate::lab::LabServer::spawn("127.0.0.1:0", faults)
+            .await
+            .unwrap();
+        let target = lab.profile("b").operator.target().unwrap();
+        let base = base_operator(&target).unwrap();
+        admin_operator(&base, &target)
+            .unwrap()
+            .write("big", vec![7u8; 1 << 20])
+            .await
+            .unwrap();
+        let op = base.layer(trace_layer(&target, &HttpOptions::default(), None, None).unwrap());
+        // About 4 s at 256 KiB/s: the body is still streaming during the stat below.
+        let reader = op.reader("big").await.unwrap();
+        let mut stream = reader.into_bytes_stream(..).await.unwrap();
+        use futures::StreamExt;
+        assert!(stream.next().await.is_some(), "the body has started");
+        let e = op.stat("big").await.unwrap_err();
+        assert!(
+            e.is_temporary() || e.kind() == opendal::ErrorKind::RateLimited,
+            "{e}"
+        );
+        drop(stream);
+    }
+
     /// The lab spares the run's cleaner, and only it: a workload's deletes meet its faults.
     /// 9.3.4's lab spared every DELETE and batch delete.
     #[tokio::test]

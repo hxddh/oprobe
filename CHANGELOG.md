@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v9.4.0 — 2026-11-28
+
+The plan of `docs/design/v9.4-plan.md`: current dependencies, a trace and an OTel feed that
+say more, a loop that hands off with the traffic's shape and shows what a remedy costs, and
+the rate limit's figure fitted right. No command, flag, finding, preset or config key was
+added; the file formats take only optional fields.
+
+### Added
+
+- **A trace says whether its retries were linked** (`resilience.retry_linking`): without
+  `Handle::retry_notify()` every attempt is an operation and no retry is counted, which
+  `show` and the app now say, with how to link them.
+- **OpenTelemetry**: the stage metric splits `connect` into `dns`, `tcp`, `proxy` and `tls`;
+  the standard `http.client.request.body.size` and `http.client.response.body.size`; and
+  `oprobe.http.client.retries` with `oprobe.http.client.retry.backoff.duration`, by
+  `oprobe.retry.reason` (`Exporter::on_retry` for your own exporter).
+- **`prove` shows the cost side**: requests per operation and bytes moved per byte read or
+  written, beside the latency and the shares (trials store `backend_bytes` and
+  `logical_bytes`).
+- **The run a trace suggests reproduces its traffic**: `-c` from the operations the
+  application kept in flight, `--object-size` from what it read or wrote whole.
+- **A clean run names one next step**: no layer to add at this load, and the same run at four
+  times the concurrency (twice the rate of an open loop) to look for the ceiling.
+- **A remedy with a cost names it** (`note:`, Trade-off in the app): FoyerLayer's whole-object
+  fetches and stale reads, a tail cut's re-sent requests, chunked reads' extra requests.
+
+### Fixed
+
+- **The rate a `rate_limit` reports is the service's** (A3, open since 9.3.3):
+  `lab://ratelimit` (100/s) read as ≈172/s; it now reads 99–100/s. The reported rate is at most
+  what the service served over its throttled stretch.
+- The lab counts a request in flight until its response body is sent, not only its headers.
+- An operation that started before `save_and_reset` lands in the interval it ended in, not
+  its whole latency into the new window.
+- A finding's evidence says each fact once.
+
+### Changed
+
+- Dependencies: `rand` 0.10, `toml` 1, `toml_edit` 0.25, `opentelemetry` 0.33 (the `otel`
+  feature), `nsh` 0.7.2, and every compatible update. `rand` 0.10 draws other values from a
+  seed: a dataset persisted by 9.3 (`--set persist=true`) is made again under a new name, and
+  a seeded run's objects and key choices differ from 9.3's.
+- The stage metric's `connect` value is gone: query `dns`, `tcp`, `proxy` and `tls`.
+
 ## v9.3.5 — 2026-11-28
 
 The confirmed bugs left by 9.3.4 (`docs/design/v9.3-review.md`, "9.3.5"): retries a reader

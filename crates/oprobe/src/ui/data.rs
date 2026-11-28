@@ -76,6 +76,8 @@ pub struct FindingRow {
     pub chart: Option<view::EvidenceChart>,
     /// The remedy as operator paths with the value to try (empty value: the path alone).
     pub remedy: Vec<(String, String)>,
+    /// What the remedy costs besides what it fixes (core's [`view::FindingView::trade_off`]).
+    pub trade_off: Option<&'static str>,
     /// Operations that show the problem ("Show N examples").
     pub op_ids: Vec<u64>,
 }
@@ -443,6 +445,7 @@ fn findings(r: &Report) -> Vec<FindingRow> {
         .map(|f| {
             let src = r.findings.iter().find(|x| x.code == f.code);
             FindingRow {
+                trade_off: f.trade_off(),
                 card: f.card(&r.verdict.headline),
                 code: f.code.clone(),
                 severity: f.severity,

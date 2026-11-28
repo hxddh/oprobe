@@ -76,7 +76,10 @@ async fn parquet_lab_ops_peak_at_four_requests_in_flight() {
     let run = lab_run("parquet", Preset::RangeReads, 6).await;
     let s = run.report.capacity.per_op;
     assert_eq!(s.peak_inflight_per_op, 4.0, "{s:?}");
-    assert!(s.requests_per_op >= 6.0, "{s:?}");
+    // A stat, the footer and four column chunks: 6 requests, or 5 when two chunks happen to
+    // land within `read.gap` of each other and `Reader::fetch` merges them (OpenDAL's
+    // behaviour; how often depends on the seed's draws, so the mean is just under 6).
+    assert!(s.requests_per_op <= 6.0 && s.requests_per_op > 5.9, "{s:?}");
     assert!(s.sequential_fraction > 0.2, "{s:?}");
     // The ceiling, at a load well above it (12 × 4), so the lab throttles even on a slow
     // runner where the scans overlap less (8 workers stayed under 24 on macOS CI).

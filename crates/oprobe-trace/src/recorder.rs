@@ -705,6 +705,12 @@ pub trait Exporter: Send + Sync {
     fn on_cache(&self, lookups: u64, hits: u64) {
         let _ = (lookups, hits);
     }
+    /// A retry a `RetryLayer` with `Handle::retry_notify()` is about to make, after waiting
+    /// `backoff`: `reason` is `throttled`, `server_error`, `timeout`, `tail_cut`, `network`
+    /// or `other` (9.4).
+    fn on_retry(&self, reason: &'static str, backoff: std::time::Duration) {
+        let _ = (reason, backoff);
+    }
     /// The OpenDAL service the layer was applied to (once, before its first request): its
     /// scheme, name (the bucket: OpenDAL's `namespace` label) and root. A layer applied to
     /// several operators reports the first one here; each HTTP request names its own
@@ -738,6 +744,8 @@ const WINDOW_OPEN: u64 = u64::MAX;
 /// Central sink shared by the transport, OpenDAL layers and workload workers.
 pub struct Recorder {
     phase: AtomicU8,
+    /// [`Recorder::set_retries_linked`]: 0 unknown, 1 unlinked, 2 linked.
+    retry_linking: AtomicU8,
     measuring: AtomicBool,
     /// Window length in microseconds once the window closed (no new operation is measured,
     /// while operations that started inside it may still be completing); `WINDOW_OPEN` before.
@@ -785,6 +793,7 @@ impl Recorder {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             phase: AtomicU8::new(0),
+            retry_linking: AtomicU8::new(0),
             measuring: AtomicBool::new(false),
             frozen_elapsed_us: AtomicU64::new(WINDOW_OPEN),
             window_start: Mutex::new(Instant::now()),
@@ -833,6 +842,19 @@ impl Recorder {
         r.set_trace_limit(max_rows);
         r.set_phase(Phase::Measure);
         r
+    }
+
+    /// Retries are linked by a `RetryNotify` (`true`), or an embedded layer has none
+    /// (`false`): [`crate::snapshot::RetryLinking`]. Linked wins: a notifier made later
+    /// links the retries from then on.
+    pub fn set_retries_linked(&self, linked: bool) {
+        if linked {
+            self.retry_linking.store(2, Ordering::Relaxed);
+        } else {
+            let _ = self
+                .retry_linking
+                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
+        }
     }
 
     /// Install the exporter hook (the first call wins; returns whether it was installed).
@@ -1466,8 +1488,16 @@ impl Recorder {
             .saturating_duration_since(window_start)
             .as_micros() as u64;
         // An open-loop operation's latency also counts how late it started (`schedule_us`,
-        // before `started`): it ends that much sooner after its start.
-        let end_us = start_us + c.latency_us.saturating_sub(c.schedule_us.unwrap_or(0));
+        // before `started`): it ends that much sooner after its start. The end is an instant
+        // first, then placed in the window: an operation that started before the window (a
+        // `snapshot_and_reset` while it ran) ends where it ended, not its whole latency after
+        // the window's start (9.3.5 put one 10 s old that ended 1 s into the window at 11 s).
+        let ran = std::time::Duration::from_micros(
+            c.latency_us.saturating_sub(c.schedule_us.unwrap_or(0)),
+        );
+        let end_us = (c.started + ran)
+            .saturating_duration_since(window_start)
+            .as_micros() as u64;
         let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
         let at = |us: u64| event_bucket(us, frozen);
         let idx = at(start_us);
@@ -1861,6 +1891,11 @@ impl Recorder {
 
         let mut resilience = a.res.clone();
         resilience.failed_ops = a.failed_ops;
+        resilience.retry_linking = match self.retry_linking.load(Ordering::Relaxed) {
+            1 => crate::snapshot::RetryLinking::Unlinked,
+            2 => crate::snapshot::RetryLinking::Linked,
+            _ => crate::snapshot::RetryLinking::Unknown,
+        };
 
         let mut bytes = a.bytes.clone();
         bytes.logical_read = a.logical_read;
@@ -2322,6 +2357,35 @@ mod tests {
             bad.is_empty(),
             "fresh windows (age s, intervals, last interval s): {bad:?}"
         );
+    }
+
+    /// An operation that started before a reset and ended after it lands in the interval of
+    /// its end. 9.3.5 clamped its start to the new window's and added its whole latency, so an
+    /// operation 3 s old that ended at once was put 3 s into a window a few ms old.
+    #[test]
+    fn an_operation_spanning_a_reset_lands_where_it_ended() {
+        let rec = Recorder::always_on(1000);
+        let started = Instant::now() - std::time::Duration::from_secs(3);
+        rec.op_started_at(1, started);
+        rec.snapshot_and_reset();
+        rec.complete_op(
+            true,
+            OpCompletion {
+                verb: "stat",
+                op_id: 1,
+                started,
+                latency_us: started.elapsed().as_micros() as u64,
+                logical_read: 0,
+                logical_write: 0,
+                error: None,
+                key: String::new(),
+                data: Default::default(),
+                schedule_us: None,
+            },
+        );
+        let snap = rec.snapshot();
+        let last = snap.timeline.iter().map(|p| p.t_s).fold(0.0, f64::max);
+        assert!(last < 1.0, "intervals up to {last} s in a window {} s old", snap.elapsed_s);
     }
 
     /// Windows saved while operations complete on other threads: each window's rows are the

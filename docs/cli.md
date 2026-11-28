@@ -139,7 +139,10 @@ paired log ratios of the objective (B over A, pair by pair):
 
 Shares, such as throttled requests, are compared with Newcombe's interval; the secondary
 metrics' intervals are plain 95 % intervals on each metric's own trial-to-trial spread, shown
-and never decisive. After an early stop the estimate overstates the change on average (the
+and never decisive. Besides the other latency metric, the throttled share and the error share,
+they show what the change costs: `requests_per_op` (a tail cut or a hedge sends more) and
+`backend_bytes_per_logical_byte` (a cache that fetches whole objects for small ranges moves
+more). After an early stop the estimate overstates the change on average (the
 proof stopped because it was large); the interval's coverage holds.
 
 The ETA printed first is learned from the run being proved: what it took around its warm-up and

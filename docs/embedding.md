@@ -17,7 +17,7 @@ meter).
 
 ```toml
 [dependencies]
-oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.5" }
+oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.4.0" }
 ```
 
 `oprobe-trace` is not on crates.io yet: the git dependency above is the one that resolves today
@@ -105,6 +105,19 @@ wherever the layer sits. The layer then sees each request from outside:
 `format!("{trace:?}")` says which one a layer does (`http_transport: "replaced by the
 instrumented client"` or `"the installed transport, observed"`).
 
+Each step of the integration adds signals; the smallest one changes no client:
+
+| integration | operations, requests, stages, status, bytes | DNS/TCP/TLS, connections | retries counted, attempts linked |
+|---|---|---|---|
+| `.layer(trace)` with `keep_http_transport(true)` | yes | no | no |
+| `.layer(trace)` (the instrumented client) | yes | yes | no |
+| either, plus `RetryLayer::with_notify(handle.retry_notify())` | yes | as above | yes |
+
+Without `retry_notify`, every attempt of a retried call is an operation of its own (a retried
+failure is a failed operation) and `retries_count` stays 0. A trace says so:
+`resilience.retry_linking` is `"unlinked"`, and `oprobe show FILE` prints how to link them
+(9.4; before, "no retries" and "retries not linked" both read 0).
+
 What was not observed is not reported as a number. With `keep_http_transport(true)`:
 - `Snapshot::connections` counts the requests by protocol, and nothing else:
   `connections.observed()` is false, and `dialed`, `reused_requests` and `reuse_pct` say nothing
@@ -162,14 +175,21 @@ let cfg = oprobe_trace::Config::default().exporter(std::sync::Arc::new(Slow));
     `network.protocol.version`, `error.type` when they apply). Its count is the number of
     requests, as any HTTP dashboard assumes.
   - `oprobe.http.client.request.stage.duration`: where each request's time went, once per stage
-    that took time. `oprobe.stage` is `queue`, `connect`, `send`, `ttfb`, `body` or `stall`
-    (they add up to the request's duration); it also carries `oprobe.api`,
+    that took time. `oprobe.stage` is `queue`, `dns`, `tcp`, `proxy`, `tls`, `send`, `ttfb`,
+    `body` or `stall` (they add up to the request's duration; until 9.3 the four parts of a
+    dial were one `connect`); it also carries `oprobe.api`,
     `http.request.method`, `http.response.status_code` and OpenDAL's own metric labels
     (`scheme`, `namespace`, `root`, `operation`), so its series join
     `opendal-layer-otelmetrics`'. `scheme`, `namespace` and `root` are those of the operator
     that issued the request: a layer cloned onto several operators labels each one's requests
     with its own (until 9.2, with the first operator's). Your own `Exporter` reads the same
     from `RequestRecord::service`.
+  - `http.client.request.body.size` and `http.client.response.body.size` (bytes, 9.4): the
+    standard body-size metrics, with the attributes of `http.client.request.duration`.
+  - `oprobe.http.client.retries` (a counter) and `oprobe.http.client.retry.backoff.duration`
+    (seconds, 9.4): each retry a `RetryLayer` with `handle.retry_notify()` makes, by
+    `oprobe.retry.reason`: `throttled` (429/503), `server_error`, `timeout`, `tail_cut`,
+    `network` or `other`. Your own `Exporter` hears them in `on_retry`.
 
   Backend calls of `memory` and `fs` are not HTTP requests and are in neither. Operation
   durations and cache metrics are not repeated: use OpenDAL's own metrics layers for them.

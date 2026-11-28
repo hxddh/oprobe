@@ -14,7 +14,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use rand::rngs::SmallRng;
 use serde::{Deserialize, Serialize};
 
@@ -352,7 +352,7 @@ impl ArrivalClock {
             Arrivals::Constant if !self.started => 0.0,
             Arrivals::Constant => 1.0,
             Arrivals::Poisson => {
-                let u: f64 = rng.r#gen::<f64>();
+                let u: f64 = rng.random::<f64>();
                 -(1.0 - u).max(f64::MIN_POSITIVE).ln()
             }
         };
@@ -541,8 +541,8 @@ impl SizeDist {
                 use rand::SeedableRng;
                 let mut rng = SmallRng::seed_from_u64(seed ^ (i as u64).wrapping_mul(0x9E37_79B9));
                 // Box–Muller.
-                let u1: f64 = rng.r#gen::<f64>().max(f64::MIN_POSITIVE);
-                let u2: f64 = rng.r#gen::<f64>();
+                let u1: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+                let u2: f64 = rng.random::<f64>();
                 let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                 ((*median as f64) * (sigma * z).exp())
                     .round()

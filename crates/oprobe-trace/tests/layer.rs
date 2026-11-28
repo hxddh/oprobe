@@ -713,3 +713,27 @@ async fn concurrent_saves_to_one_path_write_whole_files() {
     assert_eq!(left.len(), 1, "no temporary file is left: {left:?}");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A trace says whether its retries were linked (9.4). Without `retry_notify` every attempt is
+/// an operation and `retries_count` stays 0 whatever was retried; 9.3 wrote the same 0 for
+/// "no retries" and for "retries not linked".
+#[tokio::test]
+async fn a_trace_says_whether_its_retries_were_linked() {
+    let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+    let op = Operator::new(Memory::default()).unwrap().layer(layer);
+    op.write("a", "x").await.unwrap();
+    assert_eq!(
+        handle.snapshot().resilience.retry_linking,
+        oprobe_trace::RetryLinking::Unlinked
+    );
+    let path = temp_file("unlinked");
+    handle.save(&path).unwrap();
+    let doc = read_json(&path);
+    assert_eq!(doc["snapshot"]["resilience"]["retry_linking"], "unlinked");
+
+    let _notify = handle.retry_notify();
+    assert_eq!(
+        handle.snapshot().resilience.retry_linking,
+        oprobe_trace::RetryLinking::Linked
+    );
+}

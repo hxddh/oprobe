@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::TryStreamExt;
 use opendal::{Buffer, Operator};
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use super::Cancel;
 use super::dataset::{Dataset, PayloadPool, Picker};
@@ -156,7 +156,7 @@ fn aligned_offset(rng: &mut impl Rng, max: u64) -> u64 {
     if max == 0 {
         0
     } else {
-        rng.gen_range(0..=max) & !4095
+        rng.random_range(0..=max) & !4095
     }
 }
 
@@ -171,7 +171,7 @@ pub async fn execute(
 ) -> Result<OpOutcome> {
     let spec = &ctx.spec;
     let ds = &ctx.dataset;
-    let pick = |rng: &mut (dyn rand::RngCore + Send)| -> Result<&super::dataset::DataObject> {
+    let pick = |rng: &mut (dyn rand::Rng + Send)| -> Result<&super::dataset::DataObject> {
         if ds.objects.is_empty() {
             anyhow::bail!("dataset has no objects to read");
         }
@@ -311,7 +311,7 @@ pub async fn execute(
             let prefix = if parts.is_empty() {
                 ds.prefix.clone()
             } else {
-                parts[rng.gen_range(0..parts.len())].clone()
+                parts[rng.random_range(0..parts.len())].clone()
             };
             key.clone_from(&prefix);
             let mut lister = ctx.op.lister_with(&prefix).recursive(*recursive).await?;
@@ -340,7 +340,7 @@ async fn execute_more(
     key: &mut String,
 ) -> Result<OpOutcome> {
     let ds = &ctx.dataset;
-    let pick = |rng: &mut (dyn rand::RngCore + Send)| -> Result<&super::dataset::DataObject> {
+    let pick = |rng: &mut (dyn rand::Rng + Send)| -> Result<&super::dataset::DataObject> {
         if ds.objects.is_empty() {
             anyhow::bail!("dataset has no objects to read");
         }
@@ -356,7 +356,7 @@ async fn execute_more(
             let prefix = if parts.is_empty() {
                 ds.prefix.clone()
             } else {
-                parts[rng.gen_range(0..parts.len())].clone()
+                parts[rng.random_range(0..parts.len())].clone()
             };
             key.clone_from(&prefix);
             let mut lister = ctx
@@ -626,14 +626,14 @@ mod tests {
             let mix = [OpKind::Stat, kind.clone(), OpKind::Copy];
             assert_eq!(max_payload(&mix), size.as_usize(), "{kind:?}");
             let pool = PayloadPool::new(max_payload(&mix));
-            let mut rng = rand::rngs::mock::StepRng::new(1, 7);
+            let mut rng = <rand::rngs::SmallRng as rand::SeedableRng>::seed_from_u64(1);
             let data = pool.slice(&mut rng, payload_size(&kind).unwrap()).unwrap();
             assert_eq!(data.len(), size.as_usize(), "{kind:?}");
         }
         assert_eq!(max_payload(&[OpKind::Stat, OpKind::Copy]), 0);
         // A pool too small for a payload says so instead of handing out less.
         let pool = PayloadPool::new(0);
-        let mut rng = rand::rngs::mock::StepRng::new(1, 7);
+        let mut rng = <rand::rngs::SmallRng as rand::SeedableRng>::seed_from_u64(1);
         let e = pool.slice(&mut rng, 64 << 20).unwrap_err();
         assert!(e.to_string().contains("payload pool"), "{e}");
     }

@@ -8,7 +8,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt};
 use opendal::{EntryMode, Operator};
 use rand::rngs::SmallRng;
-use rand::{Rng, RngCore, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Access, DatasetSpec};
@@ -113,7 +113,7 @@ impl PayloadPool {
         let off = if max_off == 0 {
             0
         } else {
-            rng.gen_range(0..max_off) & !7
+            rng.random_range(0..max_off) & !7
         };
         Ok(self.buf.slice(off..off + len))
     }
@@ -147,10 +147,11 @@ struct Manifest {
 
 /// The name of a persisted dataset: what decides its objects and their sizes. A size
 /// distribution is part of it (9.3.3 left it out, and a lognormal-size run reused a
-/// fixed-size dataset); a dataset of fixed size keeps the name it had.
+/// fixed-size dataset). `v3`: 9.4's random number generator (rand 0.10) draws other bytes and
+/// sizes from the same seed, so a dataset persisted by 9.3 is not one 9.4 would make.
 fn fingerprint(spec: &DatasetSpec, seed: u64) -> String {
     let mut s = format!(
-        "{}|{}|{}|{seed}|v2",
+        "{}|{}|{}|{seed}|v3",
         spec.objects,
         spec.object_size.0,
         spec.partitions.max(1)
@@ -479,9 +480,9 @@ impl Picker {
             return 0;
         }
         match self.access {
-            Access::Uniform => rng.gen_range(0..self.n),
+            Access::Uniform => rng.random_range(0..self.n),
             Access::Zipf(_) => {
-                let u: f64 = rng.r#gen();
+                let u: f64 = rng.random();
                 self.zipf_cdf.partition_point(|&c| c < u).min(self.n - 1)
             }
             Access::Hotset {
@@ -489,10 +490,10 @@ impl Picker {
                 probability,
             } => {
                 let hot = ((self.n as f64 * fraction).ceil() as usize).clamp(1, self.n);
-                if rng.gen_bool(probability.clamp(0.0, 1.0)) || hot == self.n {
-                    rng.gen_range(0..hot)
+                if rng.random_bool(probability.clamp(0.0, 1.0)) || hot == self.n {
+                    rng.random_range(0..hot)
                 } else {
-                    rng.gen_range(hot..self.n)
+                    rng.random_range(hot..self.n)
                 }
             }
         }
@@ -606,8 +607,8 @@ mod tests {
             ..fixed.clone()
         };
         assert_ne!(fingerprint(&fixed, 1), fingerprint(&dist, 1));
-        // A fixed-size dataset keeps the name 9.3.3 gave it.
-        let s = format!("8|{}|{}|1|v2", 64 * 1024, fixed.partitions.max(1));
+        // The name of a fixed-size dataset: its count, size, partitions, seed and version.
+        let s = format!("8|{}|{}|1|v3", 64 * 1024, fixed.partitions.max(1));
         assert_eq!(
             fingerprint(&fixed, 1),
             format!("{:08x}", crate::util::crc32c(s.as_bytes()))

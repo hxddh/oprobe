@@ -227,6 +227,33 @@ pub struct ResilienceStats {
     pub tail_cuts: u64,
     #[serde(rename = "error_classes_count")]
     pub error_classes: BTreeMap<String, u64>,
+    /// Whether the attempts of a retried call were linked into one operation (9.4). Absent
+    /// when it is not known: oprobe's own runs, and files written before 9.4.
+    #[serde(default, skip_serializing_if = "RetryLinking::is_unknown")]
+    pub retry_linking: RetryLinking,
+}
+
+/// Whether retries were linked ([`ResilienceStats::retry_linking`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RetryLinking {
+    /// Not known (not serialized).
+    #[default]
+    Unknown,
+    /// A `RetryNotify` was installed: the attempts of a retried call are one operation, and
+    /// `retries_count` counts the retries.
+    Linked,
+    /// An embedded layer without `Handle::retry_notify()`: each attempt is an operation of
+    /// its own (a retried failure is a failed operation), and `retries_count` stays 0
+    /// whatever was retried.
+    Unlinked,
+}
+
+impl RetryLinking {
+    pub fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

@@ -786,6 +786,11 @@ fn retries(m: &ProfileModel, cx: Ctx) -> View {
                 .map(|c| prop(tr("capacity.title"), capacity_line(c)).test_id("capacity")),
         )
         .child(prop(tr("retry.retries"), n(r.retries_count)))
+        // An embedded trace without `retry_notify`: its retry count is not one.
+        .child(
+            r.unlinked
+                .then(|| prop(tr("retry.unlinked"), tr("retry.unlinked_note"))),
+        )
         .child((r.tail_cuts_count > 0).then(|| prop(tr("retry.tail_cuts"), n(r.tail_cuts_count))))
         .child(prop(tr("retry.backoff"), fmt::dur_ms(r.backoff_ms)))
         .child(prop(
@@ -1489,6 +1494,16 @@ fn finding(s: Store, m: &ProfileModel, f: FindingRow) -> View {
                     .accessibility_label(fill("profile.try_remedy_of", &[&f.code])),
                 )
         })
+        // What the remedy costs: `prove` measures it.
+        .child(f.trade_off.and_then(|k| {
+            tr_dyn(&format!("tradeoff.{k}")).map(|t| {
+                view()
+                    .flex_row()
+                    .gap_2()
+                    .child(caption(tr("profile.trade_off")))
+                    .child(small(t).flex_1().selectable(true))
+            })
+        }))
 }
 
 /// An evidence value's label in the app's language (core's label when the catalog has none).

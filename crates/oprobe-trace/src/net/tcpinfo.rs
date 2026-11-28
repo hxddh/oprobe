@@ -1057,22 +1057,22 @@ mod tests {
 
     #[test]
     fn retransmits_of_a_shared_connection_are_charged_exactly_once() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(0x0b5e_55ed);
         for _ in 0..400 {
-            let seed = rng.gen_range(0..50u64);
+            let seed = rng.random_range(0..50u64);
             let mut ledger = RetransLedger::seeded(Some(seed));
             let mut kernel = seed;
             let mut open: Vec<u64> = Vec::new();
             let mut charged = 0u64;
-            for _ in 0..rng.gen_range(1..80) {
-                kernel += rng.gen_range(0..4u64);
+            for _ in 0..rng.random_range(1..80) {
+                kernel += rng.random_range(0..4u64);
                 // Two requests ending at once may hand in their readings out of order, and
                 // a connection that just closed cannot be read at all.
-                let stale = rng.gen_bool(0.2).then(|| rng.gen_range(seed..=kernel));
-                let reading = rng.gen_bool(0.9).then_some(stale.unwrap_or(kernel));
-                let pick = rng.gen_range(0..open.len().max(1));
-                match rng.gen_range(0..10) {
+                let stale = rng.random_bool(0.2).then(|| rng.random_range(seed..=kernel));
+                let reading = rng.random_bool(0.9).then_some(stale.unwrap_or(kernel));
+                let pick = rng.random_range(0..open.len().max(1));
+                match rng.random_range(0..10) {
                     _ if open.is_empty() => open.push(ledger.open()),
                     0..=2 => open.push(ledger.open()),
                     // An upload whose connection is known while it sends.
